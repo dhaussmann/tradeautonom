@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TradeAutonom — Arbitrage Dashboard</title>
+<style>
+:root{--bg:#0f1117;--surface:#1a1d27;--surface2:#232733;--border:#2e3345;--text:#e1e4ed;--dim:#8b8fa3;--accent:#6366f1;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--blue:#3b82f6}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:17px;font-weight:600}
+header h1 span{color:var(--accent)}
+.badge{background:var(--surface2);border:1px solid var(--border);padding:3px 10px;border-radius:10px;font-size:11px;color:var(--dim)}
+.container{max-width:1200px;margin:0 auto;padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px}
+.card-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:14px}
+.full{grid-column:1/-1}
+
+.spread-row{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;margin-bottom:16px}
+.pb{text-align:center}
+.pb .lbl{font-size:11px;color:var(--dim);margin-bottom:2px}
+.pb .pr{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
+.pb .inst{font-size:10px;color:var(--dim);margin-top:1px}
+.sc{text-align:center;padding:10px 18px;background:var(--surface2);border-radius:8px;min-width:130px}
+.sc .sv{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}
+.sc .sl{font-size:10px;color:var(--dim);margin-top:1px}
+
+.sig{display:flex;align-items:center;justify-content:center;gap:8px;padding:8px;border-radius:6px;font-size:12px;font-weight:600}
+.sig.entry{background:rgba(34,197,94,.1);color:var(--green)}
+.sig.exit{background:rgba(239,68,68,.1);color:var(--red)}
+.sig.none{background:rgba(139,143,163,.1);color:var(--dim)}
+.sig .dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.sig.entry .dot{background:var(--green)}
+.sig.exit .dot{background:var(--red)}
+.sig.none .dot{background:var(--dim)}
+
+.hist{display:flex;align-items:flex-end;gap:2px;height:50px;margin-top:10px}
+.hbar{flex:1;min-width:3px;border-radius:2px 2px 0 0;transition:height .3s}
+.ri{font-size:10px;color:var(--dim);text-align:center;margin-top:6px}
+.ri span{color:var(--accent)}
+
+.at{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:var(--surface2);border-radius:8px;margin-bottom:14px}
+.at .lg h3{font-size:13px;font-weight:600}
+.at .lg p{font-size:11px;color:var(--dim);margin-top:1px}
+.tg{position:relative;width:44px;height:24px}
+.tg input{opacity:0;width:0;height:0}
+.tgs{position:absolute;inset:0;background:var(--border);border-radius:24px;cursor:pointer;transition:.3s}
+.tgs::before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.3s}
+.tg input:checked+.tgs{background:var(--green)}
+.tg input:checked+.tgs::before{transform:translateX(20px)}
+
+.cg{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.fld{display:flex;flex-direction:column;gap:3px}
+.fld label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+.fld input{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-size:13px;font-variant-numeric:tabular-nums;outline:none;transition:border-color .2s}
+.fld input:focus{border-color:var(--accent)}
+.btn{padding:8px 16px;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s}
+.bp{background:var(--accent);color:#fff}.bp:hover{opacity:.9}
+.bs{background:var(--green);color:#fff}.bs:hover{opacity:.9}
+.bd{background:var(--red);color:#fff}.bd:hover{opacity:.9}
+.bo{background:transparent;border:1px solid var(--border);color:var(--dim)}.bo:hover{border-color:var(--dim);color:var(--text)}
+.br{display:flex;gap:6px;margin-top:14px}
+
+.sg{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.st{background:var(--surface2);padding:10px;border-radius:6px;text-align:center}
+.st .stl{font-size:10px;color:var(--dim);margin-bottom:3px}
+.st .stv{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
+th{text-align:left;padding:6px 8px;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border)}
+td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+.long{color:var(--green)}.short{color:var(--red)}
+.pp{color:var(--green)}.pn{color:var(--red)}
+.empty{text-align:center;padding:20px;color:var(--dim);font-size:12px}
+
+.lc{max-height:260px;overflow-y:auto;font-size:11px;font-family:'SF Mono','Fira Code',monospace}
+.le{padding:5px 8px;border-bottom:1px solid var(--border);display:flex;gap:8px}
+.le .lt{color:var(--dim);white-space:nowrap}
+.le.success{border-left:3px solid var(--green)}
+.le.error{border-left:3px solid var(--red)}
+.le.info{border-left:3px solid var(--blue)}
+.le.warn{border-left:3px solid var(--yellow)}
+.lev-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.lev-row .lev-inst{font-size:12px;min-width:130px}
+.lev-row select{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:5px;font-size:12px;outline:none}
+.lev-row select:focus{border-color:var(--accent)}
+.lev-row .lev-cur{font-size:11px;color:var(--dim);min-width:50px}
+.pos-bar{display:flex;align-items:center;justify-content:center;gap:12px;padding:8px 12px;border-radius:6px;font-size:12px;margin-top:8px}
+.pos-bar.open{background:rgba(99,102,241,.12);color:var(--accent);border:1px solid rgba(99,102,241,.25)}
+.pos-bar.flat{background:var(--surface2);color:var(--dim)}
+.pos-bar .pos-tag{font-weight:700;font-size:11px;padding:2px 8px;border-radius:4px}
+.pos-bar .pos-tag.long{background:rgba(34,197,94,.15);color:var(--green)}
+.pos-bar .pos-tag.short{background:rgba(239,68,68,.15);color:var(--red)}
+</style>
+</head>
+<body>
+<header>
+  <h1><span>TradeAutonom</span> Arbitrage Dashboard</h1>
+  <div class="badge" id="envBadge">connecting...</div>
+  <div class="badge" id="simBadge" style="display:none;background:var(--yellow);color:#000;margin-left:8px;font-weight:700">SIM MODE</div>
+</header>
+<div class="container">
+
+  <!-- Spread Monitor -->
+  <div class="card full">
+    <div class="card-title">Live Spread Monitor</div>
+    <div class="spread-row">
+      <div class="pb"><div class="lbl">LONG PAXG</div><div class="pr" id="prB">—</div><div class="inst" id="iB">PAXG_USDT_Perp</div></div>
+      <div class="sc"><div class="sv" id="sV">—</div><div class="sl">SPREAD (PAXG−XAU)</div><div class="sv" id="sVexec" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div></div>
+      <div class="pb"><div class="lbl">SHORT XAU</div><div class="pr" id="prA">—</div><div class="inst" id="iA">XAU_USDT_Perp</div></div>
+    </div>
+    <div class="sig none" id="sigBar"><span class="dot"></span><span id="sigTxt">Waiting for data...</span></div>
+    <div class="pos-bar flat" id="posBar">No position</div>
+    <div class="hist" id="hist"></div>
+    <div class="ri">Auto-refresh every <span id="rr">3</span>s &middot; Last: <span id="lu">—</span></div>
+  </div>
+
+  <!-- Config -->
+  <div class="card">
+    <div class="card-title">Configuration</div>
+    <div class="at">
+      <div class="lg"><h3>Auto-Trading</h3><p>Monitor &amp; execute automatically</p></div>
+      <label class="tg"><input type="checkbox" id="atToggle"><span class="tgs"></span></label>
+    </div>
+    <div class="at" style="margin-top:8px;padding:8px 12px;background:rgba(255,193,7,0.08);border-radius:8px">
+      <div class="lg"><h3 style="color:var(--yellow)">Simulation Mode</h3><p>Paper-trade: no real orders</p></div>
+      <label class="tg"><input type="checkbox" id="simToggle" onchange="toggleSim()"><span class="tgs"></span></label>
+    </div>
+    <div class="cg">
+      <div class="fld"><label>Entry Low ($)</label><input type="number" id="cES" step="0.1" min="0" title="Enter when PAXG-XAU spread <= this"></div>
+      <div class="fld"><label>Exit High ($)</label><input type="number" id="cXS" step="0.1" min="0" title="Exit when PAXG-XAU spread >= this"></div>
+      <div class="fld"><label>Max Exec ($)</label><input type="number" id="cME" step="0.5" min="0" title="Max bid-ask execution cost"></div>
+      <div class="fld"><label>Quantity</label><input type="number" id="cQ" step="0.001" min="0"></div>
+      <div class="fld"><label>Max Slippage (%)</label><input type="number" id="cSl" step="0.1" min="0"></div>
+      <div class="fld"><label>Min Depth (USD)</label><input type="number" id="cMD" step="1" min="0"></div>
+      <div class="fld"><label>Liquidity (x Qty)</label><input type="number" id="cLM" step="0.5" min="1" value="2.0"></div>
+      <div class="fld"><label>Chunk Size</label><input type="number" id="cCS" step="0.1" min="0.1" value="1.0" title="Split orders into chunks of this size"></div>
+      <div class="fld"><label>Chunk Delay (ms)</label><input type="number" id="cCD" step="100" min="0" value="500" title="Delay between order chunks"></div>
+      <div class="fld"><label>Refresh (sec)</label><input type="number" id="cRR" value="3" step="1" min="1" max="60"></div>
+    </div>
+    <div class="br">
+      <button class="btn bp" onclick="saveCfg()">Save Config</button>
+      <button class="btn bo" onclick="loadCfg()">Reset</button>
+    </div>
+    <div style="margin-top:16px">
+      <div class="card-title" style="margin-bottom:8px">Leverage</div>
+      <div id="levBox"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Account -->
+  <div class="card">
+    <div class="card-title">Account</div>
+    <div class="sg">
+      <div class="st"><div class="stl">Equity</div><div class="stv" id="aEq">—</div></div>
+      <div class="st"><div class="stl">Available</div><div class="stv" id="aAv">—</div></div>
+      <div class="st"><div class="stl">Unrealized PnL</div><div class="stv" id="aPnl">—</div></div>
+    </div>
+    <div style="margin-top:14px"><div class="card-title" style="margin-bottom:6px">Open Positions</div>
+    <table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th></tr></thead>
+    <tbody id="posBody"><tr><td colspan="5" class="empty">No positions</td></tr></tbody></table></div>
+    <div class="br">
+      <button class="btn bs" onclick="manualEntry()">Manual Entry</button>
+      <button class="btn bd" onclick="manualExit()">Manual Exit</button>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card full">
+    <div class="card-title">Trade Log</div>
+    <div class="lc" id="logC"><div class="empty">No trades yet. Enable auto-trading or trigger manually.</div></div>
+  </div>
+</div>
+
+<script>
+const API=location.origin;
+let autoOn=false,rInt=null,rMs=3000,sHist=[],logs=[];
+const MH=60;
+
+async function init(){await loadCfg();await loadLev();await tick();startR();log('info','Dashboard connected')}
+
+async function f(p,o={}){try{const r=await fetch(API+p,{headers:{'Content-Type':'application/json'},...o});return await r.json()}catch(e){log('error','API: '+p+' — '+e.message);return null}}
+
+async function loadCfg(){
+  const s=await f('/arb/status');if(!s)return;
+  $('cES').value=s.spread_entry_low;$('cXS').value=s.spread_exit_high;
+  $('cME').value=s.max_exec_spread;
+  $('cQ').value=s.quantity;$('cSl').value=s.slippage_pct;
+  $('cMD').value=s.min_depth_usd;$('cLM').value=s.liquidity_multiplier;
+  $('iA').textContent=s.instrument_a;$('iB').textContent=s.instrument_b;
+  $('cCS').value=s.chunk_size;$('cCD').value=s.chunk_delay_ms;
+  $('simToggle').checked=!!s.simulation_mode;
+  $('simBadge').style.display=s.simulation_mode?'inline-block':'none';
+}
+
+async function saveCfg(){
+  const b={spread_entry_low:+$('cES').value,spread_exit_high:+$('cXS').value,
+    max_exec_spread:+$('cME').value,
+    quantity:+$('cQ').value,slippage_pct:+$('cSl').value,min_depth_usd:+$('cMD').value,
+    liquidity_multiplier:+$('cLM').value,chunk_size:+$('cCS').value,chunk_delay_ms:parseInt($('cCD').value)};
+  const r=await f('/arb/config',{method:'POST',body:JSON.stringify(b)});
+  if(r&&r.status==='ok')log('info','Config saved: entry<=$'+b.spread_entry_low+' exit>=$'+b.spread_exit_high+' qty='+b.quantity);
+
+  const nr=parseInt($('cRR').value)||3;
+  if(nr!==rMs/1000){rMs=nr*1000;$('rr').textContent=nr;startR()}
+}
+
+async function toggleSim(){
+  const on=$('simToggle').checked;
+  const r=await f('/arb/config',{method:'POST',body:JSON.stringify({simulation_mode:on})});
+  $('simBadge').style.display=on?'inline-block':'none';
+  if(r&&r.status==='ok')log('info','Simulation mode '+(on?'ENABLED':'DISABLED'));
+}
+
+async function refreshSpread(){
+  const d=await f('/arb/check');if(!d)return;
+  const s=d.snapshot;
+  // instrument_a = XAU, instrument_b = PAXG
+  $('prA').textContent='$'+s.mid_price_a.toFixed(2);
+  $('prB').textContent='$'+s.mid_price_b.toFixed(2);
+  // Directional spread: PAXG - XAU
+  const sp=s.spread||0, es=s.exec_spread||0;
+  $('sV').textContent='$'+sp.toFixed(2);
+  $('sVexec').textContent='$'+es.toFixed(2);
+  const eT=+$('cES').value||2,xT=+$('cXS').value||8;
+  const sv=$('sV');
+  sv.style.color=sp<=eT?'var(--green)':sp>=xT?'var(--red)':'var(--yellow)';
+  const bar=$('sigBar'),txt=$('sigTxt');
+  bar.className='sig '+d.action.toLowerCase();
+  if(d.action==='ENTRY')txt.textContent='ENTRY — Spread $'+sp.toFixed(2)+' <= $'+eT.toFixed(2)+' (exec $'+es.toFixed(2)+')';
+  else if(d.action==='EXIT')txt.textContent='EXIT — Spread $'+sp.toFixed(2)+' >= $'+xT.toFixed(2)+' (exec $'+es.toFixed(2)+')';
+  else txt.textContent=d.reason;
+  sHist.push(sp);if(sHist.length>MH)sHist.shift();
+  renderHist(eT,xT);
+  $('lu').textContent=new Date().toLocaleTimeString();
+  // Update position direction bar
+  const st=await f('/arb/status');
+  if(st){
+    const pb=$('posBar');
+    const sim=st.simulation_mode;
+    const stag=sim?'<span style="color:var(--yellow);font-weight:700">[SIM] </span>':'';
+    if(st.has_position&&st.long_sym&&st.short_sym){
+      pb.className='pos-bar open';
+      pb.innerHTML=stag+'POSITION OPEN &mdash; <span class="pos-tag long">LONG '+st.long_sym+'</span> <span class="pos-tag short">SHORT '+st.short_sym+'</span>'+(st.entry_spread_actual?' &mdash; Entry spread: $'+st.entry_spread_actual.toFixed(2):'');
+    } else {
+      pb.className='pos-bar flat';
+      pb.innerHTML=stag+'No position';
+    }
+    $('simBadge').style.display=sim?'inline-block':'none';
+  }
+  if(autoOn&&d.action!=='NONE'){
+    log('info','Auto-trade: '+d.action);
+    const r=await f('/arb/auto',{method:'POST',body:'{}'});
+    if(r){r.success?log('success',d.action+' executed. Spread: $'+sp.toFixed(2)):log('error',d.action+' failed: '+r.error);await refreshAcct()}
+  }
+}
+
+function renderHist(eT,xT){
+  const c=$('hist'),mx=Math.max(...sHist,xT*1.2,1);
+  c.innerHTML=sHist.map(s=>{
+    const h=Math.max(2,(s/mx)*46);
+    const co=s<=eT?'var(--green)':s>=xT?'var(--red)':'var(--yellow)';
+    return '<div class="hbar" style="height:'+h+'px;background:'+co+'" title="$'+s.toFixed(2)+'"></div>';
+  }).join('');
+}
+
+async function refreshAcct(){
+  const d=await f('/account/summary');if(!d)return;
+  $('aEq').textContent='$'+parseFloat(d.total_equity).toFixed(2);
+  $('aAv').textContent='$'+parseFloat(d.available_balance).toFixed(2);
+  const p=parseFloat(d.unrealized_pnl),el=$('aPnl');
+  el.textContent=(p>=0?'+':'')+p.toFixed(4);
+  el.style.color=p>=0?'var(--green)':'var(--red)';
+  const pos=d.positions||[],tb=$('posBody');
+  if(!pos.length){tb.innerHTML='<tr><td colspan="5" class="empty">No positions</td></tr>';return}
+  tb.innerHTML=pos.map(p=>{
+    const sz=parseFloat(p.size),sd=sz>0?'LONG':'SHORT',sc=sz>0?'long':'short';
+    const pnl=parseFloat(p.unrealized_pnl),pc=pnl>=0?'pp':'pn';
+    return '<tr><td>'+p.instrument+'</td><td class="'+sc+'">'+sd+'</td><td>'+Math.abs(sz)+'</td><td>$'+parseFloat(p.entry_price).toFixed(2)+'</td><td class="'+pc+'">'+(pnl>=0?'+':'')+pnl.toFixed(4)+'</td></tr>';
+  }).join('');
+  $('envBadge').textContent='GRVT Testnet';
+}
+
+async function manualEntry(){
+  log('info','Manual ENTRY triggered');
+  const r=await f('/arb/trigger',{method:'POST',body:JSON.stringify({action:'ENTRY'})});
+  if(r){r.success?log('success','Manual ENTRY executed'):log('error','ENTRY failed: '+r.error)}
+  await refreshAcct();
+}
+async function manualExit(){
+  log('info','Manual EXIT triggered');
+  const r=await f('/arb/trigger',{method:'POST',body:JSON.stringify({action:'EXIT'})});
+  if(r){r.success?log('success','Manual EXIT executed'):log('error','EXIT failed: '+r.error)}
+  await refreshAcct();
+}
+
+function log(lv,msg){
+  logs.unshift({t:new Date(),lv,msg});if(logs.length>100)logs.pop();
+  $('logC').innerHTML=logs.map(e=>'<div class="le '+e.lv+'"><span class="lt">'+e.t.toLocaleTimeString()+'</span><span>'+e.msg+'</span></div>').join('');
+}
+
+$('atToggle').addEventListener('change',function(){autoOn=this.checked;log(autoOn?'success':'warn',autoOn?'Auto-trading ENABLED':'Auto-trading DISABLED')});
+
+async function loadLev(){
+  const s=await f('/arb/status');if(!s)return;
+  const instruments=[s.instrument_a,s.instrument_b];
+  const all=await f('/leverage');if(!all)return;
+  const box=$('levBox');box.innerHTML='';
+  instruments.forEach(inst=>{
+    const cur=Array.isArray(all)?all.find(l=>l.instrument===inst):null;
+    const curLev=cur?cur.leverage:'10';
+    const row=document.createElement('div');row.className='lev-row';
+    row.innerHTML='<span class="lev-inst">'+inst+'</span>'+
+      '<select id="lev_'+inst.replace(/[^a-zA-Z0-9]/g,'_')+'" onchange="setLev(\''+inst+'\',this.value)">'+
+      [1,2,3,5,10,20,25,50].map(v=>'<option value="'+v+'"'+(v==parseInt(curLev)?' selected':'')+'>'+v+'x</option>').join('')+
+      '</select><span class="lev-cur" id="levCur_'+inst.replace(/[^a-zA-Z0-9]/g,'_')+'">current: '+curLev+'x</span>';
+    box.appendChild(row);
+  });
+}
+async function setLev(inst,lev){
+  log('info','Setting leverage: '+inst+' -> '+lev+'x');
+  const r=await f('/leverage',{method:'POST',body:JSON.stringify({instrument:inst,leverage:parseInt(lev)})});
+  if(r&&r.success){log('success','Leverage set: '+inst+' -> '+lev+'x');const k='levCur_'+inst.replace(/[^a-zA-Z0-9]/g,'_');$(k).textContent='current: '+lev+'x'}
+  else log('error','Failed to set leverage: '+(r?JSON.stringify(r):'no response'));
+}
+
+async function tick(){await Promise.all([refreshSpread(),refreshAcct()])}
+function startR(){if(rInt)clearInterval(rInt);rInt=setInterval(tick,rMs)}
+function $(id){return document.getElementById(id)}
+
+init();
+</script>
+</body>
+</html>
