@@ -38,5 +38,9 @@ class Settings(BaseSettings):
     arb_chunk_size: float = 1.0         # split large orders into chunks of this size
     arb_chunk_delay_ms: int = 500       # ms to wait between chunks (book replenishment)
     arb_simulation_mode: bool = False   # True = paper-trade (no real orders)
+    arb_order_type: str = "aggressive_limit"  # "aggressive_limit" or "market"
+    arb_limit_offset_ticks: int = 2     # ticks beyond best price for aggressive limit
+    arb_min_profit: float = 0.005       # min profit margin in USD above break-even
+    arb_fill_timeout_ms: int = 3000     # max ms to wait for fill confirmation
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

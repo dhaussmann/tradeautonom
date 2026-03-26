@@ -50,6 +50,7 @@ class GrvtClient:
         _patch_session_no_ssl_verify()
 
         self._min_size_cache: dict[str, Decimal] = {}
+        self._tick_size_cache: dict[str, Decimal] = {}
         self._api = GrvtCcxt(
             self._env,
             logger,
@@ -95,6 +96,8 @@ class GrvtClient:
             })
             if m.get("min_size"):
                 self._min_size_cache[sym] = Decimal(str(m["min_size"]))
+            if m.get("tick_size"):
+                self._tick_size_cache[sym] = Decimal(str(m["tick_size"]))
         return markets
 
     def get_min_order_size(self, symbol: str) -> Decimal:
@@ -128,6 +131,61 @@ class GrvtClient:
             raise RuntimeError(f"Order rejected by GRVT (empty response). Check server logs for details.")
         logger.info("Market order sent: symbol=%s side=%s amount=%s cid=%s", symbol, side, amount, cid)
         return resp
+
+    def create_aggressive_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: Decimal,
+        offset_ticks: int = 2,
+        client_order_id: int | None = None,
+    ) -> dict:
+        """Place an aggressive limit order: best price + offset ticks for near-certain fill.
+
+        BUY:  limit = best_ask + offset_ticks * tick_size  (cross the spread aggressively)
+        SELL: limit = best_bid - offset_ticks * tick_size
+        """
+        cid = client_order_id or rand_uint32()
+        book = self.fetch_order_book(symbol, limit=1)
+        tick = self.get_tick_size(symbol)
+
+        if side == "buy":
+            if not book.get("asks"):
+                raise RuntimeError(f"No asks in {symbol} orderbook")
+            best = Decimal(str(book["asks"][0][0]))
+            limit_price = float(best + tick * offset_ticks)
+        else:
+            if not book.get("bids"):
+                raise RuntimeError(f"No bids in {symbol} orderbook")
+            best = Decimal(str(book["bids"][0][0]))
+            limit_price = float(best - tick * offset_ticks)
+
+        logger.info(
+            "Aggressive limit: %s %s qty=%s best=%s limit=%s offset=%d ticks tick=%s",
+            side.upper(), symbol, amount, best, limit_price, offset_ticks, tick,
+        )
+        return self.create_limit_order(
+            symbol=symbol, side=side, amount=amount,
+            price=limit_price, client_order_id=cid,
+        )
+
+    def get_tick_size(self, symbol: str) -> Decimal:
+        """Return tick size for the symbol from GRVT market data."""
+        if not self._min_size_cache:
+            self.fetch_markets()
+        # tick_size is stored separately; fall back to 0.01
+        return self._tick_size_cache.get(symbol, Decimal("0.01"))
+
+    def check_order_fill(self, client_order_id: int) -> dict:
+        """Check if an order has been filled. Returns {filled: bool, status: str, ...}."""
+        try:
+            order = self.fetch_order(client_order_id)
+            status = order.get("status", "").upper() if order else ""
+            filled = status in ("FILLED", "CLOSED")
+            return {"filled": filled, "status": status, "order": order}
+        except Exception as exc:
+            logger.warning("check_order_fill(%s) error: %s", client_order_id, exc)
+            return {"filled": False, "status": "ERROR", "error": str(exc)}
 
     def create_limit_order(
         self,

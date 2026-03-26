@@ -316,6 +316,10 @@ async def arb_status():
         chunk_delay_ms=_arb_engine.chunk_delay_ms,
         leg_a_exchange=_arb_engine.leg_a_exchange,
         leg_b_exchange=_arb_engine.leg_b_exchange,
+        order_type=_arb_engine.order_type,
+        limit_offset_ticks=_arb_engine.limit_offset_ticks,
+        min_profit=_arb_engine.min_profit,
+        fill_timeout_ms=_arb_engine.fill_timeout_ms,
         long_sym=pi["long_sym"],
         short_sym=pi["short_sym"],
         entry_spread_actual=pi["entry_spread"],
@@ -360,6 +364,14 @@ async def arb_config(req: ArbConfigRequest):
         _arb_engine.leg_b_exchange = req.leg_b_exchange
     if req.simulation_mode is not None:
         _arb_engine.simulation_mode = req.simulation_mode
+    if req.order_type is not None:
+        _arb_engine.order_type = req.order_type
+    if req.limit_offset_ticks is not None:
+        _arb_engine.limit_offset_ticks = req.limit_offset_ticks
+    if req.min_profit is not None:
+        _arb_engine.min_profit = req.min_profit
+    if req.fill_timeout_ms is not None:
+        _arb_engine.fill_timeout_ms = req.fill_timeout_ms
     # Reset position state when instruments change — old position no longer applies
     if instruments_changed:
         _arb_engine._has_position = False

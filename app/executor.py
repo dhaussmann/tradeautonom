@@ -128,3 +128,69 @@ class TradeExecutor:
             slippage=slippage,
             error=None,
         )
+
+    def execute_aggressive_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        expected_price: float,
+        offset_ticks: int = 2,
+        slippage_pct: float | None = None,
+        min_depth_usd: float | None = None,
+        client: ExchangeClient | None = None,
+    ) -> TradeResult:
+        """Run safety checks and place an aggressive limit order.
+
+        Same pre-trade validation as market orders, but uses
+        create_aggressive_limit_order for tighter price control.
+        """
+        active_client = client or self.client
+
+        side = side.lower()
+        if side not in ("buy", "sell"):
+            return TradeResult(
+                success=False, order_response=None, depth=None, slippage=None,
+                error=f"Invalid side: {side}. Must be 'buy' or 'sell'.",
+            )
+
+        max_slip = slippage_pct if slippage_pct is not None else self.settings.default_slippage_pct
+        depth_req = min_depth_usd if min_depth_usd is not None else self.settings.min_order_book_depth_usd
+
+        if max_slip > self.settings.max_slippage_pct:
+            max_slip = self.settings.max_slippage_pct
+
+        try:
+            order_book = active_client.fetch_order_book(symbol, limit=50)
+        except Exception as exc:
+            msg = f"Failed to fetch order book for {symbol}: {exc}"
+            logger.error(msg)
+            return TradeResult(success=False, order_response=None, depth=None, slippage=None, error=msg)
+
+        passed, depth, slippage = run_pre_trade_checks(
+            order_book=order_book, side=side, quantity=quantity,
+            expected_price=expected_price,
+            max_slippage_pct=max_slip, min_depth_usd=depth_req,
+        )
+
+        if not passed:
+            reasons = []
+            if not depth.is_sufficient:
+                reasons.append(f"Depth insufficient: {depth.available_depth_usd:.2f} USD")
+            if not slippage.is_acceptable:
+                reasons.append(f"Slippage {slippage.slippage_pct:.4f}% exceeds max {slippage.max_allowed_pct:.2f}%")
+            error_msg = "Pre-trade checks failed: " + "; ".join(reasons)
+            logger.warning(error_msg)
+            return TradeResult(success=False, order_response=None, depth=depth, slippage=slippage, error=error_msg)
+
+        try:
+            resp = active_client.create_aggressive_limit_order(
+                symbol=symbol, side=side, amount=quantity, offset_ticks=offset_ticks,
+            )
+        except Exception as exc:
+            msg = f"Aggressive limit order failed: {exc}"
+            logger.error(msg)
+            return TradeResult(success=False, order_response=None, depth=depth, slippage=slippage, error=msg)
+
+        logger.info("Aggressive limit order executed: %s", resp)
+        return TradeResult(success=True, order_response=resp, depth=depth, slippage=slippage, error=None)

@@ -38,3 +38,13 @@ class ExchangeClient(Protocol):
     def get_min_order_size(self, symbol: str) -> "Decimal":
         """Return minimum order size for the symbol (0 if no minimum / unknown)."""
         ...
+
+    def create_aggressive_limit_order(
+        self, symbol: str, side: str, amount: "Decimal", offset_ticks: int = 2,
+    ) -> dict:
+        """Place an aggressive limit order: best price ± offset ticks."""
+        ...
+
+    def check_order_fill(self, order_id) -> dict:
+        """Check if an order has been filled. Returns {filled: bool, status: str}."""
+        ...

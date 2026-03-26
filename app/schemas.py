@@ -81,6 +81,10 @@ class ArbConfigRequest(BaseModel):
     leg_a_exchange: str | None = Field(None, description="Exchange for leg A (grvt or extended)")
     leg_b_exchange: str | None = Field(None, description="Exchange for leg B (grvt or extended)")
     simulation_mode: bool | None = Field(None, description="Paper-trade mode (no real orders)")
+    order_type: str | None = Field(None, description="Order type: 'aggressive_limit' or 'market'")
+    limit_offset_ticks: int | None = Field(None, ge=0, description="Ticks beyond best price for aggressive limit")
+    min_profit: float | None = Field(None, ge=0, description="Min profit margin in USD above break-even")
+    fill_timeout_ms: int | None = Field(None, ge=0, description="Max ms to wait for fill confirmation")
 
 
 class ArbStatusResponse(BaseModel):
@@ -100,6 +104,10 @@ class ArbStatusResponse(BaseModel):
     chunk_delay_ms: int
     leg_a_exchange: str
     leg_b_exchange: str
+    order_type: str
+    limit_offset_ticks: int
+    min_profit: float
+    fill_timeout_ms: int
     long_sym: str | None = None
     short_sym: str | None = None
     entry_spread_actual: float | None = None

@@ -266,6 +266,82 @@ class ExtendedClient:
         logger.info("Extended order placed: %s", result)
         return {"id": str(getattr(result, "id", None)), "external_id": str(getattr(result, "external_id", None))}
 
+    def create_aggressive_limit_order(
+        self,
+        symbol: str,
+        side: Literal["buy", "sell"],
+        amount: Decimal,
+        offset_ticks: int = 2,
+    ) -> dict:
+        """Place an aggressive limit IOC order: best price + offset ticks.
+
+        BUY:  limit = best_ask + offset_ticks * tick_size
+        SELL: limit = best_bid - offset_ticks * tick_size
+        Uses IOC (Immediate or Cancel) for instant fill-or-kill behavior.
+        """
+        self._require_trading()
+        from x10.perpetual.orders import OrderSide, TimeInForce
+
+        book = self.fetch_order_book(symbol, limit=1)
+        tick = self._get_tick_size(symbol)
+
+        if side == "buy":
+            if not book["asks"]:
+                raise RuntimeError(f"No asks in {symbol} orderbook")
+            best = Decimal(str(book["asks"][0][0]))
+            raw = best + tick * offset_ticks
+        else:
+            if not book["bids"]:
+                raise RuntimeError(f"No bids in {symbol} orderbook")
+            best = Decimal(str(book["bids"][0][0]))
+            raw = best - tick * offset_ticks
+
+        limit_price = self._round_to_tick(raw, symbol) if side == "sell" else \
+            (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
+
+        order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+
+        logger.info(
+            "Extended aggressive limit: %s %s qty=%s best=%s limit=%s offset=%d tick=%s",
+            side.upper(), symbol, amount, best, limit_price, offset_ticks, tick,
+        )
+
+        result = _run_async(
+            self._trading_client.place_order(
+                market_name=symbol,
+                amount_of_synthetic=amount,
+                price=limit_price,
+                side=order_side,
+                time_in_force=TimeInForce.IOC,
+            )
+        )
+
+        order_id = str(getattr(result, "id", None))
+        logger.info("Extended aggressive limit placed: id=%s", order_id)
+        return {
+            "id": order_id,
+            "external_id": str(getattr(result, "external_id", None)),
+            "limit_price": float(limit_price),
+            "best_price": float(best),
+        }
+
+    def check_order_fill(self, order_id: str) -> dict:
+        """Check if an order has been filled via REST API."""
+        try:
+            url = f"{self._base_url}/user/order/{order_id}"
+            resp = self._session.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status", "").upper() != "OK":
+                return {"filled": False, "status": "API_ERROR", "error": str(data)}
+            order = data.get("data", {})
+            status = order.get("status", "").upper()
+            filled = status in ("FILLED", "CLOSED")
+            return {"filled": filled, "status": status, "order": order}
+        except Exception as exc:
+            logger.warning("check_order_fill(%s) error: %s", order_id, exc)
+            return {"filled": False, "status": "ERROR", "error": str(exc)}
+
     def create_limit_order(
         self,
         symbol: str,

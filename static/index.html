@@ -152,6 +152,10 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
       <div class="fld"><label>Liquidity (x Qty)</label><input type="number" id="cLM" step="0.5" min="1" value="2.0"></div>
       <div class="fld"><label>Chunk Size</label><input type="number" id="cCS" step="0.1" min="0.1" value="1.0" title="Split orders into chunks of this size"></div>
       <div class="fld"><label>Chunk Delay (ms)</label><input type="number" id="cCD" step="100" min="0" value="500" title="Delay between order chunks"></div>
+      <div class="fld"><label>Order Type</label><select id="cOT"><option value="aggressive_limit">Aggressive Limit</option><option value="market">Market</option></select></div>
+      <div class="fld"><label>Limit Offset (ticks)</label><input type="number" id="cLOT" step="1" min="0" value="2" title="Ticks beyond best price for aggressive limit"></div>
+      <div class="fld"><label>Min Profit ($)</label><input type="number" id="cMP" step="0.001" min="0" value="0.005" title="Min profit above break-even to enter"></div>
+      <div class="fld"><label>Fill Timeout (ms)</label><input type="number" id="cFT" step="500" min="0" value="3000" title="Max wait for fill confirmation"></div>
       <div class="fld"><label>Refresh (sec)</label><input type="number" id="cRR" value="3" step="1" min="1" max="60"></div>
     </div>
     <div class="br">
@@ -197,6 +201,10 @@ async function loadCfg(){
   $('cQ').value=s.quantity;$('cSl').value=s.slippage_pct;
   $('cMD').value=s.min_depth_usd;$('cLM').value=s.liquidity_multiplier;
   $('cCS').value=s.chunk_size;$('cCD').value=s.chunk_delay_ms;
+  $('cOT').value=s.order_type||'aggressive_limit';
+  $('cLOT').value=s.limit_offset_ticks||2;
+  $('cMP').value=s.min_profit||0.005;
+  $('cFT').value=s.fill_timeout_ms||3000;
   $('simToggle').checked=!!s.simulation_mode;
   $('simBadge').style.display=s.simulation_mode?'inline-block':'none';
   // Per-leg exchange + instrument
@@ -225,6 +233,8 @@ async function saveCfg(){
     max_exec_spread:parseNum('cME'),
     quantity:parseNum('cQ'),slippage_pct:parseNum('cSl'),min_depth_usd:parseNum('cMD'),
     liquidity_multiplier:parseNum('cLM'),chunk_size:parseNum('cCS'),chunk_delay_ms:parseInt($('cCD').value),
+    order_type:$('cOT').value,limit_offset_ticks:parseInt($('cLOT').value),
+    min_profit:parseNum('cMP'),fill_timeout_ms:parseInt($('cFT').value),
     leg_a_exchange:$('cExA').value,leg_b_exchange:$('cExB').value,
     instrument_a:$('cInstA').value,instrument_b:$('cInstB').value};
   const r=await f('/arb/config',{method:'POST',body:JSON.stringify(b)});

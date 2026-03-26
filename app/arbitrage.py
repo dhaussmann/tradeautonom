@@ -14,6 +14,7 @@ Both legs are executed as market orders with full safety checks.
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -105,6 +106,11 @@ class ArbitrageEngine:
         self.chunk_size = Decimal(str(settings.arb_chunk_size))
         self.chunk_delay_ms = settings.arb_chunk_delay_ms
         self.simulation_mode = settings.arb_simulation_mode
+        # Aggressive limit order settings
+        self.order_type = settings.arb_order_type           # "aggressive_limit" or "market"
+        self.limit_offset_ticks = settings.arb_limit_offset_ticks
+        self.min_profit = settings.arb_min_profit           # min USD profit above break-even
+        self.fill_timeout_ms = settings.arb_fill_timeout_ms
         # Position state
         self._has_position = False
         self._long_sym: str | None = None   # always PAXG when open
@@ -354,14 +360,15 @@ class ArbitrageEngine:
         min_depth_usd: float | None = None,
         slippage_pct: float | None = None,
     ) -> ArbExecutionResult:
-        """Open the spread: always Long PAXG + Short XAU.
+        """Open the spread: Long cheaper / Short expensive.
 
         Safety guards:
-          1. Mid spread must be <= spread_entry_low.
-          2. Exec spread must be <= max_exec_spread (bid-ask cost check).
-          3. Both order books must have sufficient liquidity.
-          4. After Leg A fills, re-check spread hasn't blown out.
-          5. If Leg B fails, immediately unwind Leg A.
+          1. Spread abs must be >= spread_entry_low.
+          2. Exec spread must be <= max_exec_spread.
+          3. Break-even guard: spread must exceed costs + min_profit.
+          4. Both order books must have sufficient depth + slippage within bounds.
+          5. Both legs executed in parallel (ThreadPoolExecutor).
+          6. Fill confirmation: if one leg fails/unfills, unwind the other.
         """
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
@@ -388,6 +395,18 @@ class ArbitrageEngine:
                 ),
             )
 
+        # --- BREAK-EVEN GUARD ---
+        if snapshot.spread_abs < snapshot.break_even_spread + self.min_profit:
+            return ArbExecutionResult(
+                success=False, leg_a=None, leg_b=None,
+                snapshot=snapshot,
+                error=(
+                    f"Entry blocked: spread_abs ${snapshot.spread_abs:.4f} "
+                    f"< break_even ${snapshot.break_even_spread:.4f} + min_profit ${self.min_profit:.4f} "
+                    f"= ${snapshot.break_even_spread + self.min_profit:.4f}"
+                ),
+            )
+
         # Direction: dynamic — Long the cheaper instrument, Short the more expensive one
         if snapshot.a_is_cheaper:
             long_sym = self.xau_instrument
@@ -405,9 +424,10 @@ class ArbitrageEngine:
             short_price = snapshot.mid_price_a
 
         sim_tag = "[SIM] " if self.simulation_mode else ""
+        order_mode = self.order_type.upper()
         logger.info(
-            "%sARB ENTRY: LONG %s@%s @ ~%.4f | SHORT %s@%s @ ~%.4f | qty=%s | spread_abs=%.4f",
-            sim_tag, long_sym, long_exchange, long_price,
+            "%sARB ENTRY [%s]: LONG %s@%s @ ~%.4f | SHORT %s@%s @ ~%.4f | qty=%s | spread_abs=%.4f",
+            sim_tag, order_mode, long_sym, long_exchange, long_price,
             short_sym, short_exchange, short_price,
             self.quantity, snapshot.spread_abs,
         )
@@ -443,11 +463,11 @@ class ArbitrageEngine:
         depth_req = min_depth_usd if min_depth_usd is not None else self.settings.min_order_book_depth_usd
 
         logger.info(
-            "=== ENTRY PRE-TRADE CHECKS === spread_abs=$%.4f break_even=$%.4f "
-            "exec_cost=$%.4f slippage_cost=$%.4f max_slip=%.4f%% min_depth=$%.2f qty=%s",
-            snapshot.spread_abs, snapshot.break_even_spread,
+            "=== ENTRY PRE-TRADE CHECKS === spread_abs=$%.4f break_even=$%.4f min_profit=$%.4f "
+            "exec_cost=$%.4f slippage_cost=$%.4f max_slip=%.4f%% min_depth=$%.2f qty=%s order_type=%s",
+            snapshot.spread_abs, snapshot.break_even_spread, self.min_profit,
             snapshot.exec_spread, snapshot.slippage_cost,
-            max_slip, depth_req, self.quantity,
+            max_slip, depth_req, self.quantity, self.order_type,
         )
 
         # --- FULL PRE-TRADE CHECK: fetch both books once, check all conditions
@@ -553,44 +573,45 @@ class ArbitrageEngine:
 
         logger.info(
             "=== ALL ENTRY CHECKS PASSED — LONG %s@%s / SHORT %s@%s "
-            "qty=%s spread_abs=$%.4f exec_cost=$%.4f slip_cost=$%.4f ===",
+            "qty=%s spread_abs=$%.4f exec_cost=$%.4f slip_cost=$%.4f order_type=%s ===",
             long_sym, long_exchange, short_sym, short_exchange,
             self.quantity, snapshot.spread_abs, snapshot.exec_spread, snapshot.slippage_cost,
+            self.order_type,
         )
 
-        # --- Leg 1: LONG (chunked) — no repeat safety checks ---
-        leg_a = self._execute_leg_chunked(
-            symbol=long_sym,
-            side="buy",
-            total_qty=self.quantity,
-            expected_price=long_price,
-            exchange_name=long_exchange,
-            min_depth_usd=0.0,
-            slippage_pct=999.0,
+        # --- PARALLEL LEG EXECUTION ---
+        leg_a, leg_b = self._execute_legs_parallel(
+            long_sym=long_sym, short_sym=short_sym,
+            long_exchange=long_exchange, short_exchange=short_exchange,
+            long_price=long_price, short_price=short_price,
+            min_depth_usd=0.0, slippage_pct=999.0,
         )
-        if not leg_a.success:
-            return ArbExecutionResult(
-                success=False, leg_a=leg_a, leg_b=None,
-                snapshot=snapshot,
-                error=f"Leg A (LONG {long_sym}) failed: {leg_a.error}",
-            )
 
-        # --- Leg 2: SHORT (chunked) — no repeat safety checks ---
-        leg_b = self._execute_leg_chunked(
-            symbol=short_sym,
-            side="sell",
-            total_qty=self.quantity,
-            expected_price=short_price,
-            exchange_name=short_exchange,
-            min_depth_usd=0.0,
-            slippage_pct=999.0,
-        )
-        if not leg_b.success:
-            logger.error("Leg B failed after Leg A filled — position is now ONE-SIDED on %s", long_sym)
+        if not leg_a.success and not leg_b.success:
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Leg B (SHORT {short_sym}) failed after Leg A filled: {leg_b.error}. Manual intervention required.",
+                error=f"Both legs failed: A={leg_a.error}; B={leg_b.error}",
+            )
+
+        if not leg_a.success:
+            # Leg B filled but Leg A failed — unwind Leg B
+            logger.error("Leg A failed, unwinding Leg B (buying back %s)", short_sym)
+            self._unwind_leg(short_sym, "buy", self.quantity, short_price, short_exchange)
+            return ArbExecutionResult(
+                success=False, leg_a=leg_a, leg_b=leg_b,
+                snapshot=snapshot,
+                error=f"Leg A (LONG {long_sym}) failed: {leg_a.error}. Leg B unwound.",
+            )
+
+        if not leg_b.success:
+            # Leg A filled but Leg B failed — unwind Leg A
+            logger.error("Leg B failed, unwinding Leg A (selling %s)", long_sym)
+            self._unwind_leg(long_sym, "sell", self.quantity, long_price, long_exchange)
+            return ArbExecutionResult(
+                success=False, leg_a=leg_a, leg_b=leg_b,
+                snapshot=snapshot,
+                error=f"Leg B (SHORT {short_sym}) failed: {leg_b.error}. Leg A unwound.",
             )
 
         # --- Success ---
@@ -797,32 +818,31 @@ class ArbitrageEngine:
             snapshot.exec_spread, snapshot.slippage_cost,
         )
 
-        # --- Leg A: close the LONG position (chunked) — no repeat safety checks ---
-        leg_a = self._execute_leg_chunked(
-            symbol=sell_sym, side="sell", total_qty=self.quantity,
-            expected_price=sell_price, exchange_name=sell_exchange,
+        # --- PARALLEL EXIT LEG EXECUTION ---
+        # For exit, long_sym = sell (close long), short_sym = buy (close short)
+        # We reuse _execute_legs_parallel with reversed sides
+        leg_a, leg_b = self._execute_legs_parallel(
+            long_sym=buy_sym, short_sym=sell_sym,
+            long_exchange=buy_exchange, short_exchange=sell_exchange,
+            long_price=buy_price, short_price=sell_price,
             min_depth_usd=0.0, slippage_pct=999.0,
         )
-        if not leg_a.success:
-            logger.warning("Exit Leg A failed — keeping position open.")
-            return ArbExecutionResult(
-                success=False, leg_a=leg_a, leg_b=None,
-                snapshot=snapshot,
-                error=f"Exit Leg A (SELL {sell_sym}) failed: {leg_a.error}. Position kept open.",
-            )
 
-        # --- Leg B: close the SHORT position (chunked) — no repeat safety checks ---
-        leg_b = self._execute_leg_chunked(
-            symbol=buy_sym, side="buy", total_qty=self.quantity,
-            expected_price=buy_price, exchange_name=buy_exchange,
-            min_depth_usd=0.0, slippage_pct=999.0,
-        )
-        if not leg_b.success:
-            logger.error("Exit Leg B failed after Leg A filled — position is now ONE-SIDED on %s", buy_sym)
+        if not leg_a.success and not leg_b.success:
+            logger.warning("Both exit legs failed — keeping position open.")
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Exit Leg B (BUY {buy_sym}) failed after Leg A filled: {leg_b.error}. Manual intervention required.",
+                error=f"Both exit legs failed: A={leg_a.error}; B={leg_b.error}. Position kept open.",
+            )
+
+        if not leg_a.success or not leg_b.success:
+            failed_leg = "A (BUY)" if not leg_a.success else "B (SELL)"
+            logger.error("Exit %s failed — position is now ONE-SIDED. Manual intervention required.", failed_leg)
+            return ArbExecutionResult(
+                success=False, leg_a=leg_a, leg_b=leg_b,
+                snapshot=snapshot,
+                error=f"Exit {failed_leg} failed. Position ONE-SIDED — manual intervention required.",
             )
 
         # --- Success: clear position state ---
@@ -835,6 +855,134 @@ class ArbitrageEngine:
             success=True, leg_a=leg_a, leg_b=leg_b,
             snapshot=snapshot, error=None,
         )
+
+    # ------------------------------------------------------------------
+    # Parallel execution helper
+    # ------------------------------------------------------------------
+
+    def _execute_single_leg(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        expected_price: float,
+        exchange_name: str,
+        min_depth_usd: float,
+        slippage_pct: float,
+    ) -> TradeResult:
+        """Execute a single leg using the configured order type."""
+        leg_client = self._get_client(exchange_name)
+
+        if self.order_type == "aggressive_limit":
+            return self.executor.execute_aggressive_limit_order(
+                symbol=symbol, side=side, quantity=quantity,
+                expected_price=expected_price,
+                offset_ticks=self.limit_offset_ticks,
+                slippage_pct=slippage_pct, min_depth_usd=min_depth_usd,
+                client=leg_client,
+            )
+        else:
+            # Fallback: market order (chunked)
+            return self._execute_leg_chunked(
+                symbol=symbol, side=side, total_qty=quantity,
+                expected_price=expected_price, exchange_name=exchange_name,
+                min_depth_usd=min_depth_usd, slippage_pct=slippage_pct,
+            )
+
+    def _execute_legs_parallel(
+        self,
+        long_sym: str,
+        short_sym: str,
+        long_exchange: str,
+        short_exchange: str,
+        long_price: float,
+        short_price: float,
+        min_depth_usd: float,
+        slippage_pct: float,
+    ) -> tuple[TradeResult, TradeResult]:
+        """Execute both legs in parallel using ThreadPoolExecutor.
+
+        Returns (leg_a_result, leg_b_result). Caller handles unwind logic.
+        """
+        t_start = time.time()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(
+                self._execute_single_leg,
+                symbol=long_sym, side="buy", quantity=self.quantity,
+                expected_price=long_price, exchange_name=long_exchange,
+                min_depth_usd=min_depth_usd, slippage_pct=slippage_pct,
+            )
+            future_b = pool.submit(
+                self._execute_single_leg,
+                symbol=short_sym, side="sell", quantity=self.quantity,
+                expected_price=short_price, exchange_name=short_exchange,
+                min_depth_usd=min_depth_usd, slippage_pct=slippage_pct,
+            )
+
+            # Wait for both to complete
+            try:
+                leg_a = future_a.result(timeout=30)
+            except Exception as exc:
+                leg_a = TradeResult(
+                    success=False, order_response=None,
+                    depth=None, slippage=None,
+                    error=f"Leg A exception: {exc}",
+                )
+
+            try:
+                leg_b = future_b.result(timeout=30)
+            except Exception as exc:
+                leg_b = TradeResult(
+                    success=False, order_response=None,
+                    depth=None, slippage=None,
+                    error=f"Leg B exception: {exc}",
+                )
+
+        elapsed_ms = (time.time() - t_start) * 1000
+        logger.info(
+            "Parallel execution done in %.0fms — Leg A (%s %s): %s | Leg B (%s %s): %s",
+            elapsed_ms,
+            "BUY", long_sym, "OK" if leg_a.success else f"FAIL: {leg_a.error}",
+            "SELL", short_sym, "OK" if leg_b.success else f"FAIL: {leg_b.error}",
+        )
+
+        return leg_a, leg_b
+
+    def _unwind_leg(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        expected_price: float,
+        exchange_name: str,
+    ) -> TradeResult:
+        """Emergency unwind: close a filled leg using market order (max slippage)."""
+        logger.warning(
+            "UNWIND: %s %s qty=%s @ ~%.4f on %s",
+            side.upper(), symbol, quantity, expected_price, exchange_name,
+        )
+        leg_client = self._get_client(exchange_name)
+        try:
+            result = self.executor.execute_market_order(
+                symbol=symbol, side=side, quantity=quantity,
+                expected_price=expected_price,
+                slippage_pct=self.settings.max_slippage_pct,
+                min_depth_usd=0.0,
+                client=leg_client,
+            )
+            if result.success:
+                logger.info("UNWIND successful: %s %s", side.upper(), symbol)
+            else:
+                logger.error("UNWIND FAILED: %s %s — %s", side.upper(), symbol, result.error)
+            return result
+        except Exception as exc:
+            logger.error("UNWIND EXCEPTION: %s %s — %s", side.upper(), symbol, exc)
+            return TradeResult(
+                success=False, order_response=None,
+                depth=None, slippage=None,
+                error=f"Unwind exception: {exc}",
+            )
 
     # ------------------------------------------------------------------
     # Chunked execution helper
