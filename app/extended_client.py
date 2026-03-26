@@ -24,18 +24,31 @@ _MARKET_ORDER_SLIPPAGE = Decimal("0.0075")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+import threading
+
+# A single background thread with a persistent event loop, shared across all
+# ExtendedClient instances. This avoids "Event loop is closed" errors that occur
+# when asyncio.run() is called multiple times from a ThreadPoolExecutor inside
+# an already-running FastAPI event loop.
+_bg_loop: asyncio.AbstractEventLoop | None = None
+_bg_loop_lock = threading.Lock()
+
+
+def _get_bg_loop() -> asyncio.AbstractEventLoop:
+    global _bg_loop
+    with _bg_loop_lock:
+        if _bg_loop is None or _bg_loop.is_closed():
+            _bg_loop = asyncio.new_event_loop()
+            t = threading.Thread(target=_bg_loop.run_forever, daemon=True)
+            t.start()
+        return _bg_loop
+
+
 def _run_async(coro):
-    """Run an async coroutine from sync code."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        # Already inside an event loop (e.g. FastAPI) — use a new thread
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return pool.submit(asyncio.run, coro).result()
-    return asyncio.run(coro)
+    """Run an async coroutine from sync code using a persistent background loop."""
+    loop = _get_bg_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=30)
 
 
 class ExtendedClient:
@@ -59,11 +72,13 @@ class ExtendedClient:
 
         # x10 SDK trading client (lazy init — only if credentials provided)
         self._trading_client = None
+        self._tick_size_cache: dict[str, Decimal] = {}    # symbol -> minPriceChange
+        self._min_size_cache: dict[str, Decimal] = {}     # symbol -> minOrderSize
         self._api_key = api_key
         self._public_key = public_key
         self._private_key = private_key
         self._vault = vault
-        self._has_credentials = bool(api_key and private_key and public_key and vault)
+        self._has_credentials = bool(api_key and private_key and public_key and vault is not None)
 
         if self._has_credentials:
             self._init_trading_client()
@@ -133,6 +148,39 @@ class ExtendedClient:
 
         return {"bids": bids[:limit], "asks": asks[:limit]}
 
+    def _load_market_config(self) -> None:
+        """Fetch all market configs and populate tick size + min order size caches."""
+        url = f"{self._base_url}/info/markets"
+        resp = self._session.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        for m in data.get("data", []):
+            name = m["name"]
+            tc = m.get("tradingConfig", {})
+            tick = tc.get("minPriceChange")
+            if tick:
+                self._tick_size_cache[name] = Decimal(str(tick))
+            min_size = tc.get("minOrderSize")
+            if min_size:
+                self._min_size_cache[name] = Decimal(str(min_size))
+
+    def _get_tick_size(self, symbol: str) -> Decimal:
+        if symbol not in self._tick_size_cache:
+            self._load_market_config()
+        return self._tick_size_cache.get(symbol, Decimal("0.01"))
+
+    def get_min_order_size(self, symbol: str) -> Decimal:
+        """Return the minimum order size for a symbol (0 if unknown)."""
+        if symbol not in self._min_size_cache:
+            self._load_market_config()
+        return self._min_size_cache.get(symbol, Decimal("0"))
+
+    def _round_to_tick(self, price: Decimal, symbol: str) -> Decimal:
+        """Round price down (sell) or up (buy) to the instrument's tick size."""
+        tick = self._get_tick_size(symbol)
+        # quantize with ROUND_DOWN — caller adjusts direction via slippage buffer
+        return (price / tick).to_integral_value(rounding="ROUND_DOWN") * tick
+
     def fetch_markets(self) -> list[dict]:
         """Return list of available markets with normalised keys."""
         url = f"{self._base_url}/info/markets"
@@ -165,37 +213,44 @@ class ExtendedClient:
         side: Literal["buy", "sell"],
         amount: Decimal,
         expected_price: float | None = None,
+        slippage_pct: float | None = None,
     ) -> dict:
         """Place a market order (emulated as IOC limit with slippage buffer).
 
-        Extended does not support native market orders. Per their docs,
-        market orders are IOC limits with price = best_price * (1 ± 0.75%).
+        Extended does not support native market orders. The limit price is set
+        to best_price * (1 ± slippage_pct/100). Falls back to _MARKET_ORDER_SLIPPAGE
+        (0.75%) if no slippage_pct is given.
         """
         self._require_trading()
         from x10.perpetual.orders import OrderSide, TimeInForce
 
-        # Determine aggressive limit price from orderbook
-        if expected_price:
-            ref_price = Decimal(str(expected_price))
-        else:
-            book = self.fetch_order_book(symbol, limit=1)
-            if side == "buy" and book["asks"]:
-                ref_price = Decimal(str(book["asks"][0][0]))
-            elif side == "sell" and book["bids"]:
-                ref_price = Decimal(str(book["bids"][0][0]))
-            else:
-                raise RuntimeError(f"No {'asks' if side == 'buy' else 'bids'} in {symbol} orderbook")
-
+        # Use best ask/bid as reference — more accurate than mid price
+        book = self.fetch_order_book(symbol, limit=1)
         if side == "buy":
-            limit_price = ref_price * (1 + _MARKET_ORDER_SLIPPAGE)
+            if not book["asks"]:
+                raise RuntimeError(f"No asks in {symbol} orderbook")
+            ref_price = Decimal(str(book["asks"][0][0]))
         else:
-            limit_price = ref_price * (1 - _MARKET_ORDER_SLIPPAGE)
+            if not book["bids"]:
+                raise RuntimeError(f"No bids in {symbol} orderbook")
+            ref_price = Decimal(str(book["bids"][0][0]))
+
+        slip = Decimal(str(slippage_pct / 100)) if slippage_pct is not None else _MARKET_ORDER_SLIPPAGE
+
+        tick = self._get_tick_size(symbol)
+        if side == "buy":
+            raw = ref_price * (1 + slip)
+            limit_price = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
+        else:
+            raw = ref_price * (1 - slip)
+            limit_price = (raw / tick).to_integral_value(rounding="ROUND_DOWN") * tick
 
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
         logger.info(
-            "Extended MARKET %s %s qty=%s price=%s (ref=%s)",
-            side.upper(), symbol, amount, limit_price.quantize(Decimal("0.01")), ref_price,
+            "Extended MARKET %s %s qty=%s limit_price=%s (best=%s slip=%.4f%% tick=%s)",
+            side.upper(), symbol, amount, limit_price, ref_price,
+            float(slip) * 100, tick,
         )
 
         result = _run_async(
@@ -224,11 +279,14 @@ class ExtendedClient:
         self._require_trading()
         from x10.perpetual.orders import OrderSide
 
+        tick = self._get_tick_size(symbol)
+        price = (Decimal(str(price)) / tick).to_integral_value(rounding="ROUND_DOWN") * tick
+
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
         logger.info(
-            "Extended LIMIT %s %s qty=%s @ %s (post_only=%s reduce_only=%s)",
-            side.upper(), symbol, amount, price, post_only, reduce_only,
+            "Extended LIMIT %s %s qty=%s @ %s (post_only=%s reduce_only=%s tick=%s)",
+            side.upper(), symbol, amount, price, post_only, reduce_only, tick,
         )
 
         result = _run_async(
@@ -246,28 +304,48 @@ class ExtendedClient:
         return {"id": str(getattr(result, "id", None)), "external_id": str(getattr(result, "external_id", None))}
 
     def fetch_positions(self, symbols: list[str] | None = None) -> list[dict]:
-        """Fetch open positions, normalised to match GRVT format."""
-        self._require_trading()
-
-        positions = _run_async(self._trading_client.account.get_positions())
+        """Fetch open positions via REST, normalised to match GRVT format."""
+        url = f"{self._base_url}/user/positions"
+        resp = self._session.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status", "").upper() != "OK":
+            raise RuntimeError(f"Extended positions error: {data}")
 
         result = []
-        for p in positions.data:
-            market = getattr(p, "market", "")
+        for p in data.get("data", []):
+            market = p.get("market", "")
             if symbols and market not in symbols:
                 continue
-            side = str(getattr(p, "side", "")).upper()
-            size = float(getattr(p, "size", 0))
+            side = str(p.get("side", "")).upper()
+            size = float(p.get("size", 0))
             result.append({
                 "instrument": market,
                 "size": size if side == "LONG" else -size,
-                "entry_price": float(getattr(p, "open_price", 0)),
-                "mark_price": float(getattr(p, "mark_price", 0)),
-                "unrealised_pnl": float(getattr(p, "unrealised_pnl", 0)),
-                "leverage": float(getattr(p, "leverage", 1)),
+                "entry_price": float(p.get("openPrice", 0)),
+                "mark_price": float(p.get("markPrice", 0)),
+                "unrealized_pnl": float(p.get("unrealisedPnl", 0)),
+                "leverage": float(p.get("leverage", 0)),
                 "side": side,
             })
         return result
+
+    def get_account_summary(self) -> dict:
+        """Fetch account balance/equity summary, normalised to match GRVT format."""
+        url = f"{self._base_url}/user/balance"
+        resp = self._session.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status", "").upper() != "OK":
+            raise RuntimeError(f"Extended balance error: {data}")
+        d = data.get("data", {})
+        positions = self.fetch_positions()
+        return {
+            "total_equity": d.get("equity", "0"),
+            "available_balance": d.get("availableForTrade", "0"),
+            "unrealized_pnl": d.get("unrealisedPnl", "0"),
+            "positions": positions,
+        }
 
     def fetch_fees(self, symbol: str) -> dict:
         """Fetch current fee rates for a market."""

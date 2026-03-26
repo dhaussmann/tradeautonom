@@ -49,6 +49,7 @@ class GrvtClient:
         # every cookie refresh (get_cookie_with_expiration).
         _patch_session_no_ssl_verify()
 
+        self._min_size_cache: dict[str, Decimal] = {}
         self._api = GrvtCcxt(
             self._env,
             logger,
@@ -92,7 +93,15 @@ class GrvtClient:
                 "tick_size": m.get("tick_size"),
                 "min_size": m.get("min_size"),
             })
+            if m.get("min_size"):
+                self._min_size_cache[sym] = Decimal(str(m["min_size"]))
         return markets
+
+    def get_min_order_size(self, symbol: str) -> Decimal:
+        """Return minimum order size for the symbol from GRVT market data."""
+        if symbol not in self._min_size_cache:
+            self.fetch_markets()
+        return self._min_size_cache.get(symbol, Decimal("0"))
 
     # ------------------------------------------------------------------
     # Order execution
@@ -104,6 +113,7 @@ class GrvtClient:
         side: str,
         amount: Decimal,
         client_order_id: int | None = None,
+        slippage_pct: float | None = None,  # accepted but unused — GRVT handles slippage natively
     ) -> dict:
         """Place a market order. Returns the API response dict."""
         cid = client_order_id or rand_uint32()

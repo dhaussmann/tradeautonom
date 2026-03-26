@@ -108,7 +108,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
     <div class="card-title">Live Spread Monitor</div>
     <div class="spread-row">
       <div class="pb"><div class="lbl">LEG B (Long)</div><div class="pr" id="prB">—</div><div class="inst"><span id="iB">PAXG_USDT_Perp</span> <span id="exB" style="color:var(--accent);font-size:9px">grvt</span></div></div>
-      <div class="sc"><div class="sv" id="sV">—</div><div class="sl">SPREAD (B−A)</div><div class="sv" id="sVexec" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div></div>
+      <div class="sc"><div class="sv" id="sV">—</div><div class="sl">SPREAD (B−A)</div><div class="sv" id="sVexec" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div><div class="sv" id="sVbe" style="font-size:13px;color:var(--yellow);margin-top:4px">—</div><div class="sl" style="font-size:9px">BREAK-EVEN</div></div>
       <div class="pb"><div class="lbl">LEG A (Short)</div><div class="pr" id="prA">—</div><div class="inst"><span id="iA">XAU_USDT_Perp</span> <span id="exA" style="color:var(--accent);font-size:9px">grvt</span></div></div>
     </div>
     <div class="sig none" id="sigBar"><span class="dot"></span><span id="sigTxt">Waiting for data...</span></div>
@@ -165,17 +165,10 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
   </div>
 
   <!-- Account -->
-  <div class="card">
-    <div class="card-title">Account</div>
-    <div class="sg">
-      <div class="st"><div class="stl">Equity</div><div class="stv" id="aEq">—</div></div>
-      <div class="st"><div class="stl">Available</div><div class="stv" id="aAv">—</div></div>
-      <div class="st"><div class="stl">Unrealized PnL</div><div class="stv" id="aPnl">—</div></div>
-    </div>
-    <div style="margin-top:14px"><div class="card-title" style="margin-bottom:6px">Open Positions</div>
-    <table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th></tr></thead>
-    <tbody id="posBody"><tr><td colspan="5" class="empty">No positions</td></tr></tbody></table></div>
-    <div class="br">
+  <div class="card full">
+    <div class="card-title">Account Overview</div>
+    <div id="acctAll"></div>
+    <div class="br" style="margin-top:14px">
       <button class="btn bs" onclick="manualEntry()">Manual Entry</button>
       <button class="btn bd" onclick="manualExit()">Manual Exit</button>
     </div>
@@ -226,11 +219,12 @@ async function loadInstruments(leg,selected){
   if(!selected&&d.markets.length)sel.value=d.markets[0].symbol;
 }
 
+function parseNum(id){return parseFloat($( id).value.replace(',','.'))||0;}
 async function saveCfg(){
-  const b={spread_entry_low:+$('cES').value,spread_exit_high:+$('cXS').value,
-    max_exec_spread:+$('cME').value,
-    quantity:+$('cQ').value,slippage_pct:+$('cSl').value,min_depth_usd:+$('cMD').value,
-    liquidity_multiplier:+$('cLM').value,chunk_size:+$('cCS').value,chunk_delay_ms:parseInt($('cCD').value),
+  const b={spread_entry_low:parseNum('cES'),spread_exit_high:parseNum('cXS'),
+    max_exec_spread:parseNum('cME'),
+    quantity:parseNum('cQ'),slippage_pct:parseNum('cSl'),min_depth_usd:parseNum('cMD'),
+    liquidity_multiplier:parseNum('cLM'),chunk_size:parseNum('cCS'),chunk_delay_ms:parseInt($('cCD').value),
     leg_a_exchange:$('cExA').value,leg_b_exchange:$('cExB').value,
     instrument_a:$('cInstA').value,instrument_b:$('cInstB').value};
   const r=await f('/arb/config',{method:'POST',body:JSON.stringify(b)});
@@ -241,6 +235,8 @@ async function saveCfg(){
 
   const nr=parseInt($('cRR').value)||3;
   if(nr!==rMs/1000){rMs=nr*1000;$('rr').textContent=nr;startR()}
+  // Immediately refresh spread + positions with new config
+  await tick();
 }
 
 async function toggleSim(){
@@ -256,9 +252,10 @@ async function refreshSpread(){
   $('prA').textContent='$'+s.mid_price_a.toFixed(2);
   $('prB').textContent='$'+s.mid_price_b.toFixed(2);
   // Directional spread: B - A
-  const sp=s.spread||0, es=s.exec_spread||0;
+  const sp=s.spread||0, es=s.exec_spread||0, be=s.break_even_spread||0;
   $('sV').textContent='$'+sp.toFixed(2);
   $('sVexec').textContent='$'+es.toFixed(2);
+  $('sVbe').textContent='$'+be.toFixed(2);
   const eT=+$('cES').value||2,xT=+$('cXS').value||8;
   const sv=$('sV');
   sv.style.color=sp<=eT?'var(--green)':sp>=xT?'var(--red)':'var(--yellow)';
@@ -302,20 +299,44 @@ function renderHist(eT,xT){
 }
 
 async function refreshAcct(){
-  const d=await f('/account/summary');if(!d)return;
-  $('aEq').textContent='$'+parseFloat(d.total_equity).toFixed(2);
-  $('aAv').textContent='$'+parseFloat(d.available_balance).toFixed(2);
-  const p=parseFloat(d.unrealized_pnl),el=$('aPnl');
-  el.textContent=(p>=0?'+':'')+p.toFixed(4);
-  el.style.color=p>=0?'var(--green)':'var(--red)';
-  const pos=d.positions||[],tb=$('posBody');
-  if(!pos.length){tb.innerHTML='<tr><td colspan="5" class="empty">No positions</td></tr>';return}
-  tb.innerHTML=pos.map(p=>{
-    const sz=parseFloat(p.size),sd=sz>0?'LONG':'SHORT',sc=sz>0?'long':'short';
-    const pnl=parseFloat(p.unrealized_pnl),pc=pnl>=0?'pp':'pn';
-    return '<tr><td>'+p.instrument+'</td><td class="'+sc+'">'+sd+'</td><td>'+Math.abs(sz)+'</td><td>$'+parseFloat(p.entry_price).toFixed(2)+'</td><td class="'+pc+'">'+(pnl>=0?'+':'')+pnl.toFixed(4)+'</td></tr>';
-  }).join('');
-  $('envBadge').textContent='GRVT Testnet';
+  const all=await f('/account/all');if(!all)return;
+  const exColors={grvt:'var(--accent)',extended:'var(--blue)'};
+  let html='';
+  let totalEquity=0,totalPnl=0;
+  for(const ex of all){
+    const eq=parseFloat(ex.equity||0),av=parseFloat(ex.available||0),pnl=parseFloat(ex.unrealized_pnl||0);
+    totalEquity+=eq;totalPnl+=pnl;
+    const col=exColors[ex.exchange]||'var(--dim)';
+    const pnlCol=pnl>=0?'var(--green)':'var(--red)';
+    html+='<div style="margin-bottom:14px">';
+    html+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">';
+    html+='<span style="font-size:12px;font-weight:700;color:'+col+';text-transform:uppercase">'+ex.exchange+'</span>';
+    if(ex.error){html+='<span style="font-size:11px;color:var(--red)">'+ex.error+'</span></div></div>';continue;}
+    html+='<span style="font-size:11px;color:var(--dim)">Equity: <b style="color:var(--text)">$'+eq.toFixed(2)+'</b></span>';
+    html+='<span style="font-size:11px;color:var(--dim);margin-left:12px">Available: <b style="color:var(--text)">$'+av.toFixed(2)+'</b></span>';
+    html+='<span style="font-size:11px;color:var(--dim);margin-left:12px">uPnL: <b style="color:'+pnlCol+'">'+(pnl>=0?'+':'')+pnl.toFixed(4)+'</b></span>';
+    html+='</div>';
+    const pos=ex.positions||[];
+    if(!pos.length){html+='<div class="empty" style="padding:8px 0;font-size:11px">No open positions</div>';}
+    else{
+      html+='<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th></tr></thead><tbody>';
+      html+=pos.map(p=>{
+        const sz=parseFloat(p.size),sd=sz>0?'LONG':'SHORT',sc=sz>0?'long':'short';
+        const rawPnl=p.unrealized_pnl!==undefined?p.unrealized_pnl:p.unrealised_pnl;
+        const ppnl=parseFloat(rawPnl||0),pc=ppnl>=0?'pp':'pn';
+        return '<tr><td>'+p.instrument+'</td><td class="'+sc+'">'+sd+'</td><td>'+Math.abs(sz)+'</td><td>$'+parseFloat(p.entry_price).toFixed(2)+'</td><td class="'+pc+'">'+(ppnl>=0?'+':'')+ppnl.toFixed(4)+'</td></tr>';
+      }).join('');
+      html+='</tbody></table>';
+    }
+    html+='</div>';
+  }
+  // Total summary bar
+  const tc=totalPnl>=0?'var(--green)':'var(--red)';
+  html='<div style="display:flex;gap:16px;margin-bottom:14px;padding:10px;background:var(--surface2);border-radius:8px">'
+    +'<span style="font-size:12px;color:var(--dim)">Total Equity: <b style="color:var(--text)">$'+totalEquity.toFixed(2)+'</b></span>'
+    +'<span style="font-size:12px;color:var(--dim)">Total uPnL: <b style="color:'+tc+'">'+(totalPnl>=0?'+':'')+totalPnl.toFixed(4)+'</b></span>'
+    +'</div>'+html;
+  $('acctAll').innerHTML=html;
 }
 
 async function manualEntry(){

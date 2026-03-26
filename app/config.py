@@ -15,19 +15,19 @@ class Settings(BaseSettings):
     # Trading safety
     default_slippage_pct: float = 0.5
     max_slippage_pct: float = 2.0
-    min_order_book_depth_usd: float = 1000.0
+    min_order_book_depth_usd: float = 1.0
 
-    # Arbitrage — Spread-Range strategy (PAXG always >= XAU)
-    # Spread = PAXG_mid - XAU_mid (always >= 0)
-    # Entry when spread <= low threshold → Long PAXG + Short XAU
-    # Exit  when spread >= high threshold → close both
-    arb_spread_entry_low: float = 2.0   # enter when spread narrows to this
-    arb_spread_exit_high: float = 8.0   # exit when spread widens to this
-    arb_max_exec_spread: float = 5.0    # safety: max bid-ask cost to execute
-    arb_quantity: float = 1.0
-    arb_xau_instrument: str = "XAU_USDT_Perp"
-    arb_paxg_instrument: str = "PAXG_USDT_Perp"
-    arb_leg_a_exchange: str = "grvt"       # exchange for instrument_a (leg A)
+    # Arbitrage — Cross-exchange spread strategy
+    # Spread = abs(mid_b - mid_a)  (always >= 0)
+    # Entry when spread_abs >= entry threshold → Long cheap / Short expensive
+    # Exit  when spread_abs <= exit threshold  → gap has collapsed, close both
+    arb_spread_entry_low: float = 0.03  # enter when spread_abs >= this
+    arb_spread_exit_high: float = 0.005  # exit when spread_abs <= this (gap collapsed)
+    arb_max_exec_spread: float = 0.5    # safety: max bid-ask execution cost
+    arb_quantity: float = 0.1
+    arb_xau_instrument: str = "SOL-USD"       # instrument for leg A (e.g. Extended)
+    arb_paxg_instrument: str = "SOL_USDT_Perp"  # instrument for leg B (e.g. GRVT)
+    arb_leg_a_exchange: str = "extended"   # exchange for instrument_a (leg A)
     arb_leg_b_exchange: str = "grvt"       # exchange for instrument_b (leg B)
     arb_liquidity_multiplier: float = 2.0
     extended_api_base_url: str = "https://api.starknet.extended.exchange/api/v1"

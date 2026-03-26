@@ -34,3 +34,7 @@ class ExchangeClient(Protocol):
             {"symbol": "BTC_USDT_Perp", "name": "BTC/USDT Perp", ...}
         """
         ...
+
+    def get_min_order_size(self, symbol: str) -> "Decimal":
+        """Return minimum order size for the symbol (0 if no minimum / unknown)."""
+        ...

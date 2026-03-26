@@ -114,6 +114,8 @@ class SpreadInfo(BaseModel):
     spread_abs: float
     a_is_cheaper: bool
     exec_spread: float = 0.0
+    slippage_cost: float = 0.0
+    break_even_spread: float = 0.0
 
 
 class ArbCheckResponse(BaseModel):

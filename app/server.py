@@ -46,6 +46,8 @@ def _spread_info(snapshot) -> SpreadInfo:
         spread_abs=snapshot.spread_abs,
         a_is_cheaper=snapshot.a_is_cheaper,
         exec_spread=getattr(snapshot, 'exec_spread', 0.0),
+        slippage_cost=getattr(snapshot, 'slippage_cost', 0.0),
+        break_even_spread=getattr(snapshot, 'break_even_spread', 0.0),
     )
 
 # Module-level singletons (populated in lifespan)
@@ -341,10 +343,15 @@ async def arb_config(req: ArbConfigRequest):
         _arb_engine.chunk_size = Decimal(str(req.chunk_size))
     if req.chunk_delay_ms is not None:
         _arb_engine.chunk_delay_ms = req.chunk_delay_ms
+    instruments_changed = False
     if req.instrument_a is not None:
+        if req.instrument_a != _arb_engine.instrument_a:
+            instruments_changed = True
         _arb_engine.instrument_a = req.instrument_a
         _arb_engine.xau_instrument = req.instrument_a
     if req.instrument_b is not None:
+        if req.instrument_b != _arb_engine.instrument_b:
+            instruments_changed = True
         _arb_engine.instrument_b = req.instrument_b
         _arb_engine.paxg_instrument = req.instrument_b
     if req.leg_a_exchange is not None:
@@ -353,6 +360,13 @@ async def arb_config(req: ArbConfigRequest):
         _arb_engine.leg_b_exchange = req.leg_b_exchange
     if req.simulation_mode is not None:
         _arb_engine.simulation_mode = req.simulation_mode
+    # Reset position state when instruments change — old position no longer applies
+    if instruments_changed:
+        _arb_engine._has_position = False
+        _arb_engine._long_sym = None
+        _arb_engine._short_sym = None
+        _arb_engine._entry_spread_actual = None
+        logger.info("Instruments changed — position state reset")
     return {"status": "ok", "message": "Configuration updated"}
 
 
@@ -375,21 +389,51 @@ async def arb_force_state(req: dict):
 
 @app.get("/account/summary")
 async def account_summary():
-    """Return the current sub-account summary."""
+    """Return the current sub-account summary (GRVT only, for backward compat)."""
     try:
         return _client.get_account_summary()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/account/all")
+async def account_all():
+    """Return equity, balance and positions from all exchanges."""
+    result = []
+    for exchange_name, client in _exchange_clients.items():
+        entry = {"exchange": exchange_name, "equity": "0", "available": "0", "unrealized_pnl": "0", "positions": [], "error": None}
+        try:
+            summary = client.get_account_summary()
+            entry["equity"] = summary.get("total_equity", "0")
+            entry["available"] = summary.get("available_balance", "0")
+            entry["unrealized_pnl"] = summary.get("unrealized_pnl", "0")
+            positions = summary.get("positions", [])
+            for p in positions:
+                p["exchange"] = exchange_name
+            entry["positions"] = positions
+        except Exception as exc:
+            entry["error"] = str(exc)
+        result.append(entry)
+    return result
+
+
 @app.get("/account/positions")
 async def account_positions(symbols: str = ""):
-    """Return open positions. Pass comma-separated symbols or leave empty for all."""
+    """Return open positions from all exchanges. Pass comma-separated symbols or leave empty for all."""
     sym_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else []
-    try:
-        return _client.fetch_positions(sym_list)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    all_positions = []
+    errors = []
+    for exchange_name, client in _exchange_clients.items():
+        try:
+            positions = client.fetch_positions(sym_list)
+            for p in positions:
+                p["exchange"] = exchange_name
+            all_positions.extend(positions)
+        except Exception as exc:
+            errors.append(f"{exchange_name}: {exc}")
+    if errors and not all_positions:
+        raise HTTPException(status_code=500, detail="; ".join(errors))
+    return all_positions
 
 
 # ------------------------------------------------------------------

@@ -21,7 +21,7 @@ from app.config import Settings
 from app.exchange import ExchangeClient
 from app.executor import TradeExecutor, TradeResult
 from app.grvt_client import GrvtClient
-from app.safety import check_dual_liquidity, estimate_fill_price
+from app.safety import estimate_fill_price, run_pre_trade_checks
 
 logger = logging.getLogger("tradeautonom.arbitrage")
 
@@ -44,6 +44,11 @@ class SpreadSnapshot:
     # Execution spread: ask(cheap) - bid(expensive).
     # This is the REAL cost of opening the arb position.
     exec_spread: float = 0.0
+    # Slippage cost on both legs (qty * slippage_pct/100 * price, both sides).
+    # break_even_spread = exec_spread + slippage_cost — entry is only profitable
+    # if the EXIT spread will be at least this much wider than the entry spread.
+    slippage_cost: float = 0.0
+    break_even_spread: float = 0.0
 
 
 @dataclass
@@ -126,48 +131,70 @@ class ArbitrageEngine:
     # ------------------------------------------------------------------
 
     def sync_position_from_exchange(self) -> None:
-        """Read open positions from the exchange and restore internal state.
+        """Read open positions from both exchanges and restore internal state.
 
-        This must be called on startup so the engine knows about positions
-        that survived a server restart.  Only works with GRVT (which has
-        authenticated position queries).
+        Queries each instrument from its configured exchange so that
+        cross-exchange arb pairs (e.g. Extended + GRVT) are handled correctly.
         """
-        if not self.client or not hasattr(self.client, "fetch_positions"):
-            logger.info("Position sync skipped — no GRVT client with fetch_positions.")
-            return
+        positions: list[dict] = []
+
+        # Query leg A instrument from its exchange
         try:
-            positions = self.client.fetch_positions(
-                [self.xau_instrument, self.paxg_instrument]
-            )
+            client_a = self._client_a()
+            if hasattr(client_a, "fetch_positions"):
+                pos_a = client_a.fetch_positions([self.xau_instrument])
+                positions.extend(pos_a)
         except Exception as exc:
-            logger.warning("Could not sync positions from exchange: %s", exc)
-            return
+            logger.warning("Could not sync leg A positions (%s@%s): %s", self.xau_instrument, self.leg_a_exchange, exc)
+
+        # Query leg B instrument from its exchange (skip if same exchange to avoid double-counting)
+        if self.leg_b_exchange != self.leg_a_exchange:
+            try:
+                client_b = self._client_b()
+                if hasattr(client_b, "fetch_positions"):
+                    pos_b = client_b.fetch_positions([self.paxg_instrument])
+                    positions.extend(pos_b)
+            except Exception as exc:
+                logger.warning("Could not sync leg B positions (%s@%s): %s", self.paxg_instrument, self.leg_b_exchange, exc)
+        else:
+            # Same exchange — query both instruments in one call
+            try:
+                client_b = self._client_b()
+                if hasattr(client_b, "fetch_positions"):
+                    pos_b = client_b.fetch_positions([self.paxg_instrument])
+                    positions.extend(pos_b)
+            except Exception as exc:
+                logger.warning("Could not sync leg B positions: %s", exc)
 
         long_sym = None
         short_sym = None
+        entry_a = 0.0
+        entry_b = 0.0
 
         for pos in positions:
             instrument = pos.get("instrument", "")
             size = float(pos.get("size", 0))
-            if instrument not in (self.xau_instrument, self.paxg_instrument):
-                continue
-            if size > 0:
-                long_sym = instrument
-            elif size < 0:
-                short_sym = instrument
+            if instrument == self.xau_instrument:
+                if size > 0:
+                    long_sym = instrument
+                    entry_a = float(pos.get("entry_price", 0))
+                elif size < 0:
+                    short_sym = instrument
+                    entry_a = float(pos.get("entry_price", 0))
+            elif instrument == self.paxg_instrument:
+                if size > 0:
+                    long_sym = instrument
+                    entry_b = float(pos.get("entry_price", 0))
+                elif size < 0:
+                    short_sym = instrument
+                    entry_b = float(pos.get("entry_price", 0))
 
         if long_sym and short_sym:
             self._has_position = True
             self._long_sym = long_sym
             self._short_sym = short_sym
-            paxg_entry = next(
-                (float(p.get("entry_price", 0)) for p in positions if p.get("instrument") == self.paxg_instrument),
-                0,
-            )
-            xau_entry = next(
-                (float(p.get("entry_price", 0)) for p in positions if p.get("instrument") == self.xau_instrument),
-                0,
-            )
+            paxg_entry = entry_b if long_sym == self.paxg_instrument else entry_a
+            xau_entry = entry_a if short_sym == self.xau_instrument else entry_b
             self._entry_spread_actual = (paxg_entry - xau_entry) if paxg_entry and xau_entry else None
             logger.info(
                 "Synced position from exchange: LONG %s / SHORT %s (entry spread ~%.2f)",
@@ -186,45 +213,71 @@ class ArbitrageEngine:
     # ------------------------------------------------------------------
 
     def get_spread_snapshot(self) -> SpreadSnapshot:
-        """Fetch order books and compute directional spread (PAXG - XAU).
+        """Fetch order books and compute spread between instrument_a and instrument_b.
 
-        spread      = PAXG_mid - XAU_mid  (should be >= 0)
-        exec_spread = PAXG_ask - XAU_bid  (cost of opening Long PAXG / Short XAU)
+        spread      = mid_b - mid_a  (signed; positive = B is more expensive)
+        spread_abs  = abs(spread)
+        a_is_cheaper = mid_a < mid_b → buy A cheap / sell B expensive
+        exec_spread = cost of the cheaper entry direction (buy cheap ask - sell exp bid)
+
+        For same-asset cross-exchange pairs (e.g. SOL on Extended vs GRVT) the
+        spread oscillates around 0 and can be positive or negative. The strategy
+        enters when spread_abs >= spread_entry_low (a meaningful price gap exists)
+        and exits when spread_abs <= spread_exit_high is no longer met.
         """
-        book_xau = self._client_a().fetch_order_book(self.xau_instrument, limit=10)
-        book_paxg = self._client_b().fetch_order_book(self.paxg_instrument, limit=10)
+        book_a = self._client_a().fetch_order_book(self.xau_instrument, limit=10)
+        book_b = self._client_b().fetch_order_book(self.paxg_instrument, limit=10)
 
-        mid_xau = _mid_price(book_xau)
-        mid_paxg = _mid_price(book_paxg)
-        # Directional spread: PAXG - XAU (always >= 0 under our assumption)
-        spread = mid_paxg - mid_xau
+        mid_a = _mid_price(book_a)
+        mid_b = _mid_price(book_b)
+        spread = mid_b - mid_a
         spread_abs = abs(spread)
+        a_is_cheaper = mid_a < mid_b
 
-        bid_xau, ask_xau = _best_bid_ask(book_xau)
-        bid_paxg, ask_paxg = _best_bid_ask(book_paxg)
+        bid_a, ask_a = _best_bid_ask(book_a)
+        bid_b, ask_b = _best_bid_ask(book_b)
 
-        # Execution spread for our strategy direction:
-        # Entry = Long PAXG (buy at ask) + Short XAU (sell at bid)
-        # Cost  = ask_paxg - bid_xau
-        exec_spread = ask_paxg - bid_xau
+        # Execution spread: cost of entering in the profitable direction.
+        # If A is cheaper: Long A (buy at ask_a) + Short B (sell at bid_b)
+        #   exec_spread = ask_a - bid_b  (negative = profitable gap, positive = costly)
+        # If B is cheaper: Long B (buy at ask_b) + Short A (sell at bid_a)
+        #   exec_spread = ask_b - bid_a
+        if a_is_cheaper:
+            exec_spread = ask_a - bid_b
+        else:
+            exec_spread = ask_b - bid_a
+
+        # Slippage cost on all 4 legs (entry + exit):
+        # slip_pct/100 * (ask_cheap + bid_exp + bid_cheap + ask_exp)
+        slip_pct = self.settings.default_slippage_pct / 100
+        slippage_cost = round(slip_pct * (ask_a + bid_a + ask_b + bid_b), 4)
+        break_even_spread = round(abs(exec_spread) + slippage_cost, 4)
 
         snapshot = SpreadSnapshot(
             instrument_a=self.xau_instrument,
             instrument_b=self.paxg_instrument,
-            mid_price_a=round(mid_xau, 4),
-            mid_price_b=round(mid_paxg, 4),
+            mid_price_a=round(mid_a, 4),
+            mid_price_b=round(mid_b, 4),
             spread=round(spread, 4),
             spread_abs=round(spread_abs, 4),
-            a_is_cheaper=mid_xau < mid_paxg,
-            best_bid_a=bid_xau,
-            best_ask_a=ask_xau,
-            best_bid_b=bid_paxg,
-            best_ask_b=ask_paxg,
+            a_is_cheaper=a_is_cheaper,
+            best_bid_a=bid_a,
+            best_ask_a=ask_a,
+            best_bid_b=bid_b,
+            best_ask_b=ask_b,
             exec_spread=round(exec_spread, 4),
+            slippage_cost=slippage_cost,
+            break_even_spread=break_even_spread,
         )
+        cheaper = self.xau_instrument if a_is_cheaper else self.paxg_instrument
         logger.info(
-            "Spread: PAXG-XAU mid=%.2f exec=%.2f (xau bid/ask=%.2f/%.2f paxg bid/ask=%.2f/%.2f)",
-            spread, exec_spread, bid_xau, ask_xau, bid_paxg, ask_paxg,
+            "Spread: %s-%s mid=%.4f abs=%.4f exec=%.4f slippage_cost=%.4f break_even=%.4f "
+            "(%s bid/ask=%.4f/%.4f  %s bid/ask=%.4f/%.4f) cheaper=%s",
+            self.paxg_instrument, self.xau_instrument,
+            spread, spread_abs, exec_spread, slippage_cost, break_even_spread,
+            self.xau_instrument, bid_a, ask_a,
+            self.paxg_instrument, bid_b, ask_b,
+            cheaper,
         )
         return snapshot
 
@@ -235,42 +288,50 @@ class ArbitrageEngine:
     def evaluate(self, snapshot: SpreadSnapshot | None = None) -> ArbCheckResult:
         """Determine whether we should ENTER, EXIT, or do NOTHING.
 
-        Uses the directional mid spread (PAXG - XAU) for the signal:
-          ENTRY: spread <= spread_entry_low  (spread is narrow)
-          EXIT:  spread >= spread_exit_high  (spread has widened)
+        Uses the ABSOLUTE spread between the two instruments:
+          ENTRY: spread_abs >= spread_entry_low AND spread_abs > break_even
+                 (a price gap large enough to be profitable exists)
+          EXIT:  spread_abs <= spread_exit_high when holding a position
+                 (price gap has collapsed back — take profit / cut)
+
+        Note: spread_entry_low should be ABOVE break_even to make a profit.
+              spread_exit_high should be BELOW spread_entry_low (gap collapsed).
         """
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
 
-        # spread = PAXG_mid - XAU_mid (directional)
-        spread = snapshot.spread
+        spread_abs = snapshot.spread_abs
+        be = snapshot.break_even_spread
 
-        if not self._has_position and 0 <= spread <= self.spread_entry_low:
-            return ArbCheckResult(
-                action="ENTRY",
-                snapshot=snapshot,
-                reason=(
-                    f"Spread ${spread:.2f} <= entry low ${self.spread_entry_low:.2f} "
-                    f"(exec ${snapshot.exec_spread:.2f})"
-                ),
-            )
-
-        if not self._has_position and spread < 0:
+        if not self._has_position:
+            if spread_abs >= self.spread_entry_low:
+                return ArbCheckResult(
+                    action="ENTRY",
+                    snapshot=snapshot,
+                    reason=(
+                        f"Spread ${spread_abs:.4f} >= entry ${self.spread_entry_low:.4f} "
+                        f"({'A cheaper' if snapshot.a_is_cheaper else 'B cheaper'}: "
+                        f"Long {self.xau_instrument if snapshot.a_is_cheaper else self.paxg_instrument} / "
+                        f"Short {self.paxg_instrument if snapshot.a_is_cheaper else self.xau_instrument}) "
+                        f"exec=${snapshot.exec_spread:.4f} slip=${snapshot.slippage_cost:.4f}"
+                    ),
+                )
             return ArbCheckResult(
                 action="NONE",
                 snapshot=snapshot,
                 reason=(
-                    f"Spread ${spread:.2f} is NEGATIVE (PAXG < XAU) — anomaly, no entry"
+                    f"Spread ${spread_abs:.4f} < entry threshold ${self.spread_entry_low:.4f} — waiting"
                 ),
             )
 
-        if self._has_position and spread >= self.spread_exit_high:
+        # Has position: exit when the gap has collapsed to exit_high or below
+        if self._has_position and spread_abs <= self.spread_exit_high:
             return ArbCheckResult(
                 action="EXIT",
                 snapshot=snapshot,
                 reason=(
-                    f"Spread ${spread:.2f} >= exit high ${self.spread_exit_high:.2f} "
-                    f"(exec ${snapshot.exec_spread:.2f})"
+                    f"Spread ${spread_abs:.4f} <= exit ${self.spread_exit_high:.4f} "
+                    f"(gap collapsed — closing position)"
                 ),
             )
 
@@ -278,9 +339,8 @@ class ArbitrageEngine:
             action="NONE",
             snapshot=snapshot,
             reason=(
-                f"Spread ${spread:.2f} — no action "
-                f"(entry<=${self.spread_entry_low:.2f}, exit>=${self.spread_exit_high:.2f}, "
-                f"pos={self._has_position})"
+                f"Spread ${spread_abs:.4f} — holding position, "
+                f"waiting for collapse to ${self.spread_exit_high:.4f}"
             ),
         )
 
@@ -306,38 +366,50 @@ class ArbitrageEngine:
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
 
-        # --- SPREAD GUARD (mid) ---
-        if snapshot.spread > self.spread_entry_low:
+        # --- SPREAD GUARD (absolute) ---
+        if snapshot.spread_abs < self.spread_entry_low:
             return ArbExecutionResult(
                 success=False, leg_a=None, leg_b=None,
                 snapshot=snapshot,
                 error=(
-                    f"Entry blocked: spread ${snapshot.spread:.2f} "
-                    f"> entry low ${self.spread_entry_low:.2f}"
+                    f"Entry blocked: spread_abs ${snapshot.spread_abs:.4f} "
+                    f"< entry threshold ${self.spread_entry_low:.4f}"
                 ),
             )
 
         # --- EXEC SPREAD SAFETY ---
-        if snapshot.exec_spread > self.max_exec_spread:
+        if abs(snapshot.exec_spread) > self.max_exec_spread:
             return ArbExecutionResult(
                 success=False, leg_a=None, leg_b=None,
                 snapshot=snapshot,
                 error=(
-                    f"Entry blocked: exec spread ${snapshot.exec_spread:.2f} "
+                    f"Entry blocked: exec spread ${snapshot.exec_spread:.4f} "
                     f"> max ${self.max_exec_spread:.2f} (bid-ask too wide)"
                 ),
             )
 
-        # Direction is FIXED: Long PAXG + Short XAU
-        long_sym = self.paxg_instrument
-        short_sym = self.xau_instrument
-        long_price = snapshot.mid_price_b   # PAXG mid
-        short_price = snapshot.mid_price_a  # XAU mid
+        # Direction: dynamic — Long the cheaper instrument, Short the more expensive one
+        if snapshot.a_is_cheaper:
+            long_sym = self.xau_instrument
+            short_sym = self.paxg_instrument
+            long_exchange = self.leg_a_exchange
+            short_exchange = self.leg_b_exchange
+            long_price = snapshot.mid_price_a
+            short_price = snapshot.mid_price_b
+        else:
+            long_sym = self.paxg_instrument
+            short_sym = self.xau_instrument
+            long_exchange = self.leg_b_exchange
+            short_exchange = self.leg_a_exchange
+            long_price = snapshot.mid_price_b
+            short_price = snapshot.mid_price_a
 
         sim_tag = "[SIM] " if self.simulation_mode else ""
         logger.info(
-            "%sARB ENTRY: LONG %s @ ~%.2f | SHORT %s @ ~%.2f | qty=%s | spread=%.2f",
-            sim_tag, long_sym, long_price, short_sym, short_price, self.quantity, snapshot.spread,
+            "%sARB ENTRY: LONG %s@%s @ ~%.4f | SHORT %s@%s @ ~%.4f | qty=%s | spread_abs=%.4f",
+            sim_tag, long_sym, long_exchange, long_price,
+            short_sym, short_exchange, short_price,
+            self.quantity, snapshot.spread_abs,
         )
 
         # --- SIMULATION MODE: skip real orders, track virtual position ---
@@ -355,60 +427,146 @@ class ArbitrageEngine:
             self._has_position = True
             self._long_sym = long_sym
             self._short_sym = short_sym
-            self._entry_spread_actual = snapshot.spread
+            self._entry_spread_actual = snapshot.spread_abs
             logger.info(
-                "[SIM] ARB ENTRY complete — LONG %s @ %.2f / SHORT %s @ %.2f, spread=$%.2f",
-                long_sym, long_price, short_sym, short_price, snapshot.spread,
+                "[SIM] ARB ENTRY complete — LONG %s@%s @ %.4f / SHORT %s@%s @ %.4f, spread_abs=$%.4f",
+                long_sym, long_exchange, long_price,
+                short_sym, short_exchange, short_price,
+                snapshot.spread_abs,
             )
             return ArbExecutionResult(
                 success=True, leg_a=sim_leg, leg_b=sim_leg_b,
                 snapshot=snapshot, error=None,
             )
 
-        # --- PRE-ENTRY DUAL LIQUIDITY CHECK ---
+        max_slip = slippage_pct if slippage_pct is not None else self.settings.default_slippage_pct
+        depth_req = min_depth_usd if min_depth_usd is not None else self.settings.min_order_book_depth_usd
+
+        logger.info(
+            "=== ENTRY PRE-TRADE CHECKS === spread_abs=$%.4f break_even=$%.4f "
+            "exec_cost=$%.4f slippage_cost=$%.4f max_slip=%.4f%% min_depth=$%.2f qty=%s",
+            snapshot.spread_abs, snapshot.break_even_spread,
+            snapshot.exec_spread, snapshot.slippage_cost,
+            max_slip, depth_req, self.quantity,
+        )
+
+        # --- FULL PRE-TRADE CHECK: fetch both books once, check all conditions
+        #     before placing any order — avoids needing an unwind ---
+        long_client = self._get_client(long_exchange)
+        short_client = self._get_client(short_exchange)
         try:
-            book_long = self._client_b().fetch_order_book(long_sym, limit=50)
-            book_short = self._client_a().fetch_order_book(short_sym, limit=50)
-            liq_ok, long_liq, short_liq = check_dual_liquidity(
-                book_long=book_long,
-                book_short=book_short,
-                quantity=float(self.quantity),
-                multiplier=self.liquidity_multiplier,
-                long_symbol=long_sym,
-                short_symbol=short_sym,
+            book_long = long_client.fetch_order_book(long_sym, limit=50)
+            book_short = short_client.fetch_order_book(short_sym, limit=50)
+            logger.info(
+                "Order books fetched — LONG %s@%s best_ask=%s | SHORT %s@%s best_bid=%s",
+                long_sym, long_exchange,
+                book_long["asks"][0][0] if book_long.get("asks") else "?",
+                short_sym, short_exchange,
+                book_short["bids"][0][0] if book_short.get("bids") else "?",
             )
-            if not liq_ok:
-                reasons = []
-                if not long_liq.is_sufficient:
-                    reasons.append(
-                        f"LONG {long_sym}: {long_liq.available_qty:.4f} avail, "
-                        f"need {long_liq.required_qty:.4f}"
-                    )
-                if not short_liq.is_sufficient:
-                    reasons.append(
-                        f"SHORT {short_sym}: {short_liq.available_qty:.4f} avail, "
-                        f"need {short_liq.required_qty:.4f}"
-                    )
-                return ArbExecutionResult(
-                    success=False, leg_a=None, leg_b=None,
-                    snapshot=snapshot,
-                    error=f"Insufficient liquidity: {'; '.join(reasons)}",
-                )
         except Exception as exc:
             return ArbExecutionResult(
                 success=False, leg_a=None, leg_b=None,
                 snapshot=snapshot,
-                error=f"Liquidity check failed: {exc}",
+                error=f"Failed to fetch order books: {exc}",
             )
 
-        # --- Leg 1: LONG PAXG (chunked) ---
+        failures = []
+
+        # --- Min order size ---
+        min_long = long_client.get_min_order_size(long_sym)
+        logger.info("Min order size check — LONG %s: qty=%s min=%s [%s]",
+            long_sym, self.quantity, min_long, "PASS" if self.quantity >= min_long else "FAIL")
+        if self.quantity < min_long:
+            failures.append(
+                f"LONG {long_sym} qty {self.quantity} < min order size {min_long} on {long_exchange}"
+            )
+
+        min_short = short_client.get_min_order_size(short_sym)
+        logger.info("Min order size check — SHORT %s: qty=%s min=%s [%s]",
+            short_sym, self.quantity, min_short, "PASS" if self.quantity >= min_short else "FAIL")
+        if self.quantity < min_short:
+            failures.append(
+                f"SHORT {short_sym} qty {self.quantity} < min order size {min_short} on {short_exchange}"
+            )
+
+        # --- Depth + slippage checks ---
+        passed_long, depth_long, slip_long = run_pre_trade_checks(
+            order_book=book_long, side="buy", quantity=self.quantity,
+            expected_price=long_price,
+            max_slippage_pct=max_slip, min_depth_usd=depth_req,
+        )
+        logger.info(
+            "LONG %s depth check: avail=$%.2f need=$%.2f [%s] | "
+            "slippage: estimated=%.4f%% max=%.4f%% fill_price=%.4f [%s]",
+            long_sym,
+            depth_long.available_depth_usd, depth_long.required_depth_usd,
+            "PASS" if depth_long.is_sufficient else "FAIL",
+            slip_long.slippage_pct, slip_long.max_allowed_pct, slip_long.estimated_fill_price,
+            "PASS" if slip_long.is_acceptable else "FAIL",
+        )
+        if not passed_long:
+            if not depth_long.is_sufficient:
+                failures.append(
+                    f"LONG {long_sym} depth: ${depth_long.available_depth_usd:.2f} avail, "
+                    f"need ${depth_long.required_depth_usd:.2f}"
+                )
+            if not slip_long.is_acceptable:
+                failures.append(
+                    f"LONG {long_sym} slippage: {slip_long.slippage_pct:.4f}% > max {slip_long.max_allowed_pct:.4f}% "
+                    f"(fill ${slip_long.estimated_fill_price:.4f} vs expected ${long_price:.4f})"
+                )
+
+        passed_short, depth_short, slip_short = run_pre_trade_checks(
+            order_book=book_short, side="sell", quantity=self.quantity,
+            expected_price=short_price,
+            max_slippage_pct=max_slip, min_depth_usd=depth_req,
+        )
+        logger.info(
+            "SHORT %s depth check: avail=$%.2f need=$%.2f [%s] | "
+            "slippage: estimated=%.4f%% max=%.4f%% fill_price=%.4f [%s]",
+            short_sym,
+            depth_short.available_depth_usd, depth_short.required_depth_usd,
+            "PASS" if depth_short.is_sufficient else "FAIL",
+            slip_short.slippage_pct, slip_short.max_allowed_pct, slip_short.estimated_fill_price,
+            "PASS" if slip_short.is_acceptable else "FAIL",
+        )
+        if not passed_short:
+            if not depth_short.is_sufficient:
+                failures.append(
+                    f"SHORT {short_sym} depth: ${depth_short.available_depth_usd:.2f} avail, "
+                    f"need ${depth_short.required_depth_usd:.2f}"
+                )
+            if not slip_short.is_acceptable:
+                failures.append(
+                    f"SHORT {short_sym} slippage: {slip_short.slippage_pct:.4f}% > max {slip_short.max_allowed_pct:.4f}% "
+                    f"(fill ${slip_short.estimated_fill_price:.4f} vs expected ${short_price:.4f})"
+                )
+
+        if failures:
+            logger.warning("=== ENTRY BLOCKED — %d check(s) failed: %s ===", len(failures), "; ".join(failures))
+            return ArbExecutionResult(
+                success=False, leg_a=None, leg_b=None,
+                snapshot=snapshot,
+                error=f"Pre-trade checks failed — no orders placed: {'; '.join(failures)}",
+            )
+
+        logger.info(
+            "=== ALL ENTRY CHECKS PASSED — LONG %s@%s / SHORT %s@%s "
+            "qty=%s spread_abs=$%.4f exec_cost=$%.4f slip_cost=$%.4f ===",
+            long_sym, long_exchange, short_sym, short_exchange,
+            self.quantity, snapshot.spread_abs, snapshot.exec_spread, snapshot.slippage_cost,
+        )
+
+        # --- Leg 1: LONG (chunked) — no repeat safety checks ---
         leg_a = self._execute_leg_chunked(
             symbol=long_sym,
             side="buy",
             total_qty=self.quantity,
             expected_price=long_price,
-            min_depth_usd=min_depth_usd,
-            slippage_pct=slippage_pct,
+            exchange_name=long_exchange,
+            min_depth_usd=0.0,
+            slippage_pct=999.0,
         )
         if not leg_a.success:
             return ArbExecutionResult(
@@ -417,60 +575,32 @@ class ArbitrageEngine:
                 error=f"Leg A (LONG {long_sym}) failed: {leg_a.error}",
             )
 
-        # --- SPREAD RE-CHECK after Leg A ---
-        try:
-            fresh = self.get_spread_snapshot()
-            # If spread has moved significantly against us, unwind
-            if fresh.spread > self.spread_entry_low * 3:
-                logger.warning(
-                    "Spread blew out after Leg A: %.2f (was %.2f). Unwinding.",
-                    fresh.spread, snapshot.spread,
-                )
-                unwind = self._close_leg_with_retry(
-                    long_sym, "sell", self.quantity, long_price,
-                    slippage_pct or self.settings.default_slippage_pct,
-                    min_depth_usd,
-                )
-                unwind_note = "Unwind OK" if unwind.success else f"UNWIND FAILED: {unwind.error}"
-                return ArbExecutionResult(
-                    success=False, leg_a=leg_a, leg_b=None,
-                    snapshot=fresh,
-                    error=f"Spread moved to ${fresh.spread:.2f} after Leg A. {unwind_note}",
-                )
-        except Exception as exc:
-            logger.warning("Spread re-check failed (continuing): %s", exc)
-
-        # --- Leg 2: SHORT XAU (chunked) ---
+        # --- Leg 2: SHORT (chunked) — no repeat safety checks ---
         leg_b = self._execute_leg_chunked(
             symbol=short_sym,
             side="sell",
             total_qty=self.quantity,
             expected_price=short_price,
-            min_depth_usd=min_depth_usd,
-            slippage_pct=slippage_pct,
+            exchange_name=short_exchange,
+            min_depth_usd=0.0,
+            slippage_pct=999.0,
         )
         if not leg_b.success:
-            logger.error("Leg B failed, unwinding Leg A (selling %s)", long_sym)
-            unwind = self._close_leg_with_retry(
-                long_sym, "sell", self.quantity, long_price,
-                slippage_pct or self.settings.default_slippage_pct,
-                min_depth_usd,
-            )
-            unwind_note = "Unwind OK" if unwind.success else f"UNWIND FAILED: {unwind.error}"
+            logger.error("Leg B failed after Leg A filled — position is now ONE-SIDED on %s", long_sym)
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Leg B (SHORT {short_sym}) failed: {leg_b.error}. {unwind_note}",
+                error=f"Leg B (SHORT {short_sym}) failed after Leg A filled: {leg_b.error}. Manual intervention required.",
             )
 
         # --- Success ---
         self._has_position = True
         self._long_sym = long_sym
         self._short_sym = short_sym
-        self._entry_spread_actual = snapshot.spread
+        self._entry_spread_actual = snapshot.spread_abs
         logger.info(
-            "ARB ENTRY complete — LONG %s / SHORT %s, spread=$%.2f",
-            long_sym, short_sym, snapshot.spread,
+            "ARB ENTRY complete — LONG %s@%s / SHORT %s@%s, spread_abs=$%.4f",
+            long_sym, long_exchange, short_sym, short_exchange, snapshot.spread_abs,
         )
         return ArbExecutionResult(
             success=True, leg_a=leg_a, leg_b=leg_b,
@@ -530,7 +660,7 @@ class ArbitrageEngine:
                 order_response={"simulated": True, "price": buy_price},
                 depth=None, slippage=None, error=None,
             )
-            pnl = (snapshot.spread - (self._entry_spread_actual or 0)) * float(self.quantity)
+            pnl = (snapshot.spread_abs - (self._entry_spread_actual or 0)) * float(self.quantity)
             self._has_position = False
             self._long_sym = None
             self._short_sym = None
@@ -544,44 +674,155 @@ class ArbitrageEngine:
                 snapshot=snapshot, error=None,
             )
 
-        # --- Leg A: close the LONG position (chunked) ---
+        # Determine which exchange each symbol belongs to (based on configured leg assignments)
+        sell_exchange = self.leg_a_exchange if sell_sym == self.xau_instrument else self.leg_b_exchange
+        buy_exchange = self.leg_a_exchange if buy_sym == self.xau_instrument else self.leg_b_exchange
+
+        max_slip = base_slippage
+        depth_req = min_depth_usd if min_depth_usd is not None else self.settings.min_order_book_depth_usd
+
+        entry_spread = self._entry_spread_actual or 0.0
+        logger.info(
+            "=== EXIT PRE-TRADE CHECKS === spread_abs=$%.4f entry_spread=$%.4f pnl_est=$%.4f "
+            "exec_cost=$%.4f slippage_cost=$%.4f max_slip=%.4f%% min_depth=$%.2f qty=%s",
+            snapshot.spread_abs, entry_spread,
+            (snapshot.spread_abs - entry_spread) * float(self.quantity),
+            snapshot.exec_spread, snapshot.slippage_cost,
+            max_slip, depth_req, self.quantity,
+        )
+
+        # --- FULL PRE-EXIT CHECK: fetch both books, check both legs before any order ---
+        try:
+            book_sell = self._get_client(sell_exchange).fetch_order_book(sell_sym, limit=50)
+            book_buy = self._get_client(buy_exchange).fetch_order_book(buy_sym, limit=50)
+            logger.info(
+                "Order books fetched — SELL %s@%s best_bid=%s | BUY %s@%s best_ask=%s",
+                sell_sym, sell_exchange,
+                book_sell["bids"][0][0] if book_sell.get("bids") else "?",
+                buy_sym, buy_exchange,
+                book_buy["asks"][0][0] if book_buy.get("asks") else "?",
+            )
+        except Exception as exc:
+            return ArbExecutionResult(
+                success=False, leg_a=None, leg_b=None,
+                snapshot=snapshot,
+                error=f"Failed to fetch order books for exit: {exc}",
+            )
+
+        failures = []
+
+        # --- Min order size check ---
+        min_sell = self._get_client(sell_exchange).get_min_order_size(sell_sym)
+        logger.info("Min order size check — SELL %s: qty=%s min=%s [%s]",
+            sell_sym, self.quantity, min_sell, "PASS" if self.quantity >= min_sell else "FAIL")
+        if self.quantity < min_sell:
+            failures.append(
+                f"SELL {sell_sym} qty {self.quantity} < min order size {min_sell} on {sell_exchange}"
+            )
+
+        min_buy = self._get_client(buy_exchange).get_min_order_size(buy_sym)
+        logger.info("Min order size check — BUY %s: qty=%s min=%s [%s]",
+            buy_sym, self.quantity, min_buy, "PASS" if self.quantity >= min_buy else "FAIL")
+        if self.quantity < min_buy:
+            failures.append(
+                f"BUY {buy_sym} qty {self.quantity} < min order size {min_buy} on {buy_exchange}"
+            )
+
+        passed_sell, depth_sell, slip_sell = run_pre_trade_checks(
+            order_book=book_sell, side="sell", quantity=self.quantity,
+            expected_price=sell_price,
+            max_slippage_pct=max_slip, min_depth_usd=depth_req,
+        )
+        logger.info(
+            "SELL %s depth check: avail=$%.2f need=$%.2f [%s] | "
+            "slippage: estimated=%.4f%% max=%.4f%% fill_price=%.4f [%s]",
+            sell_sym,
+            depth_sell.available_depth_usd, depth_sell.required_depth_usd,
+            "PASS" if depth_sell.is_sufficient else "FAIL",
+            slip_sell.slippage_pct, slip_sell.max_allowed_pct, slip_sell.estimated_fill_price,
+            "PASS" if slip_sell.is_acceptable else "FAIL",
+        )
+        if not passed_sell:
+            if not depth_sell.is_sufficient:
+                failures.append(
+                    f"SELL {sell_sym} depth: ${depth_sell.available_depth_usd:.2f} avail, "
+                    f"need ${depth_sell.required_depth_usd:.2f}"
+                )
+            if not slip_sell.is_acceptable:
+                failures.append(
+                    f"SELL {sell_sym} slippage: {slip_sell.slippage_pct:.4f}% > max {slip_sell.max_allowed_pct:.4f}% "
+                    f"(fill ${slip_sell.estimated_fill_price:.4f} vs expected ${sell_price:.4f})"
+                )
+
+        passed_buy, depth_buy, slip_buy = run_pre_trade_checks(
+            order_book=book_buy, side="buy", quantity=self.quantity,
+            expected_price=buy_price,
+            max_slippage_pct=max_slip, min_depth_usd=depth_req,
+        )
+        logger.info(
+            "BUY %s depth check: avail=$%.2f need=$%.2f [%s] | "
+            "slippage: estimated=%.4f%% max=%.4f%% fill_price=%.4f [%s]",
+            buy_sym,
+            depth_buy.available_depth_usd, depth_buy.required_depth_usd,
+            "PASS" if depth_buy.is_sufficient else "FAIL",
+            slip_buy.slippage_pct, slip_buy.max_allowed_pct, slip_buy.estimated_fill_price,
+            "PASS" if slip_buy.is_acceptable else "FAIL",
+        )
+        if not passed_buy:
+            if not depth_buy.is_sufficient:
+                failures.append(
+                    f"BUY {buy_sym} depth: ${depth_buy.available_depth_usd:.2f} avail, "
+                    f"need ${depth_buy.required_depth_usd:.2f}"
+                )
+            if not slip_buy.is_acceptable:
+                failures.append(
+                    f"BUY {buy_sym} slippage: {slip_buy.slippage_pct:.4f}% > max {slip_buy.max_allowed_pct:.4f}% "
+                    f"(fill ${slip_buy.estimated_fill_price:.4f} vs expected ${buy_price:.4f})"
+                )
+
+        if failures:
+            logger.warning("=== EXIT BLOCKED — %d check(s) failed: %s ===", len(failures), "; ".join(failures))
+            return ArbExecutionResult(
+                success=False, leg_a=None, leg_b=None,
+                snapshot=snapshot,
+                error=f"Exit pre-trade checks failed — no orders placed: {'; '.join(failures)}",
+            )
+
+        logger.info(
+            "=== ALL EXIT CHECKS PASSED — SELL %s@%s / BUY %s@%s "
+            "qty=%s spread_abs=$%.4f entry=$%.4f est_pnl=$%.4f exec_cost=$%.4f slip_cost=$%.4f ===",
+            sell_sym, sell_exchange, buy_sym, buy_exchange,
+            self.quantity, snapshot.spread_abs, entry_spread,
+            (snapshot.spread_abs - entry_spread) * float(self.quantity),
+            snapshot.exec_spread, snapshot.slippage_cost,
+        )
+
+        # --- Leg A: close the LONG position (chunked) — no repeat safety checks ---
         leg_a = self._execute_leg_chunked(
             symbol=sell_sym, side="sell", total_qty=self.quantity,
-            expected_price=sell_price,
-            min_depth_usd=min_depth_usd, slippage_pct=base_slippage,
+            expected_price=sell_price, exchange_name=sell_exchange,
+            min_depth_usd=0.0, slippage_pct=999.0,
         )
         if not leg_a.success:
-            # Position stays open — do NOT force close with worse terms
-            logger.warning(
-                "Exit Leg A failed — keeping position open to protect profits."
-            )
+            logger.warning("Exit Leg A failed — keeping position open.")
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=None,
                 snapshot=snapshot,
                 error=f"Exit Leg A (SELL {sell_sym}) failed: {leg_a.error}. Position kept open.",
             )
 
-        # --- Leg B: close the SHORT position (chunked) ---
+        # --- Leg B: close the SHORT position (chunked) — no repeat safety checks ---
         leg_b = self._execute_leg_chunked(
             symbol=buy_sym, side="buy", total_qty=self.quantity,
-            expected_price=buy_price,
-            min_depth_usd=min_depth_usd, slippage_pct=base_slippage,
+            expected_price=buy_price, exchange_name=buy_exchange,
+            min_depth_usd=0.0, slippage_pct=999.0,
         )
         if not leg_b.success:
-            # Leg A already closed — re-open it to stay fully hedged
-            logger.error(
-                "Exit Leg B failed, re-opening Leg A (buying %s) to stay hedged",
-                sell_sym,
-            )
-            reopen = self._close_leg_with_retry(
-                sell_sym, "buy", self.quantity, sell_price,
-                base_slippage, min_depth_usd,
-            )
-            reopen_note = "Re-hedge OK" if reopen.success else f"RE-HEDGE FAILED: {reopen.error}"
+            logger.error("Exit Leg B failed after Leg A filled — position is now ONE-SIDED on %s", buy_sym)
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Exit Leg B (BUY {buy_sym}) failed: {leg_b.error}. {reopen_note}",
+                error=f"Exit Leg B (BUY {buy_sym}) failed after Leg A filled: {leg_b.error}. Manual intervention required.",
             )
 
         # --- Success: clear position state ---
@@ -605,6 +846,7 @@ class ArbitrageEngine:
         side: str,
         total_qty: Decimal,
         expected_price: float,
+        exchange_name: str | None = None,
         min_depth_usd: float | None = None,
         slippage_pct: float | None = None,
     ) -> TradeResult:
@@ -614,6 +856,7 @@ class ArbitrageEngine:
         separate market order, and waits self.chunk_delay_ms between them.
         Returns an aggregated TradeResult.
         """
+        leg_client = self._get_client(exchange_name) if exchange_name else None
         chunk = self.chunk_size
         if chunk <= 0 or chunk >= total_qty:
             # No chunking needed — single order
@@ -621,6 +864,7 @@ class ArbitrageEngine:
                 symbol=symbol, side=side, quantity=total_qty,
                 expected_price=expected_price,
                 min_depth_usd=min_depth_usd, slippage_pct=slippage_pct,
+                client=leg_client,
             )
 
         remaining = total_qty
@@ -638,6 +882,7 @@ class ArbitrageEngine:
                 symbol=symbol, side=side, quantity=qty,
                 expected_price=expected_price,
                 min_depth_usd=min_depth_usd, slippage_pct=slippage_pct,
+                client=leg_client,
             )
             if not result.success:
                 filled_total = total_qty - remaining
@@ -681,6 +926,7 @@ class ArbitrageEngine:
         expected_price: float,
         slippage_pct: float,
         min_depth_usd: float | None = None,
+        exchange_name: str | None = None,
     ) -> TradeResult:
         """Try to close a leg with constant slippage.
 
@@ -688,6 +934,7 @@ class ArbitrageEngine:
         timeout). Does NOT escalate slippage — if slippage is too high the
         position stays open to protect profits.
         """
+        leg_client = self._get_client(exchange_name) if exchange_name else None
         last_result = None
         for attempt in range(_EXIT_MAX_RETRIES):
             logger.info(
@@ -702,6 +949,7 @@ class ArbitrageEngine:
                 expected_price=expected_price,
                 slippage_pct=slippage_pct,
                 min_depth_usd=min_depth_usd,
+                client=leg_client,
             )
             if result.success:
                 return result

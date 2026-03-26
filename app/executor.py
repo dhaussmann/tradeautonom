@@ -1,11 +1,11 @@
-"""Trade executor: validates safety checks and places orders on GRVT."""
+"""Trade executor: validates safety checks and places orders on any exchange."""
 
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
 
 from app.config import Settings
-from app.grvt_client import GrvtClient
+from app.exchange import ExchangeClient
 from app.safety import DepthResult, SlippageResult, run_pre_trade_checks
 
 logger = logging.getLogger("tradeautonom.executor")
@@ -21,9 +21,9 @@ class TradeResult:
 
 
 class TradeExecutor:
-    """Validates pre-trade conditions and executes market orders on GRVT."""
+    """Validates pre-trade conditions and executes market orders on any exchange."""
 
-    def __init__(self, client: GrvtClient, settings: Settings) -> None:
+    def __init__(self, client: ExchangeClient, settings: Settings) -> None:
         self.client = client
         self.settings = settings
 
@@ -35,6 +35,7 @@ class TradeExecutor:
         expected_price: float,
         slippage_pct: float | None = None,
         min_depth_usd: float | None = None,
+        client: ExchangeClient | None = None,
     ) -> TradeResult:
         """Run safety checks and place a market order if everything passes.
 
@@ -49,6 +50,8 @@ class TradeExecutor:
         Returns:
             TradeResult with outcome details.
         """
+        active_client = client or self.client
+
         side = side.lower()
         if side not in ("buy", "sell"):
             return TradeResult(
@@ -67,9 +70,9 @@ class TradeExecutor:
             )
             max_slip = self.settings.max_slippage_pct
 
-        # Fetch order book
+        # Fetch order book from the correct exchange
         try:
-            order_book = self.client.fetch_order_book(symbol, limit=50)
+            order_book = active_client.fetch_order_book(symbol, limit=50)
         except Exception as exc:
             msg = f"Failed to fetch order book for {symbol}: {exc}"
             logger.error(msg)
@@ -103,12 +106,14 @@ class TradeExecutor:
                 depth=depth, slippage=slippage, error=error_msg,
             )
 
-        # Place the order
+        # Place the order on the correct exchange, passing slippage so exchanges
+        # that emulate market orders (e.g. Extended IOC limit) use the same tolerance
         try:
-            resp = self.client.create_market_order(
+            resp = active_client.create_market_order(
                 symbol=symbol,
                 side=side,
                 amount=quantity,
+                slippage_pct=max_slip,
             )
         except Exception as exc:
             msg = f"Order placement failed: {exc}"
