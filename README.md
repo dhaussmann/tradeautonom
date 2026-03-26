@@ -56,6 +56,10 @@ Optionale Parameter:
 | `ARB_CHUNK_DELAY_MS` | `500` | Pause zwischen Chunks (ms) |
 | `ARB_SIMULATION_MODE` | `False` | Paper-Trading (keine echten Orders) |
 | `EXTENDED_API_BASE_URL` | `https://api.starknet.extended.exchange/api/v1` | Extended API URL |
+| `EXTENDED_API_KEY` | *(leer)* | Extended API Key (für Trading) |
+| `EXTENDED_PUBLIC_KEY` | *(leer)* | Extended Stark Public Key |
+| `EXTENDED_PRIVATE_KEY` | *(leer)* | Extended Stark Private Key |
+| `EXTENDED_VAULT` | `0` | Extended Vault Nummer |
 
 ### 4. Starten
 

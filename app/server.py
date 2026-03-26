@@ -62,7 +62,13 @@ async def lifespan(app: FastAPI):
     global _settings, _client, _extended_client, _executor, _arb_engine, _exchange_clients
     _settings = Settings()
     _client = GrvtClient(_settings)
-    _extended_client = ExtendedClient(_settings.extended_api_base_url)
+    _extended_client = ExtendedClient(
+        base_url=_settings.extended_api_base_url,
+        api_key=_settings.extended_api_key,
+        public_key=_settings.extended_public_key,
+        private_key=_settings.extended_private_key,
+        vault=_settings.extended_vault,
+    )
     _exchange_clients = {"grvt": _client, "extended": _extended_client}
     _executor = TradeExecutor(_client, _settings)
     _arb_engine = ArbitrageEngine(_exchange_clients, _executor, _settings)
