@@ -55,6 +55,8 @@ header h1 span{color:var(--accent)}
 .fld label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
 .fld input{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-size:13px;font-variant-numeric:tabular-nums;outline:none;transition:border-color .2s}
 .fld input:focus{border-color:var(--accent)}
+.fld select{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-size:13px;outline:none;transition:border-color .2s;width:100%}
+.fld select:focus{border-color:var(--accent)}
 .btn{padding:8px 16px;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s}
 .bp{background:var(--accent);color:#fff}.bp:hover{opacity:.9}
 .bs{background:var(--green);color:#fff}.bs:hover{opacity:.9}
@@ -105,9 +107,9 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
   <div class="card full">
     <div class="card-title">Live Spread Monitor</div>
     <div class="spread-row">
-      <div class="pb"><div class="lbl">LONG PAXG</div><div class="pr" id="prB">—</div><div class="inst" id="iB">PAXG_USDT_Perp</div></div>
-      <div class="sc"><div class="sv" id="sV">—</div><div class="sl">SPREAD (PAXG−XAU)</div><div class="sv" id="sVexec" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div></div>
-      <div class="pb"><div class="lbl">SHORT XAU</div><div class="pr" id="prA">—</div><div class="inst" id="iA">XAU_USDT_Perp</div></div>
+      <div class="pb"><div class="lbl">LEG B (Long)</div><div class="pr" id="prB">—</div><div class="inst"><span id="iB">PAXG_USDT_Perp</span> <span id="exB" style="color:var(--accent);font-size:9px">grvt</span></div></div>
+      <div class="sc"><div class="sv" id="sV">—</div><div class="sl">SPREAD (B−A)</div><div class="sv" id="sVexec" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div></div>
+      <div class="pb"><div class="lbl">LEG A (Short)</div><div class="pr" id="prA">—</div><div class="inst"><span id="iA">XAU_USDT_Perp</span> <span id="exA" style="color:var(--accent);font-size:9px">grvt</span></div></div>
     </div>
     <div class="sig none" id="sigBar"><span class="dot"></span><span id="sigTxt">Waiting for data...</span></div>
     <div class="pos-bar flat" id="posBar">No position</div>
@@ -126,9 +128,23 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
       <div class="lg"><h3 style="color:var(--yellow)">Simulation Mode</h3><p>Paper-trade: no real orders</p></div>
       <label class="tg"><input type="checkbox" id="simToggle" onchange="toggleSim()"><span class="tgs"></span></label>
     </div>
+    <div style="margin-bottom:12px;padding:10px;background:var(--surface2);border-radius:8px">
+      <div class="card-title" style="margin-bottom:8px">Leg A (Short side)</div>
+      <div style="display:flex;gap:8px">
+        <div class="fld" style="flex:1"><label>Exchange</label><select id="cExA" onchange="loadInstruments('A')"><option value="grvt">GRVT</option><option value="extended">Extended</option></select></div>
+        <div class="fld" style="flex:2"><label>Instrument</label><select id="cInstA"></select></div>
+      </div>
+    </div>
+    <div style="margin-bottom:12px;padding:10px;background:var(--surface2);border-radius:8px">
+      <div class="card-title" style="margin-bottom:8px">Leg B (Long side)</div>
+      <div style="display:flex;gap:8px">
+        <div class="fld" style="flex:1"><label>Exchange</label><select id="cExB" onchange="loadInstruments('B')"><option value="grvt">GRVT</option><option value="extended">Extended</option></select></div>
+        <div class="fld" style="flex:2"><label>Instrument</label><select id="cInstB"></select></div>
+      </div>
+    </div>
     <div class="cg">
-      <div class="fld"><label>Entry Low ($)</label><input type="number" id="cES" step="0.1" min="0" title="Enter when PAXG-XAU spread <= this"></div>
-      <div class="fld"><label>Exit High ($)</label><input type="number" id="cXS" step="0.1" min="0" title="Exit when PAXG-XAU spread >= this"></div>
+      <div class="fld"><label>Entry Low ($)</label><input type="number" id="cES" step="0.1" min="0" title="Enter when spread <= this"></div>
+      <div class="fld"><label>Exit High ($)</label><input type="number" id="cXS" step="0.1" min="0" title="Exit when spread >= this"></div>
       <div class="fld"><label>Max Exec ($)</label><input type="number" id="cME" step="0.5" min="0" title="Max bid-ask execution cost"></div>
       <div class="fld"><label>Quantity</label><input type="number" id="cQ" step="0.001" min="0"></div>
       <div class="fld"><label>Max Slippage (%)</label><input type="number" id="cSl" step="0.1" min="0"></div>
@@ -187,19 +203,41 @@ async function loadCfg(){
   $('cME').value=s.max_exec_spread;
   $('cQ').value=s.quantity;$('cSl').value=s.slippage_pct;
   $('cMD').value=s.min_depth_usd;$('cLM').value=s.liquidity_multiplier;
-  $('iA').textContent=s.instrument_a;$('iB').textContent=s.instrument_b;
   $('cCS').value=s.chunk_size;$('cCD').value=s.chunk_delay_ms;
   $('simToggle').checked=!!s.simulation_mode;
   $('simBadge').style.display=s.simulation_mode?'inline-block':'none';
+  // Per-leg exchange + instrument
+  $('cExA').value=s.leg_a_exchange||'grvt';
+  $('cExB').value=s.leg_b_exchange||'grvt';
+  await loadInstruments('A',s.instrument_a);
+  await loadInstruments('B',s.instrument_b);
+  // Update spread monitor labels
+  $('iA').textContent=s.instrument_a;$('iB').textContent=s.instrument_b;
+  $('exA').textContent=s.leg_a_exchange||'grvt';$('exB').textContent=s.leg_b_exchange||'grvt';
+}
+
+async function loadInstruments(leg,selected){
+  const ex=$('cEx'+leg).value;
+  const sel=$('cInst'+leg);
+  sel.innerHTML='<option>Loading...</option>';
+  const d=await f('/exchanges/markets?exchange='+ex);
+  if(!d||!d.markets){sel.innerHTML='<option>Error</option>';return}
+  sel.innerHTML=d.markets.map(m=>'<option value="'+m.symbol+'"'+(m.symbol===selected?' selected':'')+'>'+m.symbol+'</option>').join('');
+  if(!selected&&d.markets.length)sel.value=d.markets[0].symbol;
 }
 
 async function saveCfg(){
   const b={spread_entry_low:+$('cES').value,spread_exit_high:+$('cXS').value,
     max_exec_spread:+$('cME').value,
     quantity:+$('cQ').value,slippage_pct:+$('cSl').value,min_depth_usd:+$('cMD').value,
-    liquidity_multiplier:+$('cLM').value,chunk_size:+$('cCS').value,chunk_delay_ms:parseInt($('cCD').value)};
+    liquidity_multiplier:+$('cLM').value,chunk_size:+$('cCS').value,chunk_delay_ms:parseInt($('cCD').value),
+    leg_a_exchange:$('cExA').value,leg_b_exchange:$('cExB').value,
+    instrument_a:$('cInstA').value,instrument_b:$('cInstB').value};
   const r=await f('/arb/config',{method:'POST',body:JSON.stringify(b)});
-  if(r&&r.status==='ok')log('info','Config saved: entry<=$'+b.spread_entry_low+' exit>=$'+b.spread_exit_high+' qty='+b.quantity);
+  if(r&&r.status==='ok')log('info','Config saved: A='+b.instrument_a+'@'+b.leg_a_exchange+' B='+b.instrument_b+'@'+b.leg_b_exchange+' qty='+b.quantity);
+  // Update spread monitor labels
+  $('iA').textContent=b.instrument_a;$('iB').textContent=b.instrument_b;
+  $('exA').textContent=b.leg_a_exchange;$('exB').textContent=b.leg_b_exchange;
 
   const nr=parseInt($('cRR').value)||3;
   if(nr!==rMs/1000){rMs=nr*1000;$('rr').textContent=nr;startR()}
@@ -215,10 +253,9 @@ async function toggleSim(){
 async function refreshSpread(){
   const d=await f('/arb/check');if(!d)return;
   const s=d.snapshot;
-  // instrument_a = XAU, instrument_b = PAXG
   $('prA').textContent='$'+s.mid_price_a.toFixed(2);
   $('prB').textContent='$'+s.mid_price_b.toFixed(2);
-  // Directional spread: PAXG - XAU
+  // Directional spread: B - A
   const sp=s.spread||0, es=s.exec_spread||0;
   $('sV').textContent='$'+sp.toFixed(2);
   $('sVexec').textContent='$'+es.toFixed(2);

@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from app.arbitrage import ArbitrageEngine
 from app.config import Settings
 from app.executor import TradeExecutor
+from app.extended_client import ExtendedClient
 from app.grvt_client import GrvtClient
 from app.schemas import (
     ArbAutoRequest,
@@ -50,19 +51,23 @@ def _spread_info(snapshot) -> SpreadInfo:
 # Module-level singletons (populated in lifespan)
 _settings: Settings | None = None
 _client: GrvtClient | None = None
+_extended_client: ExtendedClient | None = None
 _executor: TradeExecutor | None = None
 _arb_engine: ArbitrageEngine | None = None
+_exchange_clients: dict = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _client, _executor, _arb_engine
+    global _settings, _client, _extended_client, _executor, _arb_engine, _exchange_clients
     _settings = Settings()
     _client = GrvtClient(_settings)
+    _extended_client = ExtendedClient(_settings.extended_api_base_url)
+    _exchange_clients = {"grvt": _client, "extended": _extended_client}
     _executor = TradeExecutor(_client, _settings)
-    _arb_engine = ArbitrageEngine(_client, _executor, _settings)
+    _arb_engine = ArbitrageEngine(_exchange_clients, _executor, _settings)
     _arb_engine.sync_position_from_exchange()
-    logger.info("App started — GRVT env=%s", _settings.grvt_env)
+    logger.info("App started — GRVT env=%s, exchanges=%s", _settings.grvt_env, list(_exchange_clients.keys()))
     yield
     logger.info("App shutting down.")
 
@@ -301,6 +306,8 @@ async def arb_status():
         liquidity_multiplier=_arb_engine.liquidity_multiplier,
         chunk_size=float(_arb_engine.chunk_size),
         chunk_delay_ms=_arb_engine.chunk_delay_ms,
+        leg_a_exchange=_arb_engine.leg_a_exchange,
+        leg_b_exchange=_arb_engine.leg_b_exchange,
         long_sym=pi["long_sym"],
         short_sym=pi["short_sym"],
         entry_spread_actual=pi["entry_spread"],
@@ -328,6 +335,16 @@ async def arb_config(req: ArbConfigRequest):
         _arb_engine.chunk_size = Decimal(str(req.chunk_size))
     if req.chunk_delay_ms is not None:
         _arb_engine.chunk_delay_ms = req.chunk_delay_ms
+    if req.instrument_a is not None:
+        _arb_engine.instrument_a = req.instrument_a
+        _arb_engine.xau_instrument = req.instrument_a
+    if req.instrument_b is not None:
+        _arb_engine.instrument_b = req.instrument_b
+        _arb_engine.paxg_instrument = req.instrument_b
+    if req.leg_a_exchange is not None:
+        _arb_engine.leg_a_exchange = req.leg_a_exchange
+    if req.leg_b_exchange is not None:
+        _arb_engine.leg_b_exchange = req.leg_b_exchange
     if req.simulation_mode is not None:
         _arb_engine.simulation_mode = req.simulation_mode
     return {"status": "ok", "message": "Configuration updated"}
@@ -394,6 +411,28 @@ async def set_leverage(req: dict):
         return {"success": success, "instrument": instrument, "leverage": int(leverage)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ------------------------------------------------------------------
+# Exchange markets
+# ------------------------------------------------------------------
+
+@app.get("/exchanges/markets")
+async def exchange_markets(exchange: str = "grvt"):
+    """List available instruments on a given exchange."""
+    client = _exchange_clients.get(exchange)
+    if not client:
+        raise HTTPException(status_code=400, detail=f"Unknown exchange: {exchange}. Available: {list(_exchange_clients.keys())}")
+    try:
+        return {"exchange": exchange, "markets": client.fetch_markets()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/exchanges")
+async def list_exchanges():
+    """List available exchange names."""
+    return {"exchanges": list(_exchange_clients.keys())}
 
 
 # ------------------------------------------------------------------

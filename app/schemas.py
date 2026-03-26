@@ -76,6 +76,10 @@ class ArbConfigRequest(BaseModel):
     liquidity_multiplier: float | None = Field(None, ge=1.0, description="Min liquidity as multiple of qty")
     chunk_size: float | None = Field(None, gt=0, description="Order chunk size for splitting large orders")
     chunk_delay_ms: int | None = Field(None, ge=0, description="Delay between chunks in ms")
+    instrument_a: str | None = Field(None, description="Instrument for leg A")
+    instrument_b: str | None = Field(None, description="Instrument for leg B")
+    leg_a_exchange: str | None = Field(None, description="Exchange for leg A (grvt or extended)")
+    leg_b_exchange: str | None = Field(None, description="Exchange for leg B (grvt or extended)")
     simulation_mode: bool | None = Field(None, description="Paper-trade mode (no real orders)")
 
 
@@ -94,6 +98,8 @@ class ArbStatusResponse(BaseModel):
     liquidity_multiplier: float
     chunk_size: float
     chunk_delay_ms: int
+    leg_a_exchange: str
+    leg_b_exchange: str
     long_sym: str | None = None
     short_sym: str | None = None
     entry_spread_actual: float | None = None

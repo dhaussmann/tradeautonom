@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     arb_quantity: float = 1.0
     arb_xau_instrument: str = "XAU_USDT_Perp"
     arb_paxg_instrument: str = "PAXG_USDT_Perp"
+    arb_leg_a_exchange: str = "grvt"       # exchange for instrument_a (leg A)
+    arb_leg_b_exchange: str = "grvt"       # exchange for instrument_b (leg B)
     arb_liquidity_multiplier: float = 2.0
+    extended_api_base_url: str = "https://api.starknet.extended.exchange/api/v1"
     arb_chunk_size: float = 1.0         # split large orders into chunks of this size
     arb_chunk_delay_ms: int = 500       # ms to wait between chunks (book replenishment)
     arb_simulation_mode: bool = False   # True = paper-trade (no real orders)

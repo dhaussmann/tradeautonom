@@ -57,6 +57,12 @@ class GrvtClient:
         )
         logger.info("GrvtClient initialised (env=%s)", settings.grvt_env)
 
+    # -- Protocol ---------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return "grvt"
+
     # ------------------------------------------------------------------
     # Market data helpers
     # ------------------------------------------------------------------
@@ -72,7 +78,21 @@ class GrvtClient:
         return self._api.fetch_mini_ticker(symbol)
 
     def fetch_markets(self) -> list[dict]:
-        return self._api.fetch_all_markets()
+        """Return normalised market list with 'symbol' key."""
+        raw = self._api.fetch_all_markets()
+        markets = []
+        for m in raw:
+            sym = m.get("instrument", m.get("symbol", ""))
+            markets.append({
+                "symbol": sym,
+                "name": sym,
+                "base": m.get("base"),
+                "quote": m.get("quote"),
+                "kind": m.get("kind"),
+                "tick_size": m.get("tick_size"),
+                "min_size": m.get("min_size"),
+            })
+        return markets
 
     # ------------------------------------------------------------------
     # Order execution

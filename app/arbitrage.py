@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from app.config import Settings
+from app.exchange import ExchangeClient
 from app.executor import TradeExecutor, TradeResult
 from app.grvt_client import GrvtClient
 from app.safety import check_dual_liquidity, estimate_fill_price
@@ -73,11 +74,12 @@ class ArbitrageEngine:
 
     def __init__(
         self,
-        client: GrvtClient,
+        clients: dict[str, ExchangeClient],
         executor: TradeExecutor,
         settings: Settings,
     ) -> None:
-        self.client = client
+        self.clients = clients
+        self.client = clients.get("grvt")  # backward-compat: GRVT for trading/positions
         self.executor = executor
         self.settings = settings
         # Instruments — spread is always PAXG - XAU
@@ -86,6 +88,9 @@ class ArbitrageEngine:
         # Kept for backward-compat with server/WebUI (instrument_a=XAU, instrument_b=PAXG)
         self.instrument_a = self.xau_instrument
         self.instrument_b = self.paxg_instrument
+        # Per-leg exchange selection
+        self.leg_a_exchange = settings.arb_leg_a_exchange
+        self.leg_b_exchange = settings.arb_leg_b_exchange
         # Thresholds
         self.spread_entry_low = settings.arb_spread_entry_low
         self.spread_exit_high = settings.arb_spread_exit_high
@@ -101,6 +106,21 @@ class ArbitrageEngine:
         self._short_sym: str | None = None  # always XAU when open
         self._entry_spread_actual: float | None = None
 
+    def _get_client(self, exchange_name: str) -> ExchangeClient:
+        """Resolve an exchange client by name."""
+        client = self.clients.get(exchange_name)
+        if client is None:
+            raise ValueError(f"Unknown exchange: {exchange_name!r}. Available: {list(self.clients.keys())}")
+        return client
+
+    def _client_a(self) -> ExchangeClient:
+        """Client for instrument_a (leg A)."""
+        return self._get_client(self.leg_a_exchange)
+
+    def _client_b(self) -> ExchangeClient:
+        """Client for instrument_b (leg B)."""
+        return self._get_client(self.leg_b_exchange)
+
     # ------------------------------------------------------------------
     # Position state sync from exchange
     # ------------------------------------------------------------------
@@ -109,8 +129,12 @@ class ArbitrageEngine:
         """Read open positions from the exchange and restore internal state.
 
         This must be called on startup so the engine knows about positions
-        that survived a server restart.
+        that survived a server restart.  Only works with GRVT (which has
+        authenticated position queries).
         """
+        if not self.client or not hasattr(self.client, "fetch_positions"):
+            logger.info("Position sync skipped — no GRVT client with fetch_positions.")
+            return
         try:
             positions = self.client.fetch_positions(
                 [self.xau_instrument, self.paxg_instrument]
@@ -167,8 +191,8 @@ class ArbitrageEngine:
         spread      = PAXG_mid - XAU_mid  (should be >= 0)
         exec_spread = PAXG_ask - XAU_bid  (cost of opening Long PAXG / Short XAU)
         """
-        book_xau = self.client.fetch_order_book(self.xau_instrument, limit=10)
-        book_paxg = self.client.fetch_order_book(self.paxg_instrument, limit=10)
+        book_xau = self._client_a().fetch_order_book(self.xau_instrument, limit=10)
+        book_paxg = self._client_b().fetch_order_book(self.paxg_instrument, limit=10)
 
         mid_xau = _mid_price(book_xau)
         mid_paxg = _mid_price(book_paxg)
@@ -343,8 +367,8 @@ class ArbitrageEngine:
 
         # --- PRE-ENTRY DUAL LIQUIDITY CHECK ---
         try:
-            book_long = self.client.fetch_order_book(long_sym, limit=50)
-            book_short = self.client.fetch_order_book(short_sym, limit=50)
+            book_long = self._client_b().fetch_order_book(long_sym, limit=50)
+            book_short = self._client_a().fetch_order_book(short_sym, limit=50)
             liq_ok, long_liq, short_liq = check_dual_liquidity(
                 book_long=book_long,
                 book_short=book_short,
