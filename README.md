@@ -1,166 +1,136 @@
-# TradeAutonom — GRVT Trade Execution Service
+# TradeAutonom
 
-A Python service that executes trades on [GRVT](https://grvt.io) (Gravity Markets) with full safety checks. Supports:
+Multi-Exchange Arbitrage Bot mit WebUI. Unterstützt **GRVT** und **Extended Exchange**.
 
-1. **Single market order execution** — send a token, quantity, and expected price; the service validates order-book depth and slippage before placing the order.
-2. **XAU / PAXG arbitrage** — monitors the spread between two correlated gold instruments. Opens a long/short spread when the price gap is small, and closes it when the gap widens.
+---
 
-## Architecture
+## Quick Start (Clean Setup)
 
-```
-POST /trade          →  TradeExecutor  →  safety checks  →  GRVT market order
-POST /arb/trigger    →  ArbitrageEngine →  safety checks  →  GRVT market order (2 legs)
-GET  /arb/check      →  spread snapshot + recommended action (no execution)
-POST /arb/spread     →  spread query with optional instrument override
-GET  /account/summary
-GET  /account/positions?symbols=BTC_USDT_Perp,ETH_USDT_Perp
-GET  /health
-```
-
-## Safety Checks
-
-Every order goes through these validations before execution:
-
-- **Order-book depth** — walks the book to confirm enough liquidity exists for the requested quantity.
-- **Slippage validation** — computes the volume-weighted average fill price and rejects if slippage exceeds the configured threshold.
-- **Arb leg unwinding** — if one leg of an arb trade fails, the service immediately attempts to unwind the completed leg to avoid unhedged exposure.
-
-## Setup
-
-### 1. Prerequisites
-
-- Python 3.11+
-- A GRVT account with API key (see [API Setup Guide](https://api-docs.grvt.io/api_setup/))
-
-### 2. Install
+### 1. Repository klonen
 
 ```bash
+git clone https://github.com/dhaussmann/tradeautonom.git
 cd tradeautonom
-python -m venv .venv
+```
+
+### 2. Python Environment einrichten
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure
-
-Copy the example env file and fill in your credentials:
+### 3. Konfiguration (.env)
 
 ```bash
 cp .env.example .env
 ```
 
-Required variables:
+`.env` ausfüllen:
 
-| Variable | Description |
-|---|---|
-| `GRVT_API_KEY` | Your GRVT API key |
-| `GRVT_PRIVATE_KEY` | Private key for order signing |
-| `GRVT_TRADING_ACCOUNT_ID` | Your trading (sub) account ID |
-| `GRVT_ENV` | `testnet` or `prod` |
-
-Optional overrides:
-
-| Variable | Default | Description |
+| Variable | Pflicht | Beschreibung |
 |---|---|---|
-| `DEFAULT_SLIPPAGE_PCT` | `0.5` | Default max slippage % |
-| `MAX_SLIPPAGE_PCT` | `2.0` | Hard cap on slippage % |
-| `MIN_ORDER_BOOK_DEPTH_USD` | `1000.0` | Min required book depth |
-| `ARB_ENTRY_SPREAD` | `1.0` | Open arb when spread ≤ this |
-| `ARB_EXIT_SPREAD` | `5.0` | Close arb when spread ≥ this |
-| `ARB_QUANTITY` | `1.0` | Quantity for each arb leg |
-| `ARB_XAU_INSTRUMENT` | `XAU_USDT_Perp` | First arb instrument |
-| `ARB_PAXG_INSTRUMENT` | `PAXG_USDT_Perp` | Second arb instrument |
+| `GRVT_API_KEY` | Ja | GRVT API Key |
+| `GRVT_PRIVATE_KEY` | Ja | Private Key für Order-Signierung |
+| `GRVT_TRADING_ACCOUNT_ID` | Ja | Trading (Sub-)Account ID |
+| `GRVT_ENV` | Ja | `testnet` oder `prod` |
 
-### 4. Run
+Optionale Parameter:
+
+| Variable | Default | Beschreibung |
+|---|---|---|
+| `APP_HOST` | `0.0.0.0` | Server Host |
+| `APP_PORT` | `8000` | Server Port |
+| `DEFAULT_SLIPPAGE_PCT` | `0.5` | Max Slippage % |
+| `MIN_ORDER_BOOK_DEPTH_USD` | `1000.0` | Min Orderbook-Tiefe (USD) |
+| `ARB_SPREAD_ENTRY_LOW` | `2.0` | Entry wenn Spread <= Wert |
+| `ARB_SPREAD_EXIT_HIGH` | `8.0` | Exit wenn Spread >= Wert |
+| `ARB_MAX_EXEC_SPREAD` | `5.0` | Max Bid-Ask Execution Cost |
+| `ARB_QUANTITY` | `1.0` | Quantity pro Leg |
+| `ARB_XAU_INSTRUMENT` | `XAU_USDT_Perp` | Instrument Leg A |
+| `ARB_PAXG_INSTRUMENT` | `PAXG_USDT_Perp` | Instrument Leg B |
+| `ARB_LEG_A_EXCHANGE` | `grvt` | Exchange für Leg A (`grvt` oder `extended`) |
+| `ARB_LEG_B_EXCHANGE` | `grvt` | Exchange für Leg B (`grvt` oder `extended`) |
+| `ARB_CHUNK_SIZE` | `1.0` | Order-Chunk-Größe |
+| `ARB_CHUNK_DELAY_MS` | `500` | Pause zwischen Chunks (ms) |
+| `ARB_SIMULATION_MODE` | `False` | Paper-Trading (keine echten Orders) |
+| `EXTENDED_API_BASE_URL` | `https://api.starknet.extended.exchange/api/v1` | Extended API URL |
+
+### 4. Starten
 
 ```bash
 python main.py
 ```
 
-The API will be available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
+Öffne im Browser:
+- **Dashboard:** http://localhost:8000/ui
+- **API Docs:** http://localhost:8000/docs
 
-## API Usage
+---
 
-### Execute a single trade
-
-```bash
-curl -X POST http://localhost:8000/trade \
-  -H "Content-Type: application/json" \
-  -d '{
-    "symbol": "BTC_USDT_Perp",
-    "side": "buy",
-    "quantity": 0.01,
-    "expected_price": 87000.0,
-    "slippage_pct": 0.5
-  }'
-```
-
-### Check arb spread
+## Docker (Alternative)
 
 ```bash
-curl http://localhost:8000/arb/check
+# Build
+docker build -f docker/Dockerfile -t tradeautonom:latest .
+
+# Run
+docker run -d --name tradeautonom -p 8000:8000 --env-file .env tradeautonom:latest
+
+# Oder mit docker-compose
+cd docker && docker-compose up -d
 ```
 
-### Trigger arb entry
+---
 
-```bash
-curl -X POST http://localhost:8000/arb/trigger \
-  -H "Content-Type: application/json" \
-  -d '{"action": "ENTRY"}'
-```
+## Features
 
-### Trigger arb exit
+- **Multi-Exchange** — GRVT + Extended Exchange, pro Leg frei konfigurierbar
+- **Spread Monitoring** — Live-Spread zwischen zwei beliebigen Instrumenten
+- **Arbitrage Engine** — Automatischer Entry/Exit basierend auf Spread-Schwellwerten
+- **Simulation Mode** — Paper-Trading ohne echte Orders
+- **Order Chunking** — Große Orders in kleinere Chunks aufteilen
+- **Safety Checks** — Orderbook-Tiefe, Slippage, Liquiditätsprüfung, Leg-Unwinding
+- **WebUI Dashboard** — Echtzeit-Monitoring, Konfiguration, manuelle Trades
 
-```bash
-curl -X POST http://localhost:8000/arb/trigger \
-  -H "Content-Type: application/json" \
-  -d '{"action": "EXIT"}'
-```
+## API Übersicht
 
-### Override arb parameters at trigger time
+| Endpoint | Methode | Beschreibung |
+|---|---|---|
+| `/ui` | GET | WebUI Dashboard |
+| `/health` | GET | Health Check |
+| `/arb/check` | GET | Spread + Empfehlung (ohne Execution) |
+| `/arb/status` | GET | Engine-Status + Konfiguration |
+| `/arb/config` | POST | Konfiguration zur Laufzeit ändern |
+| `/arb/trigger` | POST | Manueller Entry/Exit |
+| `/arb/auto` | POST | Auto-Check + Execute |
+| `/exchanges` | GET | Verfügbare Exchanges |
+| `/exchanges/markets?exchange=X` | GET | Instrumente einer Exchange |
+| `/trade` | POST | Einzelne Market Order |
+| `/account/summary` | GET | Kontoinformationen |
+| `/account/positions` | GET | Offene Positionen |
 
-```bash
-curl -X POST http://localhost:8000/arb/trigger \
-  -H "Content-Type: application/json" \
-  -d '{
-    "action": "ENTRY",
-    "entry_spread": 0.5,
-    "quantity": 2.0
-  }'
-```
-
-## Arbitrage Flow
-
-```
-1. Spread narrows to ≤ $1 (entry_spread)
-   → POST /arb/trigger {"action": "ENTRY"}
-   → LONG the cheaper token, SHORT the expensive one
-   → Both legs validated for depth + slippage
-
-2. Spread widens to ≥ $5 (exit_spread)
-   → POST /arb/trigger {"action": "EXIT"}
-   → Close both positions
-   → Profit = spread_exit - spread_entry - fees
-
-If any leg fails, the service automatically tries to unwind
-the completed leg to prevent unhedged exposure.
-```
-
-## Project Structure
+## Projektstruktur
 
 ```
 tradeautonom/
-├── main.py              # Entry point (uvicorn)
+├── main.py                  # Entry Point (uvicorn)
 ├── requirements.txt
 ├── .env.example
-├── README.md
+├── docker/
+│   ├── Dockerfile           # Multi-Stage Build (Python 3.11-slim)
+│   └── docker-compose.yml
+├── static/
+│   └── index.html           # WebUI Dashboard
 └── app/
-    ├── __init__.py
-    ├── config.py        # Pydantic settings from .env
-    ├── grvt_client.py   # GRVT SDK wrapper (auth, orders, market data)
-    ├── safety.py        # Order-book depth + slippage checks
-    ├── executor.py      # Trade executor with pre-trade validation
-    ├── arbitrage.py     # XAU/PAXG spread trading engine
-    ├── schemas.py       # Pydantic request/response models
-    └── server.py        # FastAPI endpoints
+    ├── config.py            # Settings aus .env (pydantic-settings)
+    ├── exchange.py          # ExchangeClient Protocol
+    ├── grvt_client.py       # GRVT SDK Wrapper
+    ├── extended_client.py   # Extended Exchange REST Client
+    ├── safety.py            # Orderbook-Tiefe + Slippage Checks
+    ├── executor.py          # Trade Executor mit Validierung
+    ├── arbitrage.py         # Spread-Trading Engine (Multi-Exchange)
+    ├── schemas.py           # Pydantic Request/Response Models
+    └── server.py            # FastAPI Endpoints
 ```
