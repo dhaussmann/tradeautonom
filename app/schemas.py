@@ -163,3 +163,125 @@ class SpreadResponse(BaseModel):
     snapshot: SpreadInfo
     recommended_action: str
     reason: str
+
+
+# ------------------------------------------------------------------
+# Job management
+# ------------------------------------------------------------------
+
+class ScheduleConfig(BaseModel):
+    """Exit schedule configuration."""
+    hold_duration_h: float | None = Field(None, ge=0, description="Max hours before scheduled exit (0 or null = no limit)")
+    min_exit_spread: float = Field(0.05, ge=0, description="Min spread for exit after hold_duration expires")
+    always_exit_spread: float = Field(0.10, ge=0, description="Profit-take: exit any time if spread >= this")
+
+
+class JobCreateRequest(BaseModel):
+    """Create a new arb job."""
+    job_id: str | None = Field(None, description="Custom job ID (auto-generated if omitted)")
+    name: str | None = Field(None, description="Display name (defaults to pair name)")
+    instrument_a: str = Field(..., description="Instrument for leg A")
+    instrument_b: str = Field(..., description="Instrument for leg B")
+    leg_a_exchange: str = Field("extended", description="Exchange for leg A")
+    leg_b_exchange: str = Field("grvt", description="Exchange for leg B")
+    # Trading params
+    spread_entry_low: float = Field(0.05, description="Enter when spread <= this")
+    spread_exit_high: float = Field(0.50, description="Engine exit threshold (fallback)")
+    max_exec_spread: float = Field(0.5, ge=0, description="Max bid-ask execution cost")
+    quantity: float = Field(0.1, gt=0, description="Trade quantity")
+    simulation_mode: bool = Field(False, description="Paper-trade mode")
+    order_type: str = Field("aggressive_limit", description="Order type")
+    limit_offset_ticks: int = Field(2, ge=0, description="Ticks beyond best price")
+    min_profit: float = Field(0.005, ge=0, description="Min profit above break-even")
+    fill_timeout_ms: int = Field(3000, ge=0, description="Max fill wait time (ms)")
+    chunk_size: float = Field(1.0, gt=0)
+    chunk_delay_ms: int = Field(500, ge=0)
+    liquidity_multiplier: float = Field(2.0, ge=1.0)
+    auto_trade: bool = Field(False, description="Enable auto-trading for this job")
+    # Schedule
+    hold_duration_h: float | None = Field(None, ge=0, description="Max hours before scheduled exit")
+    min_exit_spread: float = Field(0.05, ge=0, description="Min spread for exit after hold expires")
+    always_exit_spread: float = Field(0.10, ge=0, description="Profit-take spread threshold")
+
+
+class JobConfigUpdateRequest(BaseModel):
+    """Partial update to an existing job."""
+    name: str | None = None
+    instrument_a: str | None = None
+    instrument_b: str | None = None
+    leg_a_exchange: str | None = None
+    leg_b_exchange: str | None = None
+    spread_entry_low: float | None = None
+    spread_exit_high: float | None = None
+    max_exec_spread: float | None = Field(None, ge=0)
+    quantity: float | None = Field(None, gt=0)
+    simulation_mode: bool | None = None
+    order_type: str | None = None
+    limit_offset_ticks: int | None = Field(None, ge=0)
+    min_profit: float | None = Field(None, ge=0)
+    fill_timeout_ms: int | None = Field(None, ge=0)
+    chunk_size: float | None = Field(None, gt=0)
+    chunk_delay_ms: int | None = Field(None, ge=0)
+    liquidity_multiplier: float | None = Field(None, ge=1.0)
+    auto_trade: bool | None = None
+    hold_duration_h: float | None = Field(None, ge=0)
+    min_exit_spread: float | None = Field(None, ge=0)
+    always_exit_spread: float | None = Field(None, ge=0)
+
+
+class TradeLogEntryResponse(BaseModel):
+    """A single trade log entry."""
+    timestamp: str
+    job_id: str
+    action: str
+    leg_a_instrument: str
+    leg_b_instrument: str
+    leg_a_exchange: str
+    leg_b_exchange: str
+    leg_a_side: str
+    leg_b_side: str
+    leg_a_fill_price: float | None = None
+    leg_b_fill_price: float | None = None
+    spread_at_execution: float
+    quantity: float
+    success: bool
+    error: str | None = None
+
+
+class JobStatusResponse(BaseModel):
+    """Full status of a single job."""
+    job_id: str
+    name: str
+    status: str
+    auto_trade: bool
+    created_at: str
+    entry_time: str | None = None
+    # Engine config
+    instrument_a: str
+    instrument_b: str
+    leg_a_exchange: str
+    leg_b_exchange: str
+    spread_entry_low: float
+    spread_exit_high: float
+    max_exec_spread: float
+    quantity: float
+    simulation_mode: bool
+    order_type: str
+    limit_offset_ticks: int
+    min_profit: float
+    fill_timeout_ms: int
+    chunk_size: float
+    chunk_delay_ms: int
+    liquidity_multiplier: float
+    # Schedule
+    hold_duration_h: float | None = None
+    min_exit_spread: float
+    always_exit_spread: float
+    # Position
+    has_position: bool
+    long_sym: str | None = None
+    short_sym: str | None = None
+    entry_spread_actual: float | None = None
+    # WS
+    ws_enabled: bool
+    ws_stale_ms: int

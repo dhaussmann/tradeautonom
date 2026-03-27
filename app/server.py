@@ -1,20 +1,26 @@
 """FastAPI server — exposes endpoints for trade triggers and arbitrage."""
 
+import asyncio
+import json
 import logging
+import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.arbitrage import ArbitrageEngine
 from app.config import Settings
 from app.executor import TradeExecutor
 from app.extended_client import ExtendedClient
 from app.grvt_client import GrvtClient
+from app.job_manager import JobManager, ArbJob
 from app.ws_feeds import OrderbookFeedManager
 from app.schemas import (
     ArbAutoRequest,
@@ -25,10 +31,14 @@ from app.schemas import (
     ArbStatusResponse,
     ArbTriggerRequest,
     DepthInfo,
+    JobCreateRequest,
+    JobConfigUpdateRequest,
+    JobStatusResponse,
     SlippageInfo,
     SpreadInfo,
     SpreadRequest,
     SpreadResponse,
+    TradeLogEntryResponse,
     TradeRequest,
     TradeResponse,
 )
@@ -60,11 +70,12 @@ _executor: TradeExecutor | None = None
 _arb_engine: ArbitrageEngine | None = None
 _exchange_clients: dict = {}
 _feed_manager: OrderbookFeedManager | None = None
+_job_manager: JobManager | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _client, _extended_client, _executor, _arb_engine, _exchange_clients, _feed_manager
+    global _settings, _client, _extended_client, _executor, _arb_engine, _exchange_clients, _feed_manager, _job_manager
     _settings = Settings()
     _client = GrvtClient(_settings)
     _extended_client = ExtendedClient(
@@ -76,6 +87,7 @@ async def lifespan(app: FastAPI):
     )
     _exchange_clients = {"grvt": _client, "extended": _extended_client}
     _executor = TradeExecutor(_client, _settings)
+    # Legacy single-engine (kept for backward compat with /arb/* endpoints)
     _arb_engine = ArbitrageEngine(_exchange_clients, _executor, _settings)
     _arb_engine.sync_position_from_exchange()
     # Start WebSocket orderbook feeds
@@ -92,6 +104,33 @@ async def lifespan(app: FastAPI):
         logger.info("WebSocket feeds started for %s:%s + %s:%s",
                     _settings.arb_leg_a_exchange, _settings.arb_xau_instrument,
                     _settings.arb_leg_b_exchange, _settings.arb_paxg_instrument)
+    # Job manager (multi-pair)
+    _job_manager = JobManager(_exchange_clients, _executor, _settings, _feed_manager)
+    # Create a default job from env config so existing setup works out of the box
+    try:
+        _job_manager.create_job({
+            "job_id": "default",
+            "name": f"{_settings.arb_xau_instrument} / {_settings.arb_paxg_instrument}",
+            "instrument_a": _settings.arb_xau_instrument,
+            "instrument_b": _settings.arb_paxg_instrument,
+            "leg_a_exchange": _settings.arb_leg_a_exchange,
+            "leg_b_exchange": _settings.arb_leg_b_exchange,
+            "spread_entry_low": _settings.arb_spread_entry_low,
+            "spread_exit_high": _settings.arb_spread_exit_high,
+            "max_exec_spread": _settings.arb_max_exec_spread,
+            "quantity": _settings.arb_quantity,
+            "simulation_mode": _settings.arb_simulation_mode,
+            "order_type": _settings.arb_order_type,
+            "limit_offset_ticks": _settings.arb_limit_offset_ticks,
+            "min_profit": _settings.arb_min_profit,
+            "fill_timeout_ms": _settings.arb_fill_timeout_ms,
+            "chunk_size": _settings.arb_chunk_size,
+            "chunk_delay_ms": _settings.arb_chunk_delay_ms,
+            "liquidity_multiplier": _settings.arb_liquidity_multiplier,
+        })
+        logger.info("Default job created from env config")
+    except Exception as exc:
+        logger.warning("Could not create default job: %s", exc)
     logger.info("App started — GRVT env=%s, exchanges=%s", _settings.grvt_env, list(_exchange_clients.keys()))
     yield
     if _feed_manager is not None:
@@ -184,7 +223,10 @@ async def get_spread(req: SpreadRequest = SpreadRequest()):
     if req.instrument_b:
         _arb_engine.instrument_b = req.instrument_b
 
-    snapshot = _arb_engine.get_spread_snapshot()
+    try:
+        snapshot = _arb_engine.get_spread_snapshot()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Orderbook not available: {exc}")
     check = _arb_engine.evaluate(snapshot)
 
     return SpreadResponse(
@@ -201,7 +243,10 @@ async def get_spread(req: SpreadRequest = SpreadRequest()):
 @app.get("/arb/check", response_model=ArbCheckResponse)
 async def arb_check():
     """Evaluate arb opportunity without executing."""
-    snapshot = _arb_engine.get_spread_snapshot()
+    try:
+        snapshot = _arb_engine.get_spread_snapshot()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Orderbook not available: {exc}")
     check = _arb_engine.evaluate(snapshot)
     return ArbCheckResponse(
         action=check.action,
@@ -225,11 +270,14 @@ async def arb_trigger(req: ArbTriggerRequest):
     if req.quantity is not None:
         _arb_engine.quantity = Decimal(str(req.quantity))
 
-    result = _arb_engine.execute_signal(
-        req.action,
-        min_depth_usd=req.min_depth_usd,
-        slippage_pct=req.slippage_pct,
-    )
+    try:
+        result = _arb_engine.execute_signal(
+            req.action,
+            min_depth_usd=req.min_depth_usd,
+            slippage_pct=req.slippage_pct,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Orderbook not available: {exc}")
 
     leg_a_info = None
     if result.leg_a:
@@ -269,7 +317,10 @@ async def arb_auto(req: ArbAutoRequest = ArbAutoRequest()):
         _arb_engine.quantity = Decimal(str(req.quantity))
 
     # Evaluate
-    snapshot = _arb_engine.get_spread_snapshot()
+    try:
+        snapshot = _arb_engine.get_spread_snapshot()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Orderbook not available: {exc}")
     check = _arb_engine.evaluate(snapshot)
 
     if check.action == "NONE":
@@ -570,6 +621,281 @@ async def ws_status():
     if _feed_manager is None:
         return {"enabled": False, "feeds": {}}
     return {"enabled": _arb_engine._ws_enabled, "feeds": _feed_manager.status()}
+
+
+# ------------------------------------------------------------------
+# Job management
+# ------------------------------------------------------------------
+
+
+def _job_status_response(job: ArbJob) -> JobStatusResponse:
+    """Build a JobStatusResponse from an ArbJob."""
+    eng = job.engine
+    pi = eng.position_info
+    return JobStatusResponse(
+        job_id=job.job_id,
+        name=job.name,
+        status=job.status,
+        auto_trade=job.auto_trade,
+        created_at=job.created_at,
+        entry_time=job.entry_time,
+        instrument_a=eng.instrument_a,
+        instrument_b=eng.instrument_b,
+        leg_a_exchange=eng.leg_a_exchange,
+        leg_b_exchange=eng.leg_b_exchange,
+        spread_entry_low=eng.spread_entry_low,
+        spread_exit_high=eng.spread_exit_high,
+        max_exec_spread=eng.max_exec_spread,
+        quantity=float(eng.quantity),
+        simulation_mode=eng.simulation_mode,
+        order_type=eng.order_type,
+        limit_offset_ticks=eng.limit_offset_ticks,
+        min_profit=eng.min_profit,
+        fill_timeout_ms=eng.fill_timeout_ms,
+        chunk_size=float(eng.chunk_size),
+        chunk_delay_ms=eng.chunk_delay_ms,
+        liquidity_multiplier=eng.liquidity_multiplier,
+        hold_duration_h=job.schedule.hold_duration_h,
+        min_exit_spread=job.schedule.min_exit_spread,
+        always_exit_spread=job.schedule.always_exit_spread,
+        has_position=pi["has_position"],
+        long_sym=pi["long_sym"],
+        short_sym=pi["short_sym"],
+        entry_spread_actual=pi["entry_spread"],
+        ws_enabled=eng._ws_enabled,
+        ws_stale_ms=eng._ws_stale_ms,
+    )
+
+
+@app.get("/jobs")
+async def list_jobs():
+    """List all arb jobs."""
+    return {"jobs": _job_manager.list_jobs()}
+
+
+@app.post("/jobs")
+async def create_job(req: JobCreateRequest):
+    """Create a new arb job."""
+    try:
+        job = _job_manager.create_job(req.model_dump())
+        return {"status": "ok", "job": _job_status_response(job).model_dump()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Get full status of a single job."""
+    try:
+        job = _job_manager.get_job(job_id)
+        return _job_status_response(job)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.put("/jobs/{job_id}/config")
+async def update_job_config(job_id: str, req: JobConfigUpdateRequest):
+    """Update job configuration."""
+    try:
+        config = {k: v for k, v in req.model_dump().items() if v is not None}
+        job = _job_manager.update_job_config(job_id, config)
+        return {"status": "ok", "job": _job_status_response(job).model_dump()}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete an arb job."""
+    try:
+        _job_manager.delete_job(job_id)
+        return {"status": "ok", "message": f"Job {job_id} deleted"}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/jobs/{job_id}/trigger")
+async def trigger_job(job_id: str, req: ArbTriggerRequest):
+    """Manual entry/exit for a specific job."""
+    try:
+        job = _job_manager.get_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    engine = job.engine
+    if req.spread_entry_low is not None:
+        engine.spread_entry_low = req.spread_entry_low
+    if req.spread_exit_high is not None:
+        engine.spread_exit_high = req.spread_exit_high
+    if req.quantity is not None:
+        engine.quantity = Decimal(str(req.quantity))
+
+    try:
+        result = engine.execute_signal(
+            req.action,
+            min_depth_usd=req.min_depth_usd,
+            slippage_pct=req.slippage_pct,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=f"Orderbook not available: {exc}")
+
+    # Log the trade
+    from app.job_manager import TradeLogEntry, _extract_fill_price
+    snapshot = result.snapshot
+    if req.action.upper() == "ENTRY":
+        leg_a_side = "buy" if snapshot.a_is_cheaper else "sell"
+        leg_b_side = "sell" if snapshot.a_is_cheaper else "buy"
+    else:
+        leg_a_side = "sell" if engine._long_sym == engine.instrument_a else "buy"
+        leg_b_side = "sell" if engine._long_sym == engine.instrument_b else "buy"
+
+    entry = TradeLogEntry(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        job_id=job.job_id,
+        action=req.action.upper(),
+        leg_a_instrument=engine.instrument_a,
+        leg_b_instrument=engine.instrument_b,
+        leg_a_exchange=engine.leg_a_exchange,
+        leg_b_exchange=engine.leg_b_exchange,
+        leg_a_side=leg_a_side,
+        leg_b_side=leg_b_side,
+        leg_a_fill_price=_extract_fill_price(result.leg_a),
+        leg_b_fill_price=_extract_fill_price(result.leg_b),
+        spread_at_execution=snapshot.spread_abs,
+        quantity=float(engine.quantity),
+        success=result.success,
+        error=result.error,
+    )
+    job.trade_log.append(entry)
+
+    if result.success and req.action.upper() == "ENTRY":
+        job.entry_time = datetime.now(timezone.utc).isoformat()
+        job.status = "holding"
+    elif result.success and req.action.upper() == "EXIT":
+        job.entry_time = None
+        job.status = "monitoring" if job.auto_trade else "idle"
+
+    leg_a_info = ArbLegInfo(success=result.leg_a.success, error=result.leg_a.error) if result.leg_a else None
+    leg_b_info = ArbLegInfo(success=result.leg_b.success, error=result.leg_b.error) if result.leg_b else None
+
+    return ArbExecutionResponse(
+        success=result.success,
+        leg_a=leg_a_info,
+        leg_b=leg_b_info,
+        snapshot=_spread_info(result.snapshot),
+        error=result.error,
+    )
+
+
+@app.get("/jobs/{job_id}/check")
+async def check_job(job_id: str):
+    """Spread check for a specific job."""
+    try:
+        job = _job_manager.get_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    try:
+        snapshot = job.engine.get_spread_snapshot()
+    except ValueError as exc:
+        return {"action": "NONE", "snapshot": None, "reason": f"Orderbook not available: {exc}"}
+    job._last_spread = snapshot
+    check = job.engine.evaluate(snapshot)
+    return ArbCheckResponse(
+        action=check.action,
+        snapshot=_spread_info(snapshot),
+        reason=check.reason,
+    )
+
+
+@app.get("/jobs/{job_id}/orderbooks")
+async def job_orderbooks(job_id: str, depth: int = 10):
+    """Orderbooks for a specific job's pair."""
+    try:
+        job = _job_manager.get_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    engine = job.engine
+    try:
+        book_a = engine._get_orderbook(engine.leg_a_exchange, engine.xau_instrument, limit=depth)
+        book_b = engine._get_orderbook(engine.leg_b_exchange, engine.paxg_instrument, limit=depth)
+        return {
+            "leg_a": {
+                "exchange": engine.leg_a_exchange,
+                "instrument": engine.xau_instrument,
+                "bids": book_a.get("bids", [])[:depth],
+                "asks": book_a.get("asks", [])[:depth],
+                "source": book_a.get("_source", "rest"),
+            },
+            "leg_b": {
+                "exchange": engine.leg_b_exchange,
+                "instrument": engine.paxg_instrument,
+                "bids": book_b.get("bids", [])[:depth],
+                "asks": book_b.get("asks", [])[:depth],
+                "source": book_b.get("_source", "rest"),
+            },
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/jobs/{job_id}/log")
+async def job_trade_log(job_id: str, limit: int = 50):
+    """Trade log entries for a specific job."""
+    try:
+        job = _job_manager.get_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    entries = job.trade_log[-limit:] if limit else job.trade_log
+    return {"job_id": job_id, "entries": [asdict(e) for e in reversed(entries)]}
+
+
+@app.get("/jobs/{job_id}/spread-stream")
+async def job_spread_stream(job_id: str, interval_ms: int = 1000):
+    """SSE real-time spread stream for a specific job."""
+    try:
+        _job_manager.get_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    async def event_generator():
+        while True:
+            try:
+                job = _job_manager.get_job(job_id)
+                snapshot = job.engine.get_spread_snapshot()
+                job._last_spread = snapshot
+                data = {
+                    "spread": snapshot.spread,
+                    "spread_abs": snapshot.spread_abs,
+                    "mid_a": snapshot.mid_price_a,
+                    "mid_b": snapshot.mid_price_b,
+                    "exec_spread": snapshot.exec_spread,
+                    "data_source": snapshot.data_source,
+                    "ts": time.time(),
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+            except Exception:
+                yield f"data: {json.dumps({'error': 'failed'})}\n\n"
+            await asyncio.sleep(interval_ms / 1000.0)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/jobs/tick")
+async def tick_all_jobs():
+    """Manually trigger a tick on all jobs (same as auto-trade timer)."""
+    results = _job_manager.tick_all()
+    return {"status": "ok", "results": results}
 
 
 # ------------------------------------------------------------------

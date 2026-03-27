@@ -66,7 +66,7 @@ class _ExtendedFeedThread(threading.Thread):
         self.instrument = instrument
         self._book = book
         self._lock = lock
-        self._stop = stop_event
+        self._stop_ev = stop_event
         # Extended WS endpoint — full orderbook (snapshots every 100ms + deltas)
         self._url = (
             f"wss://api.starknet.extended.exchange"
@@ -76,18 +76,18 @@ class _ExtendedFeedThread(threading.Thread):
         self._reconnect_delay = 1.0
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_ev.is_set():
             try:
                 self._connect_and_listen()
             except Exception as exc:
                 self.connected = False
-                if self._stop.is_set():
+                if self._stop_ev.is_set():
                     break
                 logger.warning(
                     "Extended WS (%s) error: %s — reconnecting in %.0fs",
                     self.instrument, exc, self._reconnect_delay,
                 )
-                self._stop.wait(self._reconnect_delay)
+                self._stop_ev.wait(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
     def _connect_and_listen(self) -> None:
@@ -97,7 +97,7 @@ class _ExtendedFeedThread(threading.Thread):
             self._reconnect_delay = 1.0
             logger.info("Extended WS connected: %s", self.instrument)
 
-            while not self._stop.is_set():
+            while not self._stop_ev.is_set():
                 try:
                     raw = conn.recv(timeout=20)  # server pings every 15s
                 except TimeoutError:
@@ -179,24 +179,24 @@ class _GrvtFeedThread(threading.Thread):
         self._env = env
         self._book = book
         self._lock = lock
-        self._stop = stop_event
+        self._stop_ev = stop_event
         self._url = _grvt_ws_url(env)
         self.connected = False
         self._reconnect_delay = 1.0
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_ev.is_set():
             try:
                 self._connect_and_listen()
             except Exception as exc:
                 self.connected = False
-                if self._stop.is_set():
+                if self._stop_ev.is_set():
                     break
                 logger.warning(
                     "GRVT WS (%s) error: %s — reconnecting in %.0fs",
                     self.instrument, exc, self._reconnect_delay,
                 )
-                self._stop.wait(self._reconnect_delay)
+                self._stop_ev.wait(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
     def _connect_and_listen(self) -> None:
@@ -236,7 +236,7 @@ class _GrvtFeedThread(threading.Thread):
             self.connected = True
             self._reconnect_delay = 1.0
 
-            while not self._stop.is_set():
+            while not self._stop_ev.is_set():
                 try:
                     raw = conn.recv(timeout=30)
                 except TimeoutError:
@@ -297,8 +297,9 @@ class OrderbookFeedManager:
         self._stale_ms = stale_ms
         self._books: dict[str, OrderbookSnapshot] = {}   # key = "exchange:instrument"
         self._locks: dict[str, threading.Lock] = {}
-        self._threads: list[threading.Thread] = []
-        self._stop_event = threading.Event()
+        self._threads: dict[str, threading.Thread] = {}  # key = "exchange:instrument"
+        self._stop_events: dict[str, threading.Event] = {}  # per-feed stop events
+        self._global_stop = threading.Event()  # for stop-all
         self._started = False
 
     def _key(self, exchange: str, instrument: str) -> str:
@@ -314,37 +315,62 @@ class OrderbookFeedManager:
             logger.warning("OrderbookFeedManager already started")
             return
 
-        self._stop_event.clear()
+        self._global_stop.clear()
 
         for exchange, instrument in instruments.items():
-            key = self._key(exchange, instrument)
-            book = OrderbookSnapshot()
-            lock = threading.Lock()
-            self._books[key] = book
-            self._locks[key] = lock
-
-            if exchange == "extended":
-                t = _ExtendedFeedThread(instrument, book, lock, self._stop_event)
-            elif exchange == "grvt":
-                t = _GrvtFeedThread(instrument, self._grvt_env, book, lock, self._stop_event)
-            else:
-                logger.warning("Unknown exchange for WS feed: %s — skipping", exchange)
-                continue
-
-            self._threads.append(t)
-            t.start()
-            logger.info("Started WS feed: %s → %s", exchange, instrument)
+            self.add_feed(exchange, instrument)
 
         self._started = True
 
     def stop(self) -> None:
         """Stop all WS feed threads."""
-        self._stop_event.set()
-        for t in self._threads:
+        self._global_stop.set()
+        for ev in self._stop_events.values():
+            ev.set()
+        for t in self._threads.values():
             t.join(timeout=5)
         self._threads.clear()
+        self._stop_events.clear()
         self._started = False
         logger.info("All WS feeds stopped")
+
+    def add_feed(self, exchange: str, instrument: str) -> None:
+        """Add a single WS feed dynamically. No-op if already running."""
+        key = self._key(exchange, instrument)
+        if key in self._threads and self._threads[key].is_alive():
+            return  # already running
+
+        book = OrderbookSnapshot()
+        lock = threading.Lock()
+        stop_ev = threading.Event()
+        self._books[key] = book
+        self._locks[key] = lock
+        self._stop_events[key] = stop_ev
+
+        if exchange == "extended":
+            t = _ExtendedFeedThread(instrument, book, lock, stop_ev)
+        elif exchange == "grvt":
+            t = _GrvtFeedThread(instrument, self._grvt_env, book, lock, stop_ev)
+        else:
+            logger.warning("Unknown exchange for WS feed: %s — skipping", exchange)
+            return
+
+        self._threads[key] = t
+        t.start()
+        logger.info("Added WS feed: %s → %s", exchange, instrument)
+
+    def remove_feed(self, exchange: str, instrument: str) -> None:
+        """Stop and remove a single WS feed. No-op if not running."""
+        key = self._key(exchange, instrument)
+        stop_ev = self._stop_events.pop(key, None)
+        if stop_ev:
+            stop_ev.set()
+        t = self._threads.pop(key, None)
+        if t:
+            t.join(timeout=5)
+        self._books.pop(key, None)
+        self._locks.pop(key, None)
+        logger.info("Removed WS feed: %s → %s", exchange, instrument)
 
     def get_book(self, exchange: str, instrument: str) -> dict | None:
         """Get cached orderbook in the same format as REST fetch_order_book.
@@ -395,12 +421,11 @@ class OrderbookFeedManager:
     def status(self) -> dict:
         """Return connection status for all feeds."""
         result = {}
-        for t in self._threads:
+        for key, t in self._threads.items():
             name = t.name
             connected = getattr(t, "connected", False)
             instrument = getattr(t, "instrument", "?")
             exchange = "extended" if "extended" in name else "grvt"
-            key = self._key(exchange, instrument)
             book = self._books.get(key)
             age_ms = (time.time() - book.last_update_ts) * 1000 if book and book.last_update_ts else None
             result[key] = {

@@ -11,11 +11,31 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
 header h1{font-size:17px;font-weight:600}
 header h1 span{color:var(--accent)}
+.hdr-right{display:flex;align-items:center;gap:8px}
 .badge{background:var(--surface2);border:1px solid var(--border);padding:3px 10px;border-radius:10px;font-size:11px;color:var(--dim)}
+
+/* Tab bar */
+.tab-bar{display:flex;align-items:center;background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px;gap:0;overflow-x:auto}
+.tab{display:flex;align-items:center;gap:6px;padding:10px 16px;font-size:12px;font-weight:600;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;transition:all .15s}
+.tab:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab .tab-status{width:6px;height:6px;border-radius:50%;display:inline-block}
+.tab .tab-status.idle{background:var(--dim)}
+.tab .tab-status.monitoring{background:var(--blue)}
+.tab .tab-status.holding{background:var(--green)}
+.tab .tab-status.awaiting_exit{background:var(--yellow)}
+.tab .tab-status.exited{background:var(--dim)}
+.tab .tab-close{font-size:14px;color:var(--dim);margin-left:4px;cursor:pointer;line-height:1}
+.tab .tab-close:hover{color:var(--red)}
+.tab-add{padding:10px 14px;font-size:16px;color:var(--dim);cursor:pointer;font-weight:700}
+.tab-add:hover{color:var(--green)}
+
 .container{max-width:1200px;margin:0 auto;padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px}
 .card-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:14px}
 .full{grid-column:1/-1}
+.job-panel{display:none}
+.job-panel.active{display:block}
 
 .spread-row{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;margin-bottom:16px}
 .pb{text-align:center}
@@ -113,380 +133,501 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
 .ob-asks .ob-row .ob-bar{right:0;background:var(--red)}
 .ob-asks .ob-row .ob-price{color:var(--red)}
 .ob-spread-row{text-align:center;padding:4px 0;font-size:10px;color:var(--dim);border-top:1px solid var(--border);border-bottom:1px solid var(--border);font-weight:600}
+
+/* Spread stream chart */
+.spread-chart{height:80px;display:flex;align-items:flex-end;gap:1px;background:var(--surface2);border-radius:6px;padding:6px;overflow:hidden}
+.spread-chart .sc-bar{flex:1;min-width:1px;border-radius:1px 1px 0 0;transition:height .2s}
+.stream-info{font-size:10px;color:var(--dim);margin-top:4px;display:flex;justify-content:space-between}
+
+/* Trade log table */
+.tlog{width:100%;border-collapse:collapse;font-size:11px}
+.tlog th{text-align:left;padding:6px 8px;color:var(--dim);font-size:9px;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border)}
+.tlog td{padding:5px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+.tlog .fill-price{color:var(--accent);font-weight:600}
+.tlog .act-entry{color:var(--green)}.tlog .act-exit{color:var(--red)}
+.tlog .ok{color:var(--green)}.tlog .fail{color:var(--red)}
+
+/* New job modal */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:center}
+.modal-overlay.show{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:460px;max-height:80vh;overflow-y:auto}
+.modal h2{font-size:16px;margin-bottom:16px}
+.modal .cg{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 </style>
 </head>
 <body>
 <header>
   <h1><span>TradeAutonom</span> Arbitrage Dashboard</h1>
-  <div class="badge" id="envBadge">connecting...</div>
-  <div class="badge" id="simBadge" style="display:none;background:var(--yellow);color:#000;margin-left:8px;font-weight:700">SIM MODE</div>
-  <div class="badge" id="wsBadge" style="display:none;margin-left:8px;font-weight:600">WS</div>
+  <div class="hdr-right">
+    <div class="badge" id="envBadge">connecting...</div>
+    <div class="badge" id="wsBadge" style="display:none;font-weight:600">WS</div>
+  </div>
 </header>
-<div class="container">
 
-  <!-- Spread Monitor -->
-  <div class="card full">
-    <div class="card-title">Live Spread Monitor</div>
-    <div class="spread-row">
-      <div class="pb"><div class="lbl">LEG B (Long)</div><div class="pr" id="prB">—</div><div class="inst"><span id="iB">PAXG_USDT_Perp</span> <span id="exB" style="color:var(--accent);font-size:9px">grvt</span></div></div>
-      <div class="sc"><div class="sv" id="sV">—</div><div class="sl">SPREAD (B−A)</div><div class="sv" id="sVexec" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div><div class="sv" id="sVbe" style="font-size:13px;color:var(--yellow);margin-top:4px">—</div><div class="sl" style="font-size:9px">BREAK-EVEN</div></div>
-      <div class="pb"><div class="lbl">LEG A (Short)</div><div class="pr" id="prA">—</div><div class="inst"><span id="iA">XAU_USDT_Perp</span> <span id="exA" style="color:var(--accent);font-size:9px">grvt</span></div></div>
-    </div>
-    <div class="sig none" id="sigBar"><span class="dot"></span><span id="sigTxt">Waiting for data...</span></div>
-    <div class="pos-bar flat" id="posBar">No position</div>
-    <div class="hist" id="hist"></div>
-    <div class="ri">Auto-refresh every <span id="rr">3</span>s &middot; Last: <span id="lu">—</span> &middot; Source: <span id="dataSrc" style="font-weight:600">REST</span></div>
-  </div>
+<!-- Tab bar -->
+<div class="tab-bar" id="tabBar">
+  <div class="tab-add" onclick="showNewJobModal()" title="Add new job">+</div>
+</div>
 
-  <!-- Orderbooks -->
-  <div class="card full">
-    <div class="card-title">Live Order Books</div>
-    <div class="ob-grid">
-      <div class="ob-panel">
-        <div class="ob-header"><span class="ob-title" id="obTitleA">LEG A</span><span class="ob-src" id="obSrcA">—</span></div>
-        <div class="ob-ladder">
-          <div class="ob-side ob-bids" id="obBidsA"><div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div></div>
-          <div class="ob-side ob-asks" id="obAsksA"><div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div></div>
-        </div>
-        <div class="ob-spread-row" id="obSpreadA">—</div>
-      </div>
-      <div class="ob-panel">
-        <div class="ob-header"><span class="ob-title" id="obTitleB">LEG B</span><span class="ob-src" id="obSrcB">—</span></div>
-        <div class="ob-ladder">
-          <div class="ob-side ob-bids" id="obBidsB"><div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div></div>
-          <div class="ob-side ob-asks" id="obAsksB"><div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div></div>
-        </div>
-        <div class="ob-spread-row" id="obSpreadB">—</div>
-      </div>
-    </div>
-  </div>
+<!-- Job panels rendered dynamically -->
+<div id="jobPanels"></div>
 
-  <!-- Config -->
-  <div class="card">
-    <div class="card-title">Configuration</div>
-    <div class="at">
-      <div class="lg"><h3>Auto-Trading</h3><p>Monitor &amp; execute automatically</p></div>
-      <label class="tg"><input type="checkbox" id="atToggle"><span class="tgs"></span></label>
-    </div>
-    <div class="at" style="margin-top:8px;padding:8px 12px;background:rgba(255,193,7,0.08);border-radius:8px">
-      <div class="lg"><h3 style="color:var(--yellow)">Simulation Mode</h3><p>Paper-trade: no real orders</p></div>
-      <label class="tg"><input type="checkbox" id="simToggle" onchange="toggleSim()"><span class="tgs"></span></label>
-    </div>
-    <div style="margin-bottom:12px;padding:10px;background:var(--surface2);border-radius:8px">
-      <div class="card-title" style="margin-bottom:8px">Leg A (Short side)</div>
-      <div style="display:flex;gap:8px">
-        <div class="fld" style="flex:1"><label>Exchange</label><select id="cExA" onchange="loadInstruments('A')"><option value="grvt">GRVT</option><option value="extended">Extended</option></select></div>
-        <div class="fld" style="flex:2"><label>Instrument</label><select id="cInstA"></select></div>
-      </div>
-    </div>
-    <div style="margin-bottom:12px;padding:10px;background:var(--surface2);border-radius:8px">
-      <div class="card-title" style="margin-bottom:8px">Leg B (Long side)</div>
-      <div style="display:flex;gap:8px">
-        <div class="fld" style="flex:1"><label>Exchange</label><select id="cExB" onchange="loadInstruments('B')"><option value="grvt">GRVT</option><option value="extended">Extended</option></select></div>
-        <div class="fld" style="flex:2"><label>Instrument</label><select id="cInstB"></select></div>
-      </div>
-    </div>
+<!-- New Job Modal -->
+<div class="modal-overlay" id="newJobModal">
+  <div class="modal">
+    <h2>New Arbitrage Job</h2>
     <div class="cg">
-      <div class="fld"><label>Entry Low ($)</label><input type="number" id="cES" step="0.1" min="0" title="Enter when spread <= this"></div>
-      <div class="fld"><label>Exit High ($)</label><input type="number" id="cXS" step="0.1" min="0" title="Exit when spread >= this"></div>
-      <div class="fld"><label>Max Exec ($)</label><input type="number" id="cME" step="0.5" min="0" title="Max bid-ask execution cost"></div>
-      <div class="fld"><label>Quantity</label><input type="number" id="cQ" step="0.001" min="0"></div>
-      <div class="fld"><label>Max Slippage (%)</label><input type="number" id="cSl" step="0.1" min="0"></div>
-      <div class="fld"><label>Min Depth (USD)</label><input type="number" id="cMD" step="1" min="0"></div>
-      <div class="fld"><label>Liquidity (x Qty)</label><input type="number" id="cLM" step="0.5" min="1" value="2.0"></div>
-      <div class="fld"><label>Chunk Size</label><input type="number" id="cCS" step="0.1" min="0.1" value="1.0" title="Split orders into chunks of this size"></div>
-      <div class="fld"><label>Chunk Delay (ms)</label><input type="number" id="cCD" step="100" min="0" value="500" title="Delay between order chunks"></div>
-      <div class="fld"><label>Order Type</label><select id="cOT"><option value="aggressive_limit">Aggressive Limit</option><option value="market">Market</option></select></div>
-      <div class="fld"><label>Limit Offset (ticks)</label><input type="number" id="cLOT" step="1" min="0" value="2" title="Ticks beyond best price for aggressive limit"></div>
-      <div class="fld"><label>Min Profit ($)</label><input type="number" id="cMP" step="0.001" min="0" value="0.005" title="Min profit above break-even to enter"></div>
-      <div class="fld"><label>Fill Timeout (ms)</label><input type="number" id="cFT" step="500" min="0" value="3000" title="Max wait for fill confirmation"></div>
-      <div class="fld"><label>Refresh (sec)</label><input type="number" id="cRR" value="3" step="1" min="1" max="60"></div>
+      <div class="fld"><label>Job ID (optional)</label><input type="text" id="njId" placeholder="auto"></div>
+      <div class="fld"><label>Name (optional)</label><input type="text" id="njName" placeholder="auto"></div>
+      <div class="fld"><label>Leg A Exchange</label><select id="njExA" onchange="loadMarkets('njExA','njInstA')"><option value="extended">Extended</option><option value="grvt">GRVT</option></select></div>
+      <div class="fld"><label>Leg A Instrument</label><select id="njInstA"><option value="">Loading...</option></select></div>
+      <div class="fld"><label>Leg B Exchange</label><select id="njExB" onchange="loadMarkets('njExB','njInstB')"><option value="grvt">GRVT</option><option value="extended">Extended</option></select></div>
+      <div class="fld"><label>Leg B Instrument</label><select id="njInstB"><option value="">Loading...</option></select></div>
+      <div class="fld"><label>Entry Low ($)</label><input type="number" id="njES" value="0.05" step="0.01"></div>
+      <div class="fld"><label>Exit High ($)</label><input type="number" id="njXS" value="0.50" step="0.01"></div>
+      <div class="fld"><label>Quantity</label><input type="number" id="njQ" value="0.1" step="0.001"></div>
+      <div class="fld"><label>Simulation</label><select id="njSim"><option value="false">Off</option><option value="true">On</option></select></div>
+      <div class="fld"><label>Hold Duration (h)</label><input type="number" id="njHD" value="" step="0.5" placeholder="no limit"></div>
+      <div class="fld"><label>Min Exit Spread ($)</label><input type="number" id="njMES" value="0.05" step="0.01"></div>
+      <div class="fld"><label>Always Exit ($)</label><input type="number" id="njAES" value="0.10" step="0.01"></div>
+      <div class="fld"><label>Auto-Trade</label><select id="njAT"><option value="false">Off</option><option value="true">On</option></select></div>
     </div>
     <div class="br">
-      <button class="btn bp" onclick="saveCfg()">Save Config</button>
-      <button class="btn bo" onclick="loadCfg()">Reset</button>
+      <button class="btn bs" onclick="createJob()">Create Job</button>
+      <button class="btn bo" onclick="hideNewJobModal()">Cancel</button>
     </div>
-    <div style="margin-top:16px">
-      <div class="card-title" style="margin-bottom:8px">Leverage</div>
-      <div id="levBox"><div class="empty">Loading...</div></div>
-    </div>
-  </div>
-
-  <!-- Account -->
-  <div class="card full">
-    <div class="card-title">Account Overview</div>
-    <div id="acctAll"></div>
-    <div class="br" style="margin-top:14px">
-      <button class="btn bs" onclick="manualEntry()">Manual Entry</button>
-      <button class="btn bd" onclick="manualExit()">Manual Exit</button>
-    </div>
-  </div>
-
-  <!-- Log -->
-  <div class="card full">
-    <div class="card-title">Trade Log</div>
-    <div class="lc" id="logC"><div class="empty">No trades yet. Enable auto-trading or trigger manually.</div></div>
   </div>
 </div>
 
 <script>
 const API=location.origin;
-let autoOn=false,rInt=null,rMs=3000,sHist=[],logs=[];
-const MH=60;
+let rInt=null,rMs=3000,activeJobId=null;
+const jobState={};  // {jobId: {sHist:[], sseSource:null, logs:[]}}
 
-async function init(){await loadCfg();await loadLev();await tick();startR();log('info','Dashboard connected')}
+function $(id){return document.getElementById(id)}
+async function f(p,o={}){try{const r=await fetch(API+p,{headers:{'Content-Type':'application/json'},...o});return await r.json()}catch(e){return null}}
+function fmtP(p){return typeof p==='number'?p.toFixed(4):parseFloat(p).toFixed(4)}
+function fmtS(s){const v=typeof s==='number'?s:parseFloat(s);return v>=1?v.toFixed(2):v>=0.01?v.toFixed(4):v.toFixed(6)}
 
-async function f(p,o={}){try{const r=await fetch(API+p,{headers:{'Content-Type':'application/json'},...o});return await r.json()}catch(e){log('error','API: '+p+' — '+e.message);return null}}
-
-async function loadCfg(){
-  const s=await f('/arb/status');if(!s)return;
-  $('cES').value=s.spread_entry_low;$('cXS').value=s.spread_exit_high;
-  $('cME').value=s.max_exec_spread;
-  $('cQ').value=s.quantity;$('cSl').value=s.slippage_pct;
-  $('cMD').value=s.min_depth_usd;$('cLM').value=s.liquidity_multiplier;
-  $('cCS').value=s.chunk_size;$('cCD').value=s.chunk_delay_ms;
-  $('cOT').value=s.order_type||'aggressive_limit';
-  $('cLOT').value=s.limit_offset_ticks||2;
-  $('cMP').value=s.min_profit||0.005;
-  $('cFT').value=s.fill_timeout_ms||3000;
-  $('simToggle').checked=!!s.simulation_mode;
-  $('simBadge').style.display=s.simulation_mode?'inline-block':'none';
-  // Per-leg exchange + instrument
-  $('cExA').value=s.leg_a_exchange||'grvt';
-  $('cExB').value=s.leg_b_exchange||'grvt';
-  await loadInstruments('A',s.instrument_a);
-  await loadInstruments('B',s.instrument_b);
-  // Update spread monitor labels
-  $('iA').textContent=s.instrument_a;$('iB').textContent=s.instrument_b;
-  $('exA').textContent=s.leg_a_exchange||'grvt';$('exB').textContent=s.leg_b_exchange||'grvt';
+// ---- Markets cache ----
+const _marketsCache={};
+async function fetchMarkets(exchange){
+  if(_marketsCache[exchange])return _marketsCache[exchange];
+  const d=await f('/exchanges/markets?exchange='+encodeURIComponent(exchange));
+  if(d&&d.markets){
+    const syms=d.markets.map(m=>m.symbol).sort();
+    _marketsCache[exchange]=syms;
+    return syms;
+  }
+  return [];
+}
+async function loadMarkets(exSelId,instSelId){
+  const ex=$(exSelId).value;
+  const sel=$(instSelId);
+  sel.innerHTML='<option value="">Loading...</option>';
+  const syms=await fetchMarkets(ex);
+  sel.innerHTML='';
+  if(!syms.length){sel.innerHTML='<option value="">No markets</option>';return}
+  syms.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o)});
 }
 
-async function loadInstruments(leg,selected){
-  const ex=$('cEx'+leg).value;
-  const sel=$('cInst'+leg);
-  sel.innerHTML='<option>Loading...</option>';
-  const d=await f('/exchanges/markets?exchange='+ex);
-  if(!d||!d.markets){sel.innerHTML='<option>Error</option>';return}
-  sel.innerHTML=d.markets.map(m=>'<option value="'+m.symbol+'"'+(m.symbol===selected?' selected':'')+'>'+m.symbol+'</option>').join('');
-  if(!selected&&d.markets.length)sel.value=d.markets[0].symbol;
+// ---- Modal ----
+async function showNewJobModal(){
+  $('newJobModal').classList.add('show');
+  await Promise.all([loadMarkets('njExA','njInstA'),loadMarkets('njExB','njInstB')]);
+}
+function hideNewJobModal(){$('newJobModal').classList.remove('show')}
+
+async function createJob(){
+  const hd=parseFloat($('njHD').value);
+  const b={
+    job_id:$('njId').value||undefined,
+    name:$('njName').value||undefined,
+    instrument_a:$('njInstA').value,
+    instrument_b:$('njInstB').value,
+    leg_a_exchange:$('njExA').value,
+    leg_b_exchange:$('njExB').value,
+    spread_entry_low:parseFloat($('njES').value)||0.05,
+    spread_exit_high:parseFloat($('njXS').value)||0.50,
+    quantity:parseFloat($('njQ').value)||0.1,
+    simulation_mode:$('njSim').value==='true',
+    auto_trade:$('njAT').value==='true',
+    hold_duration_h:isNaN(hd)?null:hd,
+    min_exit_spread:parseFloat($('njMES').value)||0.05,
+    always_exit_spread:parseFloat($('njAES').value)||0.10,
+  };
+  const r=await f('/jobs',{method:'POST',body:JSON.stringify(b)});
+  if(r&&r.status==='ok'){hideNewJobModal();await refreshJobList();switchTab(r.job.job_id)}
+  else alert('Failed: '+(r?r.detail||JSON.stringify(r):'no response'));
 }
 
-function parseNum(id){return parseFloat($( id).value.replace(',','.'))||0;}
-async function saveCfg(){
-  const b={spread_entry_low:parseNum('cES'),spread_exit_high:parseNum('cXS'),
-    max_exec_spread:parseNum('cME'),
-    quantity:parseNum('cQ'),slippage_pct:parseNum('cSl'),min_depth_usd:parseNum('cMD'),
-    liquidity_multiplier:parseNum('cLM'),chunk_size:parseNum('cCS'),chunk_delay_ms:parseInt($('cCD').value),
-    order_type:$('cOT').value,limit_offset_ticks:parseInt($('cLOT').value),
-    min_profit:parseNum('cMP'),fill_timeout_ms:parseInt($('cFT').value),
-    leg_a_exchange:$('cExA').value,leg_b_exchange:$('cExB').value,
-    instrument_a:$('cInstA').value,instrument_b:$('cInstB').value};
-  const r=await f('/arb/config',{method:'POST',body:JSON.stringify(b)});
-  if(r&&r.status==='ok')log('info','Config saved: A='+b.instrument_a+'@'+b.leg_a_exchange+' B='+b.instrument_b+'@'+b.leg_b_exchange+' qty='+b.quantity);
-  // Update spread monitor labels
-  $('iA').textContent=b.instrument_a;$('iB').textContent=b.instrument_b;
-  $('exA').textContent=b.leg_a_exchange;$('exB').textContent=b.leg_b_exchange;
-
-  const nr=parseInt($('cRR').value)||3;
-  if(nr!==rMs/1000){rMs=nr*1000;$('rr').textContent=nr;startR()}
-  // Immediately refresh spread + positions with new config
-  await tick();
-}
-
-async function toggleSim(){
-  const on=$('simToggle').checked;
-  const r=await f('/arb/config',{method:'POST',body:JSON.stringify({simulation_mode:on})});
-  $('simBadge').style.display=on?'inline-block':'none';
-  if(r&&r.status==='ok')log('info','Simulation mode '+(on?'ENABLED':'DISABLED'));
-}
-
-async function refreshSpread(){
-  const d=await f('/arb/check');if(!d)return;
-  const s=d.snapshot;
-  $('prA').textContent='$'+s.mid_price_a.toFixed(2);
-  $('prB').textContent='$'+s.mid_price_b.toFixed(2);
-  // Directional spread: B - A
-  const sp=s.spread||0, es=s.exec_spread||0, be=s.break_even_spread||0;
-  $('sV').textContent='$'+sp.toFixed(2);
-  $('sVexec').textContent='$'+es.toFixed(2);
-  $('sVbe').textContent='$'+be.toFixed(2);
-  const eT=+$('cES').value||2,xT=+$('cXS').value||8;
-  const sv=$('sV');
-  sv.style.color=sp<=eT?'var(--green)':sp>=xT?'var(--red)':'var(--yellow)';
-  const bar=$('sigBar'),txt=$('sigTxt');
-  bar.className='sig '+d.action.toLowerCase();
-  if(d.action==='ENTRY')txt.textContent='ENTRY — Spread $'+sp.toFixed(2)+' <= $'+eT.toFixed(2)+' (exec $'+es.toFixed(2)+')';
-  else if(d.action==='EXIT')txt.textContent='EXIT — Spread $'+sp.toFixed(2)+' >= $'+xT.toFixed(2)+' (exec $'+es.toFixed(2)+')';
-  else txt.textContent=d.reason;
-  sHist.push(sp);if(sHist.length>MH)sHist.shift();
-  renderHist(eT,xT);
-  $('lu').textContent=new Date().toLocaleTimeString();
-  // Update data source badge
-  const dsrc=s.data_source||'rest';
-  const dsEl=$('dataSrc');
-  dsEl.textContent=dsrc.toUpperCase();
-  dsEl.style.color=dsrc==='websocket'?'var(--green)':'var(--dim)';
-  // Update position direction bar
-  const st=await f('/arb/status');
-  if(st){
-    const pb=$('posBar');
-    const sim=st.simulation_mode;
-    const stag=sim?'<span style="color:var(--yellow);font-weight:700">[SIM] </span>':'';
-    if(st.has_position&&st.long_sym&&st.short_sym){
-      pb.className='pos-bar open';
-      pb.innerHTML=stag+'POSITION OPEN &mdash; <span class="pos-tag long">LONG '+st.long_sym+'</span> <span class="pos-tag short">SHORT '+st.short_sym+'</span>'+(st.entry_spread_actual?' &mdash; Entry spread: $'+st.entry_spread_actual.toFixed(2):'');
-    } else {
-      pb.className='pos-bar flat';
-      pb.innerHTML=stag+'No position';
+// ---- Job list + tabs ----
+async function refreshJobList(){
+  const d=await f('/jobs');if(!d)return;
+  const bar=$('tabBar');
+  // Keep the + button
+  bar.innerHTML='';
+  for(const j of d.jobs){
+    const t=document.createElement('div');
+    t.className='tab'+(j.job_id===activeJobId?' active':'');
+    t.dataset.jobId=j.job_id;
+    t.innerHTML='<span class="tab-status '+j.status+'"></span><span>'+j.name+'</span>'
+      +(j.job_id!=='default'?'<span class="tab-close" onclick="event.stopPropagation();deleteJob(\''+j.job_id+'\')">&times;</span>':'');
+    t.onclick=()=>switchTab(j.job_id);
+    bar.appendChild(t);
+    // Initialize state if needed
+    if(!jobState[j.job_id])jobState[j.job_id]={sHist:[],sseSource:null,logs:[]};
+  }
+  const addBtn=document.createElement('div');
+  addBtn.className='tab-add';addBtn.textContent='+';addBtn.onclick=showNewJobModal;addBtn.title='Add new job';
+  bar.appendChild(addBtn);
+  // Create panels
+  const panels=$('jobPanels');
+  // Remove panels for deleted jobs
+  panels.querySelectorAll('.job-panel').forEach(p=>{
+    if(!d.jobs.find(j=>j.job_id===p.dataset.jobId))p.remove();
+  });
+  for(const j of d.jobs){
+    if(!document.querySelector('.job-panel[data-job-id="'+j.job_id+'"]')){
+      const panel=document.createElement('div');
+      panel.className='job-panel';panel.dataset.jobId=j.job_id;
+      panel.innerHTML=buildJobHTML(j.job_id);
+      panels.appendChild(panel);
     }
-    $('simBadge').style.display=sim?'inline-block':'none';
-    // WS badge
-    const wsb=$('wsBadge');
-    wsb.style.display=st.ws_enabled?'inline-block':'none';
-    wsb.style.background=dsrc==='websocket'?'var(--green)':'var(--border)';
-    wsb.style.color=dsrc==='websocket'?'#000':'var(--dim)';
-    wsb.textContent=dsrc==='websocket'?'WS LIVE':'WS OFF';
   }
-  if(autoOn&&d.action!=='NONE'){
-    log('info','Auto-trade: '+d.action);
-    const r=await f('/arb/auto',{method:'POST',body:'{}'});
-    if(r){r.success?log('success',d.action+' executed. Spread: $'+sp.toFixed(2)):log('error',d.action+' failed: '+r.error);await refreshAcct()}
-  }
+  // Auto-select first tab if none active
+  if(!activeJobId&&d.jobs.length)switchTab(d.jobs[0].job_id);
+  // Update env badge
+  const ws=await f('/ws/status');
+  const wsb=$('wsBadge');
+  if(ws&&ws.enabled){wsb.style.display='inline-block';wsb.style.background='var(--green)';wsb.style.color='#000';wsb.textContent='WS LIVE'}
+  else{wsb.style.display='none'}
+  $('envBadge').textContent=d.jobs.length+' job'+(d.jobs.length!==1?'s':'');
 }
 
-function renderHist(eT,xT){
-  const c=$('hist'),mx=Math.max(...sHist,xT*1.2,1);
-  c.innerHTML=sHist.map(s=>{
-    const h=Math.max(2,(s/mx)*46);
-    const co=s<=eT?'var(--green)':s>=xT?'var(--red)':'var(--yellow)';
-    return '<div class="hbar" style="height:'+h+'px;background:'+co+'" title="$'+s.toFixed(2)+'"></div>';
+function switchTab(jobId){
+  activeJobId=jobId;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.jobId===jobId));
+  document.querySelectorAll('.job-panel').forEach(p=>{p.classList.toggle('active',p.dataset.jobId===jobId)});
+  // Start SSE for this job
+  startSSE(jobId);
+  // Refresh immediately
+  tickJob(jobId);
+}
+
+async function deleteJob(jobId){
+  if(!confirm('Delete job '+jobId+'?'))return;
+  await f('/jobs/'+jobId,{method:'DELETE'});
+  if(jobState[jobId]&&jobState[jobId].sseSource){jobState[jobId].sseSource.close();delete jobState[jobId]}
+  const panel=document.querySelector('.job-panel[data-job-id="'+jobId+'"]');
+  if(panel)panel.remove();
+  if(activeJobId===jobId)activeJobId=null;
+  await refreshJobList();
+}
+
+// ---- Build per-job HTML ----
+function buildJobHTML(jid){
+  const p=jid.replace(/[^a-zA-Z0-9]/g,'_');
+  return `<div class="container">
+  <div class="card full">
+    <div class="card-title">Live Spread Monitor <span class="badge" id="jStatus_${p}" style="margin-left:8px"></span></div>
+    <div class="spread-row">
+      <div class="pb"><div class="lbl">LEG B</div><div class="pr" id="jPrB_${p}">—</div><div class="inst"><span id="jIB_${p}">—</span> <span id="jExB_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
+      <div class="sc"><div class="sv" id="jSV_${p}">—</div><div class="sl">SPREAD</div><div class="sv" id="jSVexec_${p}" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div></div>
+      <div class="pb"><div class="lbl">LEG A</div><div class="pr" id="jPrA_${p}">—</div><div class="inst"><span id="jIA_${p}">—</span> <span id="jExA_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
+    </div>
+    <div class="sig none" id="jSig_${p}"><span class="dot"></span><span id="jSigTxt_${p}">Waiting...</span></div>
+    <div class="pos-bar flat" id="jPos_${p}">No position</div>
+    <div class="spread-chart" id="jChart_${p}"></div>
+    <div class="stream-info"><span id="jSrc_${p}">Source: —</span><span id="jLu_${p}">Last: —</span></div>
+  </div>
+  <div class="card full">
+    <div class="card-title">Live Order Books</div>
+    <div class="ob-grid">
+      <div class="ob-panel">
+        <div class="ob-header"><span class="ob-title" id="jObTA_${p}">LEG A</span><span class="ob-src" id="jObSA_${p}">—</span></div>
+        <div class="ob-ladder">
+          <div class="ob-side ob-bids" id="jObBidsA_${p}"><div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div></div>
+          <div class="ob-side ob-asks" id="jObAsksA_${p}"><div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div></div>
+        </div>
+        <div class="ob-spread-row" id="jObSpA_${p}">—</div>
+      </div>
+      <div class="ob-panel">
+        <div class="ob-header"><span class="ob-title" id="jObTB_${p}">LEG B</span><span class="ob-src" id="jObSB_${p}">—</span></div>
+        <div class="ob-ladder">
+          <div class="ob-side ob-bids" id="jObBidsB_${p}"><div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div></div>
+          <div class="ob-side ob-asks" id="jObAsksB_${p}"><div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div></div>
+        </div>
+        <div class="ob-spread-row" id="jObSpB_${p}">—</div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Configuration</div>
+    <div class="at">
+      <div class="lg"><h3>Auto-Trading</h3><p>Monitor &amp; execute via schedule</p></div>
+      <label class="tg"><input type="checkbox" id="jAT_${p}" onchange="toggleJobAT('${jid}')"><span class="tgs"></span></label>
+    </div>
+    <div class="at" style="margin-top:8px;padding:8px 12px;background:rgba(255,193,7,0.08);border-radius:8px">
+      <div class="lg"><h3 style="color:var(--yellow)">Simulation Mode</h3><p>Paper-trade: no real orders</p></div>
+      <label class="tg"><input type="checkbox" id="jSim_${p}" onchange="toggleJobSim('${jid}')"><span class="tgs"></span></label>
+    </div>
+    <div style="margin:12px 0;padding:10px;background:var(--surface2);border-radius:8px">
+      <div class="card-title" style="margin-bottom:8px">Schedule</div>
+      <div class="cg">
+        <div class="fld"><label>Hold Duration (h)</label><input type="number" id="jHD_${p}" step="0.5" placeholder="no limit"></div>
+        <div class="fld"><label>Min Exit Spread ($)</label><input type="number" id="jMES_${p}" step="0.01"></div>
+        <div class="fld"><label>Always Exit ($)</label><input type="number" id="jAES_${p}" step="0.01"></div>
+      </div>
+    </div>
+    <div class="cg">
+      <div class="fld"><label>Entry Low ($)</label><input type="number" id="jES_${p}" step="0.01"></div>
+      <div class="fld"><label>Exit High ($)</label><input type="number" id="jXS_${p}" step="0.01"></div>
+      <div class="fld"><label>Max Exec ($)</label><input type="number" id="jME_${p}" step="0.5"></div>
+      <div class="fld"><label>Quantity</label><input type="number" id="jQ_${p}" step="0.001"></div>
+      <div class="fld"><label>Order Type</label><select id="jOT_${p}"><option value="aggressive_limit">Aggressive Limit</option><option value="market">Market</option></select></div>
+      <div class="fld"><label>Offset (ticks)</label><input type="number" id="jLOT_${p}" step="1" min="0"></div>
+    </div>
+    <div class="br">
+      <button class="btn bp" onclick="saveJobCfg('${jid}')">Save Config</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Account &amp; Actions</div>
+    <div id="jAcct_${p}"></div>
+    <div class="br" style="margin-top:14px">
+      <button class="btn bs" onclick="manualJobEntry('${jid}')">Manual Entry</button>
+      <button class="btn bd" onclick="manualJobExit('${jid}')">Manual Exit</button>
+    </div>
+  </div>
+  <div class="card full">
+    <div class="card-title">Trade Log (Fill Prices)</div>
+    <div id="jTLog_${p}" style="max-height:300px;overflow-y:auto"><div class="empty">No trades yet.</div></div>
+  </div>
+  <div class="card full">
+    <div class="card-title">Event Log</div>
+    <div class="lc" id="jLog_${p}"><div class="empty">—</div></div>
+  </div>
+</div>`;
+}
+
+// ---- SSE Spread Stream ----
+function startSSE(jobId){
+  // Close all other SSE connections
+  for(const [id,st] of Object.entries(jobState)){
+    if(st.sseSource&&id!==jobId){st.sseSource.close();st.sseSource=null}
+  }
+  const st=jobState[jobId];
+  if(!st)return;
+  if(st.sseSource)return;  // already connected
+  const es=new EventSource(API+'/jobs/'+jobId+'/spread-stream?interval_ms=1000');
+  es.onmessage=function(e){
+    try{
+      const d=JSON.parse(e.data);
+      if(d.error)return;
+      st.sHist.push(d.spread_abs);
+      if(st.sHist.length>120)st.sHist.shift();
+      renderChart(jobId);
+    }catch(x){}
+  };
+  es.onerror=function(){es.close();st.sseSource=null;setTimeout(()=>{if(activeJobId===jobId)startSSE(jobId)},5000)};
+  st.sseSource=es;
+}
+
+function renderChart(jobId){
+  const st=jobState[jobId];if(!st)return;
+  const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
+  const el=$('jChart_'+p);if(!el)return;
+  const hist=st.sHist,mx=Math.max(...hist,0.01);
+  el.innerHTML=hist.map(v=>{
+    const h=Math.max(1,(v/mx)*68);
+    const co=v<0.05?'var(--green)':v>0.1?'var(--red)':'var(--yellow)';
+    return '<div class="sc-bar" style="height:'+h+'px;background:'+co+'" title="$'+v.toFixed(4)+'"></div>';
   }).join('');
 }
 
-async function refreshAcct(){
-  const all=await f('/account/all');if(!all)return;
-  const exColors={grvt:'var(--accent)',extended:'var(--blue)'};
-  let html='';
-  let totalEquity=0,totalPnl=0;
-  for(const ex of all){
-    const eq=parseFloat(ex.equity||0),av=parseFloat(ex.available||0),pnl=parseFloat(ex.unrealized_pnl||0);
-    totalEquity+=eq;totalPnl+=pnl;
-    const col=exColors[ex.exchange]||'var(--dim)';
-    const pnlCol=pnl>=0?'var(--green)':'var(--red)';
-    html+='<div style="margin-bottom:14px">';
-    html+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">';
-    html+='<span style="font-size:12px;font-weight:700;color:'+col+';text-transform:uppercase">'+ex.exchange+'</span>';
-    if(ex.error){html+='<span style="font-size:11px;color:var(--red)">'+ex.error+'</span></div></div>';continue;}
-    html+='<span style="font-size:11px;color:var(--dim)">Equity: <b style="color:var(--text)">$'+eq.toFixed(2)+'</b></span>';
-    html+='<span style="font-size:11px;color:var(--dim);margin-left:12px">Available: <b style="color:var(--text)">$'+av.toFixed(2)+'</b></span>';
-    html+='<span style="font-size:11px;color:var(--dim);margin-left:12px">uPnL: <b style="color:'+pnlCol+'">'+(pnl>=0?'+':'')+pnl.toFixed(4)+'</b></span>';
-    html+='</div>';
-    const pos=ex.positions||[];
-    if(!pos.length){html+='<div class="empty" style="padding:8px 0;font-size:11px">No open positions</div>';}
-    else{
-      html+='<table><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>PnL</th></tr></thead><tbody>';
-      html+=pos.map(p=>{
-        const sz=parseFloat(p.size),sd=sz>0?'LONG':'SHORT',sc=sz>0?'long':'short';
-        const rawPnl=p.unrealized_pnl!==undefined?p.unrealized_pnl:p.unrealised_pnl;
-        const ppnl=parseFloat(rawPnl||0),pc=ppnl>=0?'pp':'pn';
-        return '<tr><td>'+p.instrument+'</td><td class="'+sc+'">'+sd+'</td><td>'+Math.abs(sz)+'</td><td>$'+parseFloat(p.entry_price).toFixed(2)+'</td><td class="'+pc+'">'+(ppnl>=0?'+':'')+ppnl.toFixed(4)+'</td></tr>';
-      }).join('');
-      html+='</tbody></table>';
+// ---- Per-job tick ----
+async function tickJob(jobId){
+  if(!jobId)return;
+  const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
+  // Check spread
+  const d=await f('/jobs/'+jobId+'/check');
+  if(d){
+    const s=d.snapshot;
+    const el=id=>$(id);
+    if(s){
+      el('jPrA_'+p).textContent='$'+s.mid_price_a.toFixed(2);
+      el('jPrB_'+p).textContent='$'+s.mid_price_b.toFixed(2);
+      el('jSV_'+p).textContent='$'+(s.spread||0).toFixed(4);
+      el('jSVexec_'+p).textContent='$'+(s.exec_spread||0).toFixed(4);
+      el('jIA_'+p).textContent=s.instrument_a;el('jIB_'+p).textContent=s.instrument_b;
+      el('jSrc_'+p).textContent='Source: '+(s.data_source||'rest').toUpperCase();
     }
-    html+='</div>';
+    const sig=el('jSig_'+p),stxt=el('jSigTxt_'+p);
+    sig.className='sig '+(d.action||'none').toLowerCase();
+    stxt.textContent=d.reason||'Waiting for data...';
+    el('jLu_'+p).textContent='Last: '+new Date().toLocaleTimeString();
   }
-  // Total summary bar
-  const tc=totalPnl>=0?'var(--green)':'var(--red)';
-  html='<div style="display:flex;gap:16px;margin-bottom:14px;padding:10px;background:var(--surface2);border-radius:8px">'
-    +'<span style="font-size:12px;color:var(--dim)">Total Equity: <b style="color:var(--text)">$'+totalEquity.toFixed(2)+'</b></span>'
-    +'<span style="font-size:12px;color:var(--dim)">Total uPnL: <b style="color:'+tc+'">'+(totalPnl>=0?'+':'')+totalPnl.toFixed(4)+'</b></span>'
-    +'</div>'+html;
-  $('acctAll').innerHTML=html;
+  // Status
+  const st=await f('/jobs/'+jobId);
+  if(st){
+    const el=id=>$(id);
+    el('jExA_'+p).textContent=st.leg_a_exchange;el('jExB_'+p).textContent=st.leg_b_exchange;
+    el('jES_'+p).value=st.spread_entry_low;el('jXS_'+p).value=st.spread_exit_high;
+    el('jME_'+p).value=st.max_exec_spread;el('jQ_'+p).value=st.quantity;
+    el('jOT_'+p).value=st.order_type;el('jLOT_'+p).value=st.limit_offset_ticks;
+    el('jAT_'+p).checked=st.auto_trade;el('jSim_'+p).checked=st.simulation_mode;
+    el('jHD_'+p).value=st.hold_duration_h!=null?st.hold_duration_h:'';
+    el('jMES_'+p).value=st.min_exit_spread;el('jAES_'+p).value=st.always_exit_spread;
+    // Status badge
+    const sb=el('jStatus_'+p);
+    sb.textContent=st.status.toUpperCase()+(st.simulation_mode?' [SIM]':'');
+    sb.style.background=st.status==='holding'?'rgba(34,197,94,.15)':st.status==='awaiting_exit'?'rgba(234,179,8,.15)':'rgba(139,143,163,.1)';
+    sb.style.color=st.status==='holding'?'var(--green)':st.status==='awaiting_exit'?'var(--yellow)':'var(--dim)';
+    // Position bar
+    const pb=el('jPos_'+p);
+    if(st.has_position&&st.long_sym&&st.short_sym){
+      pb.className='pos-bar open';
+      let einfo=st.entry_spread_actual?' — Entry: $'+st.entry_spread_actual.toFixed(4):'';
+      if(st.entry_time){const et=new Date(st.entry_time);const elapsed=((Date.now()-et.getTime())/3600000).toFixed(1);einfo+=' ('+elapsed+'h ago)'}
+      pb.innerHTML='POSITION OPEN — <span class="pos-tag long">LONG '+st.long_sym+'</span> <span class="pos-tag short">SHORT '+st.short_sym+'</span>'+einfo;
+    }else{pb.className='pos-bar flat';pb.textContent='No position'}
+    // Update tab status dot
+    const tab=document.querySelector('.tab[data-job-id="'+jobId+'"] .tab-status');
+    if(tab)tab.className='tab-status '+st.status;
+  }
+  // Orderbooks
+  const ob=await f('/jobs/'+jobId+'/orderbooks?depth=10');
+  if(ob){renderJobOB(p,'A',ob.leg_a);renderJobOB(p,'B',ob.leg_b)}
+  // Account
+  const all=await f('/account/all');
+  if(all){renderAcct(p,all)}
+  // Trade log
+  const tl=await f('/jobs/'+jobId+'/log?limit=20');
+  if(tl)renderTradeLog(p,tl.entries||[]);
 }
 
-async function manualEntry(){
-  log('info','Manual ENTRY triggered');
-  const r=await f('/arb/trigger',{method:'POST',body:JSON.stringify({action:'ENTRY'})});
-  if(r){r.success?log('success','Manual ENTRY executed'):log('error','ENTRY failed: '+r.error)}
-  await refreshAcct();
-}
-async function manualExit(){
-  log('info','Manual EXIT triggered');
-  const r=await f('/arb/trigger',{method:'POST',body:JSON.stringify({action:'EXIT'})});
-  if(r){r.success?log('success','Manual EXIT executed'):log('error','EXIT failed: '+r.error)}
-  await refreshAcct();
-}
-
-function log(lv,msg){
-  logs.unshift({t:new Date(),lv,msg});if(logs.length>100)logs.pop();
-  $('logC').innerHTML=logs.map(e=>'<div class="le '+e.lv+'"><span class="lt">'+e.t.toLocaleTimeString()+'</span><span>'+e.msg+'</span></div>').join('');
-}
-
-$('atToggle').addEventListener('change',function(){autoOn=this.checked;log(autoOn?'success':'warn',autoOn?'Auto-trading ENABLED':'Auto-trading DISABLED')});
-
-async function loadLev(){
-  const s=await f('/arb/status');if(!s)return;
-  const instruments=[s.instrument_a,s.instrument_b];
-  const all=await f('/leverage');if(!all)return;
-  const box=$('levBox');box.innerHTML='';
-  instruments.forEach(inst=>{
-    const cur=Array.isArray(all)?all.find(l=>l.instrument===inst):null;
-    const curLev=cur?cur.leverage:'10';
-    const row=document.createElement('div');row.className='lev-row';
-    row.innerHTML='<span class="lev-inst">'+inst+'</span>'+
-      '<select id="lev_'+inst.replace(/[^a-zA-Z0-9]/g,'_')+'" onchange="setLev(\''+inst+'\',this.value)">'+
-      [1,2,3,5,10,20,25,50].map(v=>'<option value="'+v+'"'+(v==parseInt(curLev)?' selected':'')+'>'+v+'x</option>').join('')+
-      '</select><span class="lev-cur" id="levCur_'+inst.replace(/[^a-zA-Z0-9]/g,'_')+'">current: '+curLev+'x</span>';
-    box.appendChild(row);
-  });
-}
-async function setLev(inst,lev){
-  log('info','Setting leverage: '+inst+' -> '+lev+'x');
-  const r=await f('/leverage',{method:'POST',body:JSON.stringify({instrument:inst,leverage:parseInt(lev)})});
-  if(r&&r.success){log('success','Leverage set: '+inst+' -> '+lev+'x');const k='levCur_'+inst.replace(/[^a-zA-Z0-9]/g,'_');$(k).textContent='current: '+lev+'x'}
-  else log('error','Failed to set leverage: '+(r?JSON.stringify(r):'no response'));
-}
-
-async function refreshOrderbooks(){
-  const d=await f('/arb/orderbooks?depth=10');if(!d)return;
-  renderOB('A',d.leg_a);
-  renderOB('B',d.leg_b);
-}
-function renderOB(leg,data){
-  const bidsEl=$('obBids'+leg),asksEl=$('obAsks'+leg);
-  const titleEl=$('obTitle'+leg),srcEl=$('obSrc'+leg),spreadEl=$('obSpread'+leg);
+function renderJobOB(p,leg,data){
+  const bidsEl=$('jObBids'+leg+'_'+p),asksEl=$('jObAsks'+leg+'_'+p);
+  const titleEl=$('jObT'+leg+'_'+p),srcEl=$('jObS'+leg+'_'+p),spreadEl=$('jObSp'+leg+'_'+p);
+  if(!bidsEl)return;
   titleEl.textContent=data.instrument+' ('+data.exchange+')';
   srcEl.textContent=data.source==='websocket'?'WS':'REST';
   srcEl.className='ob-src '+(data.source==='websocket'?'ws':'rest');
   const bids=data.bids||[],asks=data.asks||[];
   const maxSz=Math.max(...bids.map(b=>b[1]),...asks.map(a=>a[1]),0.001);
-  // Bids: highest first (already sorted)
   let bhtml='<div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div>';
-  for(const b of bids.slice(0,10)){
-    const pct=Math.min(100,(b[1]/maxSz)*100);
-    bhtml+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+fmtP(b[0])+'</span><span class="ob-size">'+fmtS(b[1])+'</span></div>';
-  }
+  for(const b of bids.slice(0,10)){const pct=Math.min(100,(b[1]/maxSz)*100);bhtml+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+fmtP(b[0])+'</span><span class="ob-size">'+fmtS(b[1])+'</span></div>'}
   bidsEl.innerHTML=bhtml;
-  // Asks: lowest first (already sorted)
   let ahtml='<div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div>';
-  for(const a of asks.slice(0,10)){
-    const pct=Math.min(100,(a[1]/maxSz)*100);
-    ahtml+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+fmtP(a[0])+'</span><span class="ob-size">'+fmtS(a[1])+'</span></div>';
-  }
+  for(const a of asks.slice(0,10)){const pct=Math.min(100,(a[1]/maxSz)*100);ahtml+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+fmtP(a[0])+'</span><span class="ob-size">'+fmtS(a[1])+'</span></div>'}
   asksEl.innerHTML=ahtml;
-  // Spread between best bid and best ask
-  if(bids.length&&asks.length){
-    const sp=(asks[0][0]-bids[0][0]).toFixed(4);
-    spreadEl.textContent='Spread: $'+sp;
-  }
+  if(bids.length&&asks.length){spreadEl.textContent='Spread: $'+(asks[0][0]-bids[0][0]).toFixed(4)}
 }
-function fmtP(p){return typeof p==='number'?p.toFixed(4):parseFloat(p).toFixed(4)}
-function fmtS(s){const v=typeof s==='number'?s:parseFloat(s);return v>=1?v.toFixed(2):v>=0.01?v.toFixed(4):v.toFixed(6)}
 
-async function tick(){await Promise.all([refreshSpread(),refreshAcct(),refreshOrderbooks()])}
+function renderAcct(p,all){
+  const el=$('jAcct_'+p);if(!el)return;
+  const exColors={grvt:'var(--accent)',extended:'var(--blue)'};
+  let html='',totalEquity=0,totalPnl=0;
+  for(const ex of all){
+    const eq=parseFloat(ex.equity||0),av=parseFloat(ex.available||0),pnl=parseFloat(ex.unrealized_pnl||0);
+    totalEquity+=eq;totalPnl+=pnl;
+    const col=exColors[ex.exchange]||'var(--dim)',pnlCol=pnl>=0?'var(--green)':'var(--red)';
+    html+='<div style="margin-bottom:10px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+    html+='<span style="font-size:11px;font-weight:700;color:'+col+';text-transform:uppercase">'+ex.exchange+'</span>';
+    if(ex.error){html+='<span style="font-size:10px;color:var(--red)">'+ex.error+'</span></div></div>';continue}
+    html+='<span style="font-size:10px;color:var(--dim)">$'+eq.toFixed(2)+'</span>';
+    html+='<span style="font-size:10px;color:'+pnlCol+';margin-left:8px">PnL: '+(pnl>=0?'+':'')+pnl.toFixed(4)+'</span>';
+    html+='</div>';
+    const pos=ex.positions||[];
+    if(pos.length){html+='<table style="font-size:10px"><thead><tr><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th></tr></thead><tbody>';
+      pos.forEach(pp=>{const sz=parseFloat(pp.size);html+='<tr><td>'+pp.instrument+'</td><td class="'+(sz>0?'long':'short')+'">'+(sz>0?'LONG':'SHORT')+'</td><td>'+Math.abs(sz)+'</td><td>$'+parseFloat(pp.entry_price).toFixed(2)+'</td></tr>'});
+      html+='</tbody></table>'}
+    html+='</div>';
+  }
+  html='<div style="display:flex;gap:12px;margin-bottom:10px;padding:8px;background:var(--surface2);border-radius:6px;font-size:10px"><span>Equity: <b>$'+totalEquity.toFixed(2)+'</b></span><span>uPnL: <b style="color:'+(totalPnl>=0?'var(--green)':'var(--red)')+'">'+(totalPnl>=0?'+':'')+totalPnl.toFixed(4)+'</b></span></div>'+html;
+  el.innerHTML=html;
+}
+
+function renderTradeLog(p,entries){
+  const el=$('jTLog_'+p);if(!el)return;
+  if(!entries.length){el.innerHTML='<div class="empty">No trades yet.</div>';return}
+  let html='<table class="tlog"><thead><tr><th>Time</th><th>Action</th><th>Leg A Fill</th><th>Leg B Fill</th><th>Spread</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
+  for(const e of entries){
+    const ts=new Date(e.timestamp).toLocaleTimeString();
+    const ac=e.action==='ENTRY'?'act-entry':'act-exit';
+    const fa=e.leg_a_fill_price!=null?'$'+parseFloat(e.leg_a_fill_price).toFixed(4):'—';
+    const fb=e.leg_b_fill_price!=null?'$'+parseFloat(e.leg_b_fill_price).toFixed(4):'—';
+    const ok=e.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>';
+    html+='<tr><td>'+ts+'</td><td class="'+ac+'">'+e.action+'</td><td class="fill-price">'+fa+'</td><td class="fill-price">'+fb+'</td><td>$'+parseFloat(e.spread_at_execution).toFixed(4)+'</td><td>'+e.quantity+'</td><td>'+ok+'</td></tr>';
+  }
+  html+='</tbody></table>';
+  el.innerHTML=html;
+}
+
+// ---- Job config actions ----
+async function saveJobCfg(jobId){
+  const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
+  const hd=parseFloat($('jHD_'+p).value);
+  const b={
+    spread_entry_low:parseFloat($('jES_'+p).value),
+    spread_exit_high:parseFloat($('jXS_'+p).value),
+    max_exec_spread:parseFloat($('jME_'+p).value),
+    quantity:parseFloat($('jQ_'+p).value),
+    order_type:$('jOT_'+p).value,
+    limit_offset_ticks:parseInt($('jLOT_'+p).value),
+    hold_duration_h:isNaN(hd)?0:hd,
+    min_exit_spread:parseFloat($('jMES_'+p).value),
+    always_exit_spread:parseFloat($('jAES_'+p).value),
+  };
+  const r=await f('/jobs/'+jobId+'/config',{method:'PUT',body:JSON.stringify(b)});
+  if(r&&r.status==='ok')jLog(jobId,'info','Config saved');
+  await tickJob(jobId);
+}
+
+async function toggleJobAT(jobId){
+  const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
+  const on=$('jAT_'+p).checked;
+  await f('/jobs/'+jobId+'/config',{method:'PUT',body:JSON.stringify({auto_trade:on})});
+  jLog(jobId,on?'success':'warn','Auto-trading '+(on?'ENABLED':'DISABLED'));
+}
+async function toggleJobSim(jobId){
+  const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
+  const on=$('jSim_'+p).checked;
+  await f('/jobs/'+jobId+'/config',{method:'PUT',body:JSON.stringify({simulation_mode:on})});
+  jLog(jobId,'info','Simulation '+(on?'ENABLED':'DISABLED'));
+}
+
+async function manualJobEntry(jobId){
+  jLog(jobId,'info','Manual ENTRY triggered');
+  const r=await f('/jobs/'+jobId+'/trigger',{method:'POST',body:JSON.stringify({action:'ENTRY'})});
+  if(r){r.success?jLog(jobId,'success','ENTRY executed'):jLog(jobId,'error','ENTRY failed: '+r.error)}
+  await tickJob(jobId);
+}
+async function manualJobExit(jobId){
+  jLog(jobId,'info','Manual EXIT triggered');
+  const r=await f('/jobs/'+jobId+'/trigger',{method:'POST',body:JSON.stringify({action:'EXIT'})});
+  if(r){r.success?jLog(jobId,'success','EXIT executed'):jLog(jobId,'error','EXIT failed: '+r.error)}
+  await tickJob(jobId);
+}
+
+function jLog(jobId,lv,msg){
+  const st=jobState[jobId];if(!st)return;
+  st.logs.unshift({t:new Date(),lv,msg});if(st.logs.length>100)st.logs.pop();
+  const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
+  const el=$('jLog_'+p);if(!el)return;
+  el.innerHTML=st.logs.map(e=>'<div class="le '+e.lv+'"><span class="lt">'+e.t.toLocaleTimeString()+'</span><span>'+e.msg+'</span></div>').join('');
+}
+
+// ---- Global tick ----
+async function tick(){
+  await refreshJobList();
+  if(activeJobId)await tickJob(activeJobId);
+}
+
 function startR(){if(rInt)clearInterval(rInt);rInt=setInterval(tick,rMs)}
-function $(id){return document.getElementById(id)}
 
+async function init(){await tick();startR()}
 init();
 </script>
 </body>
