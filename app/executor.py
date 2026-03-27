@@ -203,23 +203,43 @@ class TradeExecutor:
         traded = state.get("traded_size", ["0"])
         traded_qty = float(traded[0]) if traded else 0.0
 
-        if status and status not in ("FILLED", "CLOSED") and traded_qty == 0.0:
-            # Order is PENDING with 0 fill — IOC likely expired unfilled
-            # Try to confirm via check_order_fill if available
+        # Determine if we need to poll for fill:
+        # - GRVT: status=PENDING, traded=0 → poll via check_order_fill(cloid)
+        # - Extended: no state field → status="" → always poll via check_order_fill(id)
+        need_fill_check = (status not in ("FILLED", "CLOSED")) and traded_qty == 0.0
+        if need_fill_check and hasattr(active_client, "check_order_fill"):
+            import time as _time
+            # GRVT uses client_order_id (int), Extended uses order id (str)
             cid = resp.get("metadata", {}).get("client_order_id") if isinstance(resp, dict) else None
-            if cid and hasattr(active_client, "check_order_fill"):
-                import time as _time
-                _time.sleep(0.5)  # brief wait for exchange to process IOC
-                fill_check = active_client.check_order_fill(int(cid))
-                if not fill_check.get("filled"):
-                    msg = (
-                        f"Order {side.upper()} {symbol} placed but not filled "
-                        f"(status={fill_check.get('status')} traded={traded_qty}) — "
-                        f"IOC order expired or rejected"
-                    )
-                    logger.error(msg)
-                    return TradeResult(success=False, order_response=resp, depth=depth, slippage=slippage, error=msg)
-                logger.info("Fill confirmed via check_order_fill: %s", fill_check)
+            oid = resp.get("id") if isinstance(resp, dict) else None
+            order_ref = cid or oid
+
+            if order_ref is None or str(order_ref) in ("None", ""):
+                msg = f"Order {side.upper()} {symbol} placed but no order ID returned — cannot confirm fill"
+                logger.error(msg)
+                return TradeResult(success=False, order_response=resp, depth=depth, slippage=slippage, error=msg)
+
+            filled = False
+            fill_check = {}
+            for attempt, wait in enumerate([0.5, 1.0, 1.5], start=1):
+                _time.sleep(wait)
+                fill_check = active_client.check_order_fill(int(cid) if cid else str(oid))
+                if fill_check.get("filled"):
+                    filled = True
+                    logger.info("Fill confirmed via check_order_fill (attempt %d): %s", attempt, fill_check)
+                    break
+                logger.debug(
+                    "check_order_fill attempt %d: status=%s traded=%s",
+                    attempt, fill_check.get("status"), fill_check.get("traded_qty"),
+                )
+            if not filled:
+                msg = (
+                    f"Order {side.upper()} {symbol} placed but not filled "
+                    f"(status={fill_check.get('status')} traded={fill_check.get('traded_qty', 0)}) — "
+                    f"IOC order expired or rejected"
+                )
+                logger.error(msg)
+                return TradeResult(success=False, order_response=resp, depth=depth, slippage=slippage, error=msg)
 
         logger.info("Aggressive limit order executed: symbol=%s side=%s status=%s traded=%s",
                     symbol, side, status or "unknown", traded_qty)

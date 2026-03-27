@@ -366,19 +366,19 @@ class JobManager:
             should_exit = False
             reason = ""
 
-            # 1. Always-exit (profit-take): any time
-            if spread_abs >= job.schedule.always_exit_spread:
+            # 1. Always-exit (profit-take): any time spread converges below target
+            if spread_abs <= job.schedule.always_exit_spread:
                 should_exit = True
-                reason = f"Profit-take: spread ${spread_abs:.4f} >= always_exit ${job.schedule.always_exit_spread:.4f}"
+                reason = f"Profit-take: spread ${spread_abs:.4f} <= always_exit ${job.schedule.always_exit_spread:.4f}"
 
-            # 2. Scheduled exit: after hold_duration, if spread >= min_exit_spread
+            # 2. Scheduled exit: after hold_duration, if spread <= min_exit_spread
             elif job.entry_time and job.schedule.hold_duration_h is not None:
                 elapsed_h = (datetime.now(timezone.utc) - datetime.fromisoformat(job.entry_time)).total_seconds() / 3600
-                if elapsed_h >= job.schedule.hold_duration_h and spread_abs >= job.schedule.min_exit_spread:
+                if elapsed_h >= job.schedule.hold_duration_h and spread_abs <= job.schedule.min_exit_spread:
                     should_exit = True
                     reason = (
                         f"Scheduled exit: {elapsed_h:.1f}h >= {job.schedule.hold_duration_h}h "
-                        f"and spread ${spread_abs:.4f} >= min_exit ${job.schedule.min_exit_spread:.4f}"
+                        f"and spread ${spread_abs:.4f} <= min_exit ${job.schedule.min_exit_spread:.4f}"
                     )
 
             # 3. Original threshold exit (spread_exit_high from engine config)

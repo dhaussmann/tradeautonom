@@ -263,8 +263,11 @@ class ExtendedClient:
             )
         )
 
-        logger.info("Extended order placed: %s", result)
-        return {"id": str(getattr(result, "id", None)), "external_id": str(getattr(result, "external_id", None))}
+        data = getattr(result, "data", result)
+        order_id = getattr(data, "id", None)
+        external_id = getattr(data, "external_id", None)
+        logger.info("Extended order placed: id=%s external_id=%s", order_id, external_id)
+        return {"id": str(order_id) if order_id is not None else None, "external_id": str(external_id) if external_id is not None else None}
 
     def create_aggressive_limit_order(
         self,
@@ -301,11 +304,14 @@ class ExtendedClient:
                 best = Decimal(str(book["bids"][0][0]))
 
         if side == "buy":
+            # BUY aggressive: limit above best_ask → crosses into asks, fills immediately
             raw = best + tick * offset_ticks
             limit_price = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
         else:
-            raw = best - tick * offset_ticks
-            limit_price = self._round_to_tick(raw, symbol)
+            # SELL aggressive: limit ABOVE best_bid → crosses into bids, fills immediately
+            # Setting limit BELOW bid (passive) would cause IOC cancellation
+            raw = best + tick * offset_ticks
+            limit_price = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
 
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
@@ -324,30 +330,42 @@ class ExtendedClient:
             )
         )
 
-        order_id = str(getattr(result, "id", None))
-        logger.info("Extended aggressive limit placed: id=%s", order_id)
+        # WrappedApiResponse[PlacedOrderModel] — unwrap .data to get the actual order
+        data = getattr(result, "data", result)
+        order_id = getattr(data, "id", None)
+        external_id = getattr(data, "external_id", None)
+        logger.info(
+            "Extended aggressive limit placed: id=%s external_id=%s",
+            order_id, external_id,
+        )
+        # Use numeric id for fill checks — /user/orders/external/{id} uses PlacedOrderModel.id
         return {
-            "id": order_id,
-            "external_id": str(getattr(result, "external_id", None)),
+            "id": str(order_id) if order_id is not None else None,
+            "external_id": str(external_id) if external_id is not None else None,
             "limit_price": float(limit_price),
             "best_price": float(best),
         }
 
     def check_order_fill(self, order_id: str) -> dict:
-        """Check if an order has been filled via REST API."""
+        """Check if an order has been filled via REST API.
+
+        Endpoint: GET /user/orders/{id} — returns a single order object.
+        Uses the numeric PlacedOrderModel.id.
+        """
         try:
-            url = f"{self._base_url}/user/order/{order_id}"
+            url = f"{self._base_url}/user/orders/{order_id}"
             resp = self._session.get(url, timeout=10)
             resp.raise_for_status()
             data = resp.json()
             if data.get("status", "").upper() != "OK":
                 return {"filled": False, "status": "API_ERROR", "error": str(data)}
             order = data.get("data", {})
-            status = order.get("status", "").upper()
+            status = str(order.get("status", "")).upper()
             filled = status in ("FILLED", "CLOSED")
+            logger.info("check_order_fill extended(%s): status=%s filled=%s", str(order_id)[:20], status, filled)
             return {"filled": filled, "status": status, "order": order}
         except Exception as exc:
-            logger.warning("check_order_fill(%s) error: %s", order_id, exc)
+            logger.warning("check_order_fill(%s) error: %s", str(order_id)[:20], exc)
             return {"filled": False, "status": "ERROR", "error": str(exc)}
 
     def create_limit_order(
@@ -384,8 +402,11 @@ class ExtendedClient:
             )
         )
 
-        logger.info("Extended limit order placed: %s", result)
-        return {"id": str(getattr(result, "id", None)), "external_id": str(getattr(result, "external_id", None))}
+        data = getattr(result, "data", result)
+        order_id = getattr(data, "id", None)
+        external_id = getattr(data, "external_id", None)
+        logger.info("Extended limit order placed: id=%s external_id=%s", order_id, external_id)
+        return {"id": str(order_id) if order_id is not None else None, "external_id": str(external_id) if external_id is not None else None}
 
     def fetch_positions(self, symbols: list[str] | None = None) -> list[dict]:
         """Fetch open positions via REST, normalised to match GRVT format."""

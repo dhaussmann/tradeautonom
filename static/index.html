@@ -183,13 +183,13 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
       <div class="fld"><label>Leg A Instrument</label><select id="njInstA"><option value="">Loading...</option></select></div>
       <div class="fld"><label>Leg B Exchange</label><select id="njExB" onchange="loadMarkets('njExB','njInstB')"><option value="grvt">GRVT</option><option value="extended">Extended</option></select></div>
       <div class="fld"><label>Leg B Instrument</label><select id="njInstB"><option value="">Loading...</option></select></div>
-      <div class="fld"><label>Entry Low ($)</label><input type="number" id="njES" value="0.05" step="0.01"></div>
-      <div class="fld"><label>Exit High ($)</label><input type="number" id="njXS" value="0.50" step="0.01"></div>
+      <div class="fld"><label>Entry Min Spread ($)</label><input type="number" id="njES" value="0.08" step="0.01"></div>
+      <div class="fld"><label>Exit Max Spread ($)</label><input type="number" id="njXS" value="0.02" step="0.01"></div>
       <div class="fld"><label>Quantity</label><input type="number" id="njQ" value="0.1" step="0.001"></div>
       <div class="fld"><label>Simulation</label><select id="njSim"><option value="false">Off</option><option value="true">On</option></select></div>
       <div class="fld"><label>Hold Duration (h)</label><input type="number" id="njHD" value="" step="0.5" placeholder="no limit"></div>
-      <div class="fld"><label>Min Exit Spread ($)</label><input type="number" id="njMES" value="0.05" step="0.01"></div>
-      <div class="fld"><label>Always Exit ($)</label><input type="number" id="njAES" value="0.10" step="0.01"></div>
+      <div class="fld"><label>Sched. Exit Max Spread ($)</label><input type="number" id="njMES" value="0.02" step="0.01"></div>
+      <div class="fld"><label>Always Exit Max ($)</label><input type="number" id="njAES" value="0.02" step="0.01"></div>
       <div class="fld"><label>Auto-Trade</label><select id="njAT"><option value="false">Off</option><option value="true">On</option></select></div>
     </div>
     <div class="br">
@@ -332,9 +332,9 @@ function buildJobHTML(jid){
   <div class="card full">
     <div class="card-title">Live Spread Monitor <span class="badge" id="jStatus_${p}" style="margin-left:8px"></span></div>
     <div class="spread-row">
-      <div class="pb"><div class="lbl">LEG B</div><div class="pr" id="jPrB_${p}">—</div><div class="inst"><span id="jIB_${p}">—</span> <span id="jExB_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
+      <div class="pb"><div class="lbl" id="jLblB_${p}">LEG B</div><div class="pr" id="jPrB_${p}">—</div><div class="inst"><span id="jIB_${p}">—</span> <span id="jExB_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
       <div class="sc"><div class="sv" id="jSV_${p}">—</div><div class="sl">SPREAD</div><div class="sv" id="jSVexec_${p}" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div></div>
-      <div class="pb"><div class="lbl">LEG A</div><div class="pr" id="jPrA_${p}">—</div><div class="inst"><span id="jIA_${p}">—</span> <span id="jExA_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
+      <div class="pb"><div class="lbl" id="jLblA_${p}">LEG A</div><div class="pr" id="jPrA_${p}">—</div><div class="inst"><span id="jIA_${p}">—</span> <span id="jExA_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
     </div>
     <div class="sig none" id="jSig_${p}"><span class="dot"></span><span id="jSigTxt_${p}">Waiting...</span></div>
     <div class="pos-bar flat" id="jPos_${p}">No position</div>
@@ -376,13 +376,13 @@ function buildJobHTML(jid){
       <div class="card-title" style="margin-bottom:8px">Schedule</div>
       <div class="cg">
         <div class="fld"><label>Hold Duration (h)</label><input type="number" id="jHD_${p}" step="0.5" placeholder="no limit"></div>
-        <div class="fld"><label>Min Exit Spread ($)</label><input type="number" id="jMES_${p}" step="0.01"></div>
-        <div class="fld"><label>Always Exit ($)</label><input type="number" id="jAES_${p}" step="0.01"></div>
+        <div class="fld"><label>Sched. Exit Max ($)</label><input type="number" id="jMES_${p}" step="0.01" title="Exit when spread converges below this (after hold duration)"></div>
+        <div class="fld"><label>Always Exit Max ($)</label><input type="number" id="jAES_${p}" step="0.01" title="Exit immediately when spread converges below this"></div>
       </div>
     </div>
     <div class="cg">
-      <div class="fld"><label>Entry Low ($)</label><input type="number" id="jES_${p}" step="0.01"></div>
-      <div class="fld"><label>Exit High ($)</label><input type="number" id="jXS_${p}" step="0.01"></div>
+      <div class="fld"><label>Entry Min Spread ($)</label><input type="number" id="jES_${p}" step="0.01" title="Enter when spread diverges above this"></div>
+      <div class="fld"><label>Exit Max Spread ($)</label><input type="number" id="jXS_${p}" step="0.01" title="Exit when spread converges below this"></div>
       <div class="fld"><label>Max Exec ($)</label><input type="number" id="jME_${p}" step="0.5"></div>
       <div class="fld"><label>Quantity</label><input type="number" id="jQ_${p}" step="0.001"></div>
       <div class="fld"><label>Order Type</label><select id="jOT_${p}"><option value="aggressive_limit">Aggressive Limit</option><option value="market">Market</option></select></div>
@@ -473,6 +473,22 @@ async function tickJob(jobId){
   if(st){
     const el=id=>$(id);
     el('jExA_'+p).textContent=st.leg_a_exchange;el('jExB_'+p).textContent=st.leg_b_exchange;
+    // Store exchange names for trade log header
+    if(!jobState[jobId])jobState[jobId]={sHist:[],sseSource:null};
+    jobState[jobId].legAExchange=st.leg_a_exchange;jobState[jobId].legBExchange=st.leg_b_exchange;
+    // Update LONG/SHORT labels based on current position or spread direction
+    const exA=(st.leg_a_exchange||'LEG A').toUpperCase();
+    const exB=(st.leg_b_exchange||'LEG B').toUpperCase();
+    if(st.has_position&&st.long_sym&&st.short_sym){
+      const aIsLong=st.long_sym===st.instrument_a;
+      const lblAEl=el('jLblA_'+p),lblBEl=el('jLblB_'+p);
+      if(lblAEl){lblAEl.textContent=exA+(aIsLong?' LONG':' SHORT');lblAEl.style.color=aIsLong?'var(--green)':'var(--red)'}
+      if(lblBEl){lblBEl.textContent=exB+(aIsLong?' SHORT':' LONG');lblBEl.style.color=aIsLong?'var(--red)':'var(--green)'}
+    }else{
+      const lblAEl=el('jLblA_'+p),lblBEl=el('jLblB_'+p);
+      if(lblAEl){lblAEl.textContent=exA;lblAEl.style.color=''}
+      if(lblBEl){lblBEl.textContent=exB;lblBEl.style.color=''}
+    }
     el('jES_'+p).value=st.spread_entry_low;el('jXS_'+p).value=st.spread_exit_high;
     el('jME_'+p).value=st.max_exec_spread;el('jQ_'+p).value=st.quantity;
     el('jOT_'+p).value=st.order_type;el('jLOT_'+p).value=st.limit_offset_ticks;
@@ -504,7 +520,7 @@ async function tickJob(jobId){
   if(all){renderAcct(p,all)}
   // Trade log
   const tl=await f('/jobs/'+jobId+'/log?limit=20');
-  if(tl)renderTradeLog(p,tl.entries||[]);
+  if(tl)renderTradeLog(p,tl.entries||[],jobId);
 }
 
 function renderJobOB(p,leg,data){
@@ -549,10 +565,13 @@ function renderAcct(p,all){
   el.innerHTML=html;
 }
 
-function renderTradeLog(p,entries){
+function renderTradeLog(p,entries,jobId){
   const el=$('jTLog_'+p);if(!el)return;
   if(!entries.length){el.innerHTML='<div class="empty">No trades yet.</div>';return}
-  let html='<table class="tlog"><thead><tr><th>Time</th><th>Action</th><th>Leg A Fill</th><th>Leg B Fill</th><th>Spread</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
+  const st2=(jobId&&jobState[jobId])||{};
+  const legALabel=(st2.legAExchange||'Leg A').toUpperCase();
+  const legBLabel=(st2.legBExchange||'Leg B').toUpperCase();
+  let html='<table class="tlog"><thead><tr><th>Time</th><th>Action</th><th>'+legALabel+' Fill</th><th>'+legBLabel+' Fill</th><th>Spread</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
   for(const e of entries){
     const ts=new Date(e.timestamp).toLocaleTimeString();
     const ac=e.action==='ENTRY'?'act-entry':'act-exit';

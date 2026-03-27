@@ -201,7 +201,17 @@ class ArbitrageEngine:
 
         for pos in positions:
             instrument = pos.get("instrument", "")
-            size = float(pos.get("size", 0))
+            size_raw = pos.get("size", 0)
+            # Extended uses a "side" field ("LONG"/"SHORT") and positive size.
+            # GRVT uses signed size: positive = LONG, negative = SHORT (no side field).
+            side_str = str(pos.get("side", "")).upper()
+            if side_str == "LONG":
+                size = abs(float(size_raw))
+            elif side_str == "SHORT":
+                size = -abs(float(size_raw))
+            else:
+                size = float(size_raw)  # GRVT: signed size determines direction
+
             if instrument == self.xau_instrument:
                 if size > 0:
                     long_sym = instrument
@@ -252,6 +262,48 @@ class ArbitrageEngine:
                 )
             else:
                 logger.info("Sync: no open arb positions on exchange — state is flat.")
+
+    def _soft_sync_after_entry(self, expected_long: str, expected_short: str) -> None:
+        """Soft sync after entry: only resets state if exchange shows NO positions at all.
+
+        Unlike sync_position_from_exchange(), this method trusts the order responses
+        and does NOT override _long_sym/_short_sym when the exchange API shows only
+        one side (which can happen due to position API lag after a fresh fill).
+        """
+        positions: list[dict] = []
+        try:
+            client_a = self._client_a()
+            if hasattr(client_a, "fetch_positions"):
+                positions.extend(client_a.fetch_positions([self.xau_instrument]))
+        except Exception as exc:
+            logger.warning("Soft sync: leg A position fetch failed (non-fatal): %s", exc)
+
+        if self.leg_b_exchange != self.leg_a_exchange:
+            try:
+                client_b = self._client_b()
+                if hasattr(client_b, "fetch_positions"):
+                    positions.extend(client_b.fetch_positions([self.paxg_instrument]))
+            except Exception as exc:
+                logger.warning("Soft sync: leg B position fetch failed (non-fatal): %s", exc)
+
+        has_any = any(abs(float(p.get("size", 0))) > 0 for p in positions)
+        if not has_any:
+            # Exchange shows nothing — fills likely didn't land
+            self._has_position = False
+            self._long_sym = None
+            self._short_sym = None
+            self._entry_spread_actual = None
+            logger.warning(
+                "Soft sync: exchange shows NO positions after entry — fills may not have landed. "
+                "State reset to flat."
+            )
+        else:
+            # At least one side confirmed — keep state from order responses
+            logger.info(
+                "Soft sync: exchange confirms at least one position — keeping state "
+                "(LONG %s / SHORT %s). Position API may lag for the other side.",
+                expected_long, expected_short,
+            )
 
     # ------------------------------------------------------------------
     # Spread calculation
@@ -340,13 +392,11 @@ class ArbitrageEngine:
     def evaluate(self, snapshot: SpreadSnapshot | None = None) -> ArbCheckResult:
         """Determine whether we should ENTER, EXIT, or do NOTHING.
 
-        Goal: open a delta-neutral position (Long cheap / Short expensive) when
-        the price difference between the two exchanges is small enough.
-
-          ENTRY: spread_abs <= spread_entry_low
-                 (prices are close enough — acceptable entry cost)
-          EXIT:  spread_abs >= spread_exit_high when holding a position
-                 (spread has widened unfavourably — close to limit loss)
+        Spread-convergence strategy:
+          ENTRY: spread_abs >= spread_entry_low
+                 (spread is large enough — Long cheap / Short expensive, bet on convergence)
+          EXIT:  spread_abs <= spread_exit_high when holding a position
+                 (spread has converged — take profit)
         """
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
@@ -354,12 +404,12 @@ class ArbitrageEngine:
         spread_abs = snapshot.spread_abs
 
         if not self._has_position:
-            if spread_abs <= self.spread_entry_low:
+            if spread_abs >= self.spread_entry_low:
                 return ArbCheckResult(
                     action="ENTRY",
                     snapshot=snapshot,
                     reason=(
-                        f"Spread ${spread_abs:.4f} <= entry max ${self.spread_entry_low:.4f} "
+                        f"Spread ${spread_abs:.4f} >= entry min ${self.spread_entry_low:.4f} "
                         f"({'A cheaper' if snapshot.a_is_cheaper else 'B cheaper'}: "
                         f"Long {self.xau_instrument if snapshot.a_is_cheaper else self.paxg_instrument} / "
                         f"Short {self.paxg_instrument if snapshot.a_is_cheaper else self.xau_instrument}) "
@@ -370,18 +420,18 @@ class ArbitrageEngine:
                 action="NONE",
                 snapshot=snapshot,
                 reason=(
-                    f"Spread ${spread_abs:.4f} > entry max ${self.spread_entry_low:.4f} — spread too wide"
+                    f"Spread ${spread_abs:.4f} < entry min ${self.spread_entry_low:.4f} — spread too small"
                 ),
             )
 
-        # Has position: exit when spread has widened beyond the exit threshold
-        if self._has_position and spread_abs >= self.spread_exit_high:
+        # Has position: exit when spread has converged below exit threshold
+        if self._has_position and spread_abs <= self.spread_exit_high:
             return ArbCheckResult(
                 action="EXIT",
                 snapshot=snapshot,
                 reason=(
-                    f"Spread ${spread_abs:.4f} >= exit threshold ${self.spread_exit_high:.4f} "
-                    f"(spread widened — closing position)"
+                    f"Spread ${spread_abs:.4f} <= exit threshold ${self.spread_exit_high:.4f} "
+                    f"(spread converged — taking profit)"
                 ),
             )
 
@@ -390,7 +440,7 @@ class ArbitrageEngine:
             snapshot=snapshot,
             reason=(
                 f"Spread ${spread_abs:.4f} — holding position "
-                f"(exit if spread >= ${self.spread_exit_high:.4f})"
+                f"(exit if spread <= ${self.spread_exit_high:.4f})"
             ),
         )
 
@@ -417,14 +467,14 @@ class ArbitrageEngine:
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
 
-        # --- SPREAD GUARD: entry only when spread is within acceptable range ---
-        if snapshot.spread_abs > self.spread_entry_low:
+        # --- SPREAD GUARD: entry only when spread is large enough ---
+        if snapshot.spread_abs < self.spread_entry_low:
             return ArbExecutionResult(
                 success=False, leg_a=None, leg_b=None,
                 snapshot=snapshot,
                 error=(
                     f"Entry blocked: spread_abs ${snapshot.spread_abs:.4f} "
-                    f"> entry max ${self.spread_entry_low:.4f}"
+                    f"< entry min ${self.spread_entry_low:.4f}"
                 ),
             )
 
@@ -646,28 +696,27 @@ class ArbitrageEngine:
                 error=f"Leg B (SHORT {short_sym}) failed: {leg_b.error}. Leg A unwound.",
             )
 
-        # --- Success: set state optimistically, then verify with exchange ---
+        # --- Success: set state from order responses (authoritative), then do a soft sync ---
+        # Both legs reported OK — trust the order responses. The exchange position API
+        # can lag by several seconds after a fill, causing sync to see only one side.
+        # We only override state if the exchange shows NOTHING (both sides missing),
+        # which would indicate the fills truly didn't land.
         self._has_position = True
         self._long_sym = long_sym
         self._short_sym = short_sym
         self._entry_spread_actual = snapshot.spread_abs
         logger.info(
-            "ARB ENTRY orders sent — LONG %s@%s / SHORT %s@%s, spread_abs=$%.4f — verifying with exchange...",
+            "ARB ENTRY orders sent — LONG %s@%s / SHORT %s@%s, spread_abs=$%.4f — soft-syncing with exchange...",
             long_sym, long_exchange, short_sym, short_exchange, snapshot.spread_abs,
         )
-        self.sync_position_from_exchange()
-        if not self._has_position:
-            logger.warning(
-                "ARB ENTRY: orders reported OK but exchange shows NO position — "
-                "fills may not have landed. State set to flat."
-            )
-            return ArbExecutionResult(
-                success=False, leg_a=leg_a, leg_b=leg_b,
-                snapshot=snapshot,
-                error="Entry orders sent but exchange shows no position — fills not confirmed.",
-            )
+        # Soft sync: only reset to flat if exchange shows absolutely no positions.
+        # One-sided result is ignored here because position API lags after fills.
+        try:
+            self._soft_sync_after_entry(long_sym, short_sym)
+        except Exception as exc:
+            logger.warning("Soft sync after entry failed (non-fatal): %s", exc)
         logger.info(
-            "ARB ENTRY complete — exchange confirms LONG %s / SHORT %s open.",
+            "ARB ENTRY complete — LONG %s / SHORT %s (state from order responses).",
             self._long_sym, self._short_sym,
         )
         return ArbExecutionResult(
@@ -914,20 +963,15 @@ class ArbitrageEngine:
                 error=f"Exit Leg B (SELL {sell_sym}) failed — Leg A unwound back. Position restored.",
             )
 
-        # --- Success: verify with exchange before clearing state ---
-        logger.info("ARB EXIT orders sent — verifying with exchange...")
-        self.sync_position_from_exchange()
-        if self._has_position:
-            logger.warning(
-                "ARB EXIT: orders reported OK but exchange still shows open position "
-                "(long=%s short=%s) — state kept open.", self._long_sym, self._short_sym,
-            )
-            return ArbExecutionResult(
-                success=False, leg_a=leg_a, leg_b=leg_b,
-                snapshot=snapshot,
-                error=f"Exit orders sent but exchange still shows position open — manual check required.",
-            )
-        logger.info("ARB EXIT complete — exchange confirms both positions closed.")
+        # --- Success: both legs filled — clear state immediately from order responses ---
+        # The exchange position API can lag several seconds after a fill, so we do NOT
+        # re-query the exchange here (it would wrongly show the position still open).
+        # Both legs reported OK, so we trust the order responses and clear state now.
+        self._has_position = False
+        self._long_sym = None
+        self._short_sym = None
+        self._entry_spread_actual = None
+        logger.info("ARB EXIT complete — both legs filled (state cleared from order responses).")
         return ArbExecutionResult(
             success=True, leg_a=leg_a, leg_b=leg_b,
             snapshot=snapshot, error=None,

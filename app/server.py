@@ -127,12 +127,25 @@ async def lifespan(app: FastAPI):
             "chunk_size": _settings.arb_chunk_size,
             "chunk_delay_ms": _settings.arb_chunk_delay_ms,
             "liquidity_multiplier": _settings.arb_liquidity_multiplier,
+            "auto_trade": _settings.arb_auto_trade,
         })
-        logger.info("Default job created from env config")
+        logger.info("Default job created from env config (auto_trade=%s)", _settings.arb_auto_trade)
     except Exception as exc:
         logger.warning("Could not create default job: %s", exc)
     logger.info("App started — GRVT env=%s, exchanges=%s", _settings.grvt_env, list(_exchange_clients.keys()))
+
+    # Background auto-trade loop: runs tick_all() every arb_tick_interval_s seconds
+    async def _auto_trade_loop():
+        while True:
+            await asyncio.sleep(_settings.arb_tick_interval_s)
+            try:
+                _job_manager.tick_all()
+            except Exception as exc:
+                logger.error("Auto-trade loop error: %s", exc, exc_info=True)
+
+    loop_task = asyncio.create_task(_auto_trade_loop())
     yield
+    loop_task.cancel()
     if _feed_manager is not None:
         _feed_manager.stop()
     logger.info("App shutting down.")
