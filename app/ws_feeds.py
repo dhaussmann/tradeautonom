@@ -67,10 +67,10 @@ class _ExtendedFeedThread(threading.Thread):
         self._book = book
         self._lock = lock
         self._stop = stop_event
-        # Extended WS endpoint for BBO (depth=1 → 10ms updates)
+        # Extended WS endpoint — full orderbook (snapshots every 100ms + deltas)
         self._url = (
             f"wss://api.starknet.extended.exchange"
-            f"/stream.extended.exchange/v1/orderbooks/{instrument}?depth=1"
+            f"/stream.extended.exchange/v1/orderbooks/{instrument}"
         )
         self.connected = False
         self._reconnect_delay = 1.0
@@ -120,6 +120,7 @@ class _ExtendedFeedThread(threading.Thread):
         if not data:
             return
 
+        msg_type = msg.get("type", "SNAPSHOT")
         bids_raw = data.get("b", [])
         asks_raw = data.get("a", [])
 
@@ -130,12 +131,32 @@ class _ExtendedFeedThread(threading.Thread):
             return
 
         with self._lock:
-            if bids:
-                self._book.bids = sorted(bids, key=lambda x: -x[0])
-            if asks:
-                self._book.asks = sorted(asks, key=lambda x: x[0])
+            if msg_type == "SNAPSHOT":
+                # Full replacement
+                if bids:
+                    self._book.bids = sorted(bids, key=lambda x: -x[0])
+                if asks:
+                    self._book.asks = sorted(asks, key=lambda x: x[0])
+            else:
+                # DELTA: merge updates into existing book
+                if bids:
+                    self._apply_delta(self._book.bids, bids, reverse=True)
+                if asks:
+                    self._apply_delta(self._book.asks, asks, reverse=False)
             self._book.last_update_ts = time.time()
             self._book.update_count += 1
+
+    @staticmethod
+    def _apply_delta(book: list, updates: list, reverse: bool) -> None:
+        """Apply delta updates: size>0 upserts, size==0 removes."""
+        price_map = {level[0]: level for level in book}
+        for price, size in updates:
+            if size == 0:
+                price_map.pop(price, None)
+            else:
+                price_map[price] = [price, size]
+        book.clear()
+        book.extend(sorted(price_map.values(), key=lambda x: -x[0] if reverse else x[0]))
 
 
 # ---------------------------------------------------------------------------
