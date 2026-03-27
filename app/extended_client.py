@@ -308,10 +308,10 @@ class ExtendedClient:
             raw = best + tick * offset_ticks
             limit_price = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
         else:
-            # SELL aggressive: limit ABOVE best_bid → crosses into bids, fills immediately
-            # Setting limit BELOW bid (passive) would cause IOC cancellation
-            raw = best + tick * offset_ticks
-            limit_price = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
+            # SELL aggressive: limit BELOW best_bid → crosses into bids, fills immediately
+            # Setting limit ABOVE bid would be passive and IOC would cancel unfilled
+            raw = best - tick * offset_ticks
+            limit_price = (raw / tick).to_integral_value(rounding="ROUND_DOWN") * tick
 
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
