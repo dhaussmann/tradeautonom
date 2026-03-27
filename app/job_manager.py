@@ -351,6 +351,17 @@ class JobManager:
 
         # --- SCHEDULE-BASED EXIT LOGIC ---
         if engine._has_position:
+            # One-sided position (synced from exchange): exit will fail because
+            # execute_exit needs both _long_sym and _short_sym to determine direction.
+            if not engine._long_sym or not engine._short_sym:
+                logger.warning(
+                    "Job %s: one-sided position (long=%s short=%s) — "
+                    "auto-exit skipped, manual close required.",
+                    job.job_id, engine._long_sym, engine._short_sym,
+                )
+                job.status = "awaiting_exit"
+                return None
+
             spread_abs = snapshot.spread_abs
             should_exit = False
             reason = ""
