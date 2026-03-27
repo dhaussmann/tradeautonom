@@ -41,6 +41,7 @@ class ExchangeClient(Protocol):
 
     def create_aggressive_limit_order(
         self, symbol: str, side: str, amount: "Decimal", offset_ticks: int = 2,
+        best_price: float | None = None,
     ) -> dict:
         """Place an aggressive limit order: best price ± offset ticks."""
         ...

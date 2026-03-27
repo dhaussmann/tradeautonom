@@ -183,14 +183,44 @@ class TradeExecutor:
             logger.warning(error_msg)
             return TradeResult(success=False, order_response=None, depth=depth, slippage=slippage, error=error_msg)
 
+        # Use best price from already-fetched book to avoid a redundant order book request
+        levels = order_book.get("asks" if side == "buy" else "bids", [])
+        best_price = float(levels[0][0]) if levels else None
+
         try:
             resp = active_client.create_aggressive_limit_order(
-                symbol=symbol, side=side, amount=quantity, offset_ticks=offset_ticks,
+                symbol=symbol, side=side, amount=quantity,
+                offset_ticks=offset_ticks, best_price=best_price,
             )
         except Exception as exc:
             msg = f"Aggressive limit order failed: {exc}"
             logger.error(msg)
             return TradeResult(success=False, order_response=None, depth=depth, slippage=slippage, error=msg)
 
-        logger.info("Aggressive limit order executed: %s", resp)
+        # Check fill confirmation if the client supports it
+        state = resp.get("state", {}) if isinstance(resp, dict) else {}
+        status = state.get("status", "")
+        traded = state.get("traded_size", ["0"])
+        traded_qty = float(traded[0]) if traded else 0.0
+
+        if status and status not in ("FILLED", "CLOSED") and traded_qty == 0.0:
+            # Order is PENDING with 0 fill — IOC likely expired unfilled
+            # Try to confirm via check_order_fill if available
+            cid = resp.get("metadata", {}).get("client_order_id") if isinstance(resp, dict) else None
+            if cid and hasattr(active_client, "check_order_fill"):
+                import time as _time
+                _time.sleep(0.5)  # brief wait for exchange to process IOC
+                fill_check = active_client.check_order_fill(int(cid))
+                if not fill_check.get("filled"):
+                    msg = (
+                        f"Order {side.upper()} {symbol} placed but not filled "
+                        f"(status={fill_check.get('status')} traded={traded_qty}) — "
+                        f"IOC order expired or rejected"
+                    )
+                    logger.error(msg)
+                    return TradeResult(success=False, order_response=resp, depth=depth, slippage=slippage, error=msg)
+                logger.info("Fill confirmed via check_order_fill: %s", fill_check)
+
+        logger.info("Aggressive limit order executed: symbol=%s side=%s status=%s traded=%s",
+                    symbol, side, status or "unknown", traded_qty)
         return TradeResult(success=True, order_response=resp, depth=depth, slippage=slippage, error=None)

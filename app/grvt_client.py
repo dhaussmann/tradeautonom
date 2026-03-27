@@ -70,8 +70,38 @@ class GrvtClient:
     # ------------------------------------------------------------------
 
     def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
-        """Return order book dict with 'bids' and 'asks' lists."""
-        return self._api.fetch_order_book(symbol, limit=limit)
+        """Return order book dict with 'bids' and 'asks' lists.
+
+        The GRVT SDK's convert_grvt_ob_to_ccxt crashes with KeyError when
+        'event_time' is absent from the response (intermittent API behaviour).
+        We catch that and fall back to manually converting the raw result.
+
+        GRVT API requires depth >= 10; smaller values return "Depth is invalid".
+        """
+        # Enforce minimum depth of 10 (GRVT API requirement)
+        safe_limit = max(limit, 10)
+        try:
+            return self._api.fetch_order_book(symbol, limit=safe_limit)
+        except KeyError as exc:
+            if "event_time" not in str(exc):
+                raise
+            logger.debug("fetch_order_book: event_time missing, falling back to raw conversion (%s)", exc)
+            # Bypass the SDK converter — call the endpoint directly and convert manually.
+            # GRVT API requires depth >= 10; smaller values return 400 "Depth is invalid".
+            from pysdk.grvt_ccxt_env import get_grvt_endpoint
+            path = get_grvt_endpoint(self._env, "GET_ORDER_BOOK")
+            payload = {"instrument": symbol, "aggregate": 1}
+            if safe_limit:
+                payload["depth"] = safe_limit
+            response: dict = self._api._auth_and_post(path, payload=payload)
+            raw = response.get("result", {})
+            return {
+                "symbol": raw.get("instrument", symbol),
+                "bids": [[b["price"], b["size"]] for b in raw.get("bids", [])],
+                "asks": [[a["price"], a["size"]] for a in raw.get("asks", [])],
+                "timestamp": None,
+                "datetime": None,
+            }
 
     def fetch_ticker(self, symbol: str) -> dict:
         return self._api.fetch_ticker(symbol)
@@ -138,26 +168,35 @@ class GrvtClient:
         side: str,
         amount: Decimal,
         offset_ticks: int = 2,
+        best_price: float | None = None,
         client_order_id: int | None = None,
     ) -> dict:
         """Place an aggressive limit order: best price + offset ticks for near-certain fill.
 
         BUY:  limit = best_ask + offset_ticks * tick_size  (cross the spread aggressively)
         SELL: limit = best_bid - offset_ticks * tick_size
+
+        If best_price is provided it is used directly, avoiding an extra order book fetch.
         """
         cid = client_order_id or rand_uint32()
-        book = self.fetch_order_book(symbol, limit=1)
         tick = self.get_tick_size(symbol)
 
+        if best_price is not None:
+            best = Decimal(str(best_price))
+        else:
+            book = self.fetch_order_book(symbol, limit=1)
+            if side == "buy":
+                if not book.get("asks"):
+                    raise RuntimeError(f"No asks in {symbol} orderbook")
+                best = Decimal(str(book["asks"][0][0]))
+            else:
+                if not book.get("bids"):
+                    raise RuntimeError(f"No bids in {symbol} orderbook")
+                best = Decimal(str(book["bids"][0][0]))
+
         if side == "buy":
-            if not book.get("asks"):
-                raise RuntimeError(f"No asks in {symbol} orderbook")
-            best = Decimal(str(book["asks"][0][0]))
             limit_price = float(best + tick * offset_ticks)
         else:
-            if not book.get("bids"):
-                raise RuntimeError(f"No bids in {symbol} orderbook")
-            best = Decimal(str(book["bids"][0][0]))
             limit_price = float(best - tick * offset_ticks)
 
         logger.info(
@@ -177,12 +216,25 @@ class GrvtClient:
         return self._tick_size_cache.get(symbol, Decimal("0.01"))
 
     def check_order_fill(self, client_order_id: int) -> dict:
-        """Check if an order has been filled. Returns {filled: bool, status: str, ...}."""
+        """Check if an order has been filled. Returns {filled: bool, status: str, ...}.
+
+        fetch_order returns the raw API response: {"result": {...}, "request_id": ...}.
+        The order details are nested under "result", and status under "result.state.status".
+        """
         try:
-            order = self.fetch_order(client_order_id)
-            status = order.get("status", "").upper() if order else ""
-            filled = status in ("FILLED", "CLOSED")
-            return {"filled": filled, "status": status, "order": order}
+            raw = self.fetch_order(client_order_id)
+            # SDK fetch_order returns raw API response — unwrap "result"
+            order = raw.get("result", raw) if isinstance(raw, dict) else {}
+            state = order.get("state", {}) if order else {}
+            status = state.get("status", "").upper() if state else ""
+            traded = state.get("traded_size", ["0"])
+            traded_qty = float(traded[0]) if traded else 0.0
+            filled = status in ("FILLED", "CLOSED") or (status == "PENDING" and traded_qty > 0.0)
+            logger.info(
+                "check_order_fill(%s): status=%s traded=%s filled=%s",
+                client_order_id, status, traded_qty, filled,
+            )
+            return {"filled": filled, "status": status, "traded_qty": traded_qty, "order": order}
         except Exception as exc:
             logger.warning("check_order_fill(%s) error: %s", client_order_id, exc)
             return {"filled": False, "status": "ERROR", "error": str(exc)}
@@ -194,8 +246,13 @@ class GrvtClient:
         amount: Decimal,
         price: float,
         client_order_id: int | None = None,
+        time_in_force: str = "IMMEDIATE_OR_CANCEL",
     ) -> dict:
-        """Place a limit order. Returns the API response dict."""
+        """Place a limit IOC order. Returns the API response dict.
+
+        Uses IMMEDIATE_OR_CANCEL by default so the order fills instantly or is
+        cancelled — it never lingers in the book as PENDING.
+        """
         cid = client_order_id or rand_uint32()
         resp = self._api.create_order(
             symbol=symbol,
@@ -203,17 +260,33 @@ class GrvtClient:
             side=side,
             amount=amount,
             price=price,
-            params={"client_order_id": cid},
+            params={"client_order_id": cid, "time_in_force": time_in_force},
         )
         if not resp:
             raise RuntimeError(f"Order rejected by GRVT (empty response). Check server logs for details.")
+
+        state = resp.get("state", {})
+        status = state.get("status", "UNKNOWN")
+        traded = state.get("traded_size", ["0.0"])
+        traded_qty = float(traded[0]) if traded else 0.0
         logger.info(
-            "Limit order sent: symbol=%s side=%s amount=%s price=%s cid=%s",
-            symbol, side, amount, price, cid,
+            "Limit order sent: symbol=%s side=%s amount=%s price=%s cid=%s tif=%s → status=%s traded=%s",
+            symbol, side, amount, price, cid, time_in_force, status, traded_qty,
         )
+
+        # IOC orders that don't fill immediately come back PENDING then get cancelled.
+        # If traded_qty == 0 and status is not FILLED/CLOSED, treat as not filled.
+        if status not in ("FILLED", "CLOSED", "PENDING") or (status == "PENDING" and traded_qty == 0.0):
+            logger.warning(
+                "GRVT limit order %s %s may not have filled: status=%s traded=%s — "
+                "order placed but fill not confirmed", side.upper(), symbol, status, traded_qty,
+            )
+
         return resp
 
     def fetch_order(self, client_order_id: int) -> dict:
+        """Fetch order by client_order_id. Returns raw API response (result unwrapping
+        is done in check_order_fill to preserve backward-compat with other callers)."""
         return self._api.fetch_order(params={"client_order_id": client_order_id})
 
     def fetch_open_orders(self, symbol: str) -> list[dict]:

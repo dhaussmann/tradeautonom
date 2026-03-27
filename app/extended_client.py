@@ -272,32 +272,40 @@ class ExtendedClient:
         side: Literal["buy", "sell"],
         amount: Decimal,
         offset_ticks: int = 2,
+        best_price: float | None = None,
     ) -> dict:
         """Place an aggressive limit IOC order: best price + offset ticks.
 
         BUY:  limit = best_ask + offset_ticks * tick_size
         SELL: limit = best_bid - offset_ticks * tick_size
         Uses IOC (Immediate or Cancel) for instant fill-or-kill behavior.
+
+        If best_price is provided it is used directly, avoiding an extra order book fetch.
         """
         self._require_trading()
         from x10.perpetual.orders import OrderSide, TimeInForce
 
-        book = self.fetch_order_book(symbol, limit=1)
         tick = self._get_tick_size(symbol)
 
-        if side == "buy":
-            if not book["asks"]:
-                raise RuntimeError(f"No asks in {symbol} orderbook")
-            best = Decimal(str(book["asks"][0][0]))
-            raw = best + tick * offset_ticks
+        if best_price is not None:
+            best = Decimal(str(best_price))
         else:
-            if not book["bids"]:
-                raise RuntimeError(f"No bids in {symbol} orderbook")
-            best = Decimal(str(book["bids"][0][0]))
-            raw = best - tick * offset_ticks
+            book = self.fetch_order_book(symbol, limit=1)
+            if side == "buy":
+                if not book["asks"]:
+                    raise RuntimeError(f"No asks in {symbol} orderbook")
+                best = Decimal(str(book["asks"][0][0]))
+            else:
+                if not book["bids"]:
+                    raise RuntimeError(f"No bids in {symbol} orderbook")
+                best = Decimal(str(book["bids"][0][0]))
 
-        limit_price = self._round_to_tick(raw, symbol) if side == "sell" else \
-            (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
+        if side == "buy":
+            raw = best + tick * offset_ticks
+            limit_price = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
+        else:
+            raw = best - tick * offset_ticks
+            limit_price = self._round_to_tick(raw, symbol)
 
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 

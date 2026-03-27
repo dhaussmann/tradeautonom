@@ -17,12 +17,12 @@ class Settings(BaseSettings):
     max_slippage_pct: float = 2.0
     min_order_book_depth_usd: float = 1.0
 
-    # Arbitrage — Cross-exchange spread strategy
+    # Arbitrage — Cross-exchange delta-neutral strategy
     # Spread = abs(mid_b - mid_a)  (always >= 0)
-    # Entry when spread_abs >= entry threshold → Long cheap / Short expensive
-    # Exit  when spread_abs <= exit threshold  → gap has collapsed, close both
-    arb_spread_entry_low: float = 0.03  # enter when spread_abs >= this
-    arb_spread_exit_high: float = 0.005  # exit when spread_abs <= this (gap collapsed)
+    # Entry when spread_abs <= entry_low  → prices close enough, open Long cheap / Short expensive
+    # Exit  when spread_abs >= exit_high  → spread widened unfavourably, close both
+    arb_spread_entry_low: float = 0.05   # enter when spread_abs <= this (max acceptable entry spread)
+    arb_spread_exit_high: float = 0.50   # exit when spread_abs >= this (spread too wide — cut loss)
     arb_max_exec_spread: float = 0.5    # safety: max bid-ask execution cost
     arb_quantity: float = 0.1
     arb_xau_instrument: str = "SOL-USD"       # instrument for leg A (e.g. Extended)
