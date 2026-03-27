@@ -93,6 +93,26 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
 .pos-bar .pos-tag{font-weight:700;font-size:11px;padding:2px 8px;border-radius:4px}
 .pos-bar .pos-tag.long{background:rgba(34,197,94,.15);color:var(--green)}
 .pos-bar .pos-tag.short{background:rgba(239,68,68,.15);color:var(--red)}
+
+.ob-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.ob-panel{background:var(--surface2);border-radius:8px;padding:12px;overflow:hidden}
+.ob-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.ob-header .ob-title{font-size:12px;font-weight:700}
+.ob-header .ob-src{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600}
+.ob-header .ob-src.ws{background:rgba(34,197,94,.15);color:var(--green)}
+.ob-header .ob-src.rest{background:rgba(139,143,163,.15);color:var(--dim)}
+.ob-ladder{display:grid;grid-template-columns:1fr 1fr;gap:0}
+.ob-side{min-width:0}
+.ob-side-hdr{font-size:9px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim);padding:4px 6px;border-bottom:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;text-align:right}
+.ob-side-hdr span:first-child{text-align:left}
+.ob-row{display:grid;grid-template-columns:1fr 1fr;padding:2px 6px;font-size:11px;font-variant-numeric:tabular-nums;position:relative}
+.ob-row .ob-price{text-align:left}.ob-row .ob-size{text-align:right;color:var(--dim)}
+.ob-row .ob-bar{position:absolute;top:0;bottom:0;opacity:.12;border-radius:2px}
+.ob-bids .ob-row .ob-bar{right:0;background:var(--green)}
+.ob-bids .ob-row .ob-price{color:var(--green)}
+.ob-asks .ob-row .ob-bar{right:0;background:var(--red)}
+.ob-asks .ob-row .ob-price{color:var(--red)}
+.ob-spread-row{text-align:center;padding:4px 0;font-size:10px;color:var(--dim);border-top:1px solid var(--border);border-bottom:1px solid var(--border);font-weight:600}
 </style>
 </head>
 <body>
@@ -116,6 +136,29 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
     <div class="pos-bar flat" id="posBar">No position</div>
     <div class="hist" id="hist"></div>
     <div class="ri">Auto-refresh every <span id="rr">3</span>s &middot; Last: <span id="lu">—</span> &middot; Source: <span id="dataSrc" style="font-weight:600">REST</span></div>
+  </div>
+
+  <!-- Orderbooks -->
+  <div class="card full">
+    <div class="card-title">Live Order Books</div>
+    <div class="ob-grid">
+      <div class="ob-panel">
+        <div class="ob-header"><span class="ob-title" id="obTitleA">LEG A</span><span class="ob-src" id="obSrcA">—</span></div>
+        <div class="ob-ladder">
+          <div class="ob-side ob-bids" id="obBidsA"><div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div></div>
+          <div class="ob-side ob-asks" id="obAsksA"><div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div></div>
+        </div>
+        <div class="ob-spread-row" id="obSpreadA">—</div>
+      </div>
+      <div class="ob-panel">
+        <div class="ob-header"><span class="ob-title" id="obTitleB">LEG B</span><span class="ob-src" id="obSrcB">—</span></div>
+        <div class="ob-ladder">
+          <div class="ob-side ob-bids" id="obBidsB"><div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div></div>
+          <div class="ob-side ob-asks" id="obAsksB"><div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div></div>
+        </div>
+        <div class="ob-spread-row" id="obSpreadB">—</div>
+      </div>
+    </div>
   </div>
 
   <!-- Config -->
@@ -404,7 +447,43 @@ async function setLev(inst,lev){
   else log('error','Failed to set leverage: '+(r?JSON.stringify(r):'no response'));
 }
 
-async function tick(){await Promise.all([refreshSpread(),refreshAcct()])}
+async function refreshOrderbooks(){
+  const d=await f('/arb/orderbooks?depth=10');if(!d)return;
+  renderOB('A',d.leg_a);
+  renderOB('B',d.leg_b);
+}
+function renderOB(leg,data){
+  const bidsEl=$('obBids'+leg),asksEl=$('obAsks'+leg);
+  const titleEl=$('obTitle'+leg),srcEl=$('obSrc'+leg),spreadEl=$('obSpread'+leg);
+  titleEl.textContent=data.instrument+' ('+data.exchange+')';
+  srcEl.textContent=data.source==='websocket'?'WS':'REST';
+  srcEl.className='ob-src '+(data.source==='websocket'?'ws':'rest');
+  const bids=data.bids||[],asks=data.asks||[];
+  const maxSz=Math.max(...bids.map(b=>b[1]),...asks.map(a=>a[1]),0.001);
+  // Bids: highest first (already sorted)
+  let bhtml='<div class="ob-side-hdr"><span>BID</span><span>SIZE</span></div>';
+  for(const b of bids.slice(0,10)){
+    const pct=Math.min(100,(b[1]/maxSz)*100);
+    bhtml+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+fmtP(b[0])+'</span><span class="ob-size">'+fmtS(b[1])+'</span></div>';
+  }
+  bidsEl.innerHTML=bhtml;
+  // Asks: lowest first (already sorted)
+  let ahtml='<div class="ob-side-hdr"><span>ASK</span><span>SIZE</span></div>';
+  for(const a of asks.slice(0,10)){
+    const pct=Math.min(100,(a[1]/maxSz)*100);
+    ahtml+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+fmtP(a[0])+'</span><span class="ob-size">'+fmtS(a[1])+'</span></div>';
+  }
+  asksEl.innerHTML=ahtml;
+  // Spread between best bid and best ask
+  if(bids.length&&asks.length){
+    const sp=(asks[0][0]-bids[0][0]).toFixed(4);
+    spreadEl.textContent='Spread: $'+sp;
+  }
+}
+function fmtP(p){return typeof p==='number'?p.toFixed(4):parseFloat(p).toFixed(4)}
+function fmtS(s){const v=typeof s==='number'?s:parseFloat(s);return v>=1?v.toFixed(2):v>=0.01?v.toFixed(4):v.toFixed(6)}
+
+async function tick(){await Promise.all([refreshSpread(),refreshAcct(),refreshOrderbooks()])}
 function startR(){if(rInt)clearInterval(rInt);rInt=setInterval(tick,rMs)}
 function $(id){return document.getElementById(id)}
 

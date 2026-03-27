@@ -531,6 +531,36 @@ async def list_exchanges():
 
 
 # ------------------------------------------------------------------
+# Orderbooks (for WebUI visualization)
+# ------------------------------------------------------------------
+
+@app.get("/arb/orderbooks")
+async def arb_orderbooks(depth: int = 10):
+    """Return orderbook data for both arb legs (WS cache or REST fallback)."""
+    try:
+        book_a = _arb_engine._get_orderbook(_arb_engine.leg_a_exchange, _arb_engine.xau_instrument, limit=depth)
+        book_b = _arb_engine._get_orderbook(_arb_engine.leg_b_exchange, _arb_engine.paxg_instrument, limit=depth)
+        return {
+            "leg_a": {
+                "exchange": _arb_engine.leg_a_exchange,
+                "instrument": _arb_engine.xau_instrument,
+                "bids": book_a.get("bids", [])[:depth],
+                "asks": book_a.get("asks", [])[:depth],
+                "source": book_a.get("_source", "rest"),
+            },
+            "leg_b": {
+                "exchange": _arb_engine.leg_b_exchange,
+                "instrument": _arb_engine.paxg_instrument,
+                "bids": book_b.get("bids", [])[:depth],
+                "asks": book_b.get("asks", [])[:depth],
+                "source": book_b.get("_source", "rest"),
+            },
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ------------------------------------------------------------------
 # WebSocket feed status
 # ------------------------------------------------------------------
 
