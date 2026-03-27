@@ -100,6 +100,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
   <h1><span>TradeAutonom</span> Arbitrage Dashboard</h1>
   <div class="badge" id="envBadge">connecting...</div>
   <div class="badge" id="simBadge" style="display:none;background:var(--yellow);color:#000;margin-left:8px;font-weight:700">SIM MODE</div>
+  <div class="badge" id="wsBadge" style="display:none;margin-left:8px;font-weight:600">WS</div>
 </header>
 <div class="container">
 
@@ -114,7 +115,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
     <div class="sig none" id="sigBar"><span class="dot"></span><span id="sigTxt">Waiting for data...</span></div>
     <div class="pos-bar flat" id="posBar">No position</div>
     <div class="hist" id="hist"></div>
-    <div class="ri">Auto-refresh every <span id="rr">3</span>s &middot; Last: <span id="lu">—</span></div>
+    <div class="ri">Auto-refresh every <span id="rr">3</span>s &middot; Last: <span id="lu">—</span> &middot; Source: <span id="dataSrc" style="font-weight:600">REST</span></div>
   </div>
 
   <!-- Config -->
@@ -277,6 +278,11 @@ async function refreshSpread(){
   sHist.push(sp);if(sHist.length>MH)sHist.shift();
   renderHist(eT,xT);
   $('lu').textContent=new Date().toLocaleTimeString();
+  // Update data source badge
+  const dsrc=s.data_source||'rest';
+  const dsEl=$('dataSrc');
+  dsEl.textContent=dsrc.toUpperCase();
+  dsEl.style.color=dsrc==='websocket'?'var(--green)':'var(--dim)';
   // Update position direction bar
   const st=await f('/arb/status');
   if(st){
@@ -291,6 +297,12 @@ async function refreshSpread(){
       pb.innerHTML=stag+'No position';
     }
     $('simBadge').style.display=sim?'inline-block':'none';
+    // WS badge
+    const wsb=$('wsBadge');
+    wsb.style.display=st.ws_enabled?'inline-block':'none';
+    wsb.style.background=dsrc==='websocket'?'var(--green)':'var(--border)';
+    wsb.style.color=dsrc==='websocket'?'#000':'var(--dim)';
+    wsb.textContent=dsrc==='websocket'?'WS LIVE':'WS OFF';
   }
   if(autoOn&&d.action!=='NONE'){
     log('info','Auto-trade: '+d.action);

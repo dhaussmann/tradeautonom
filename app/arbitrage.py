@@ -23,6 +23,7 @@ from app.exchange import ExchangeClient
 from app.executor import TradeExecutor, TradeResult
 from app.grvt_client import GrvtClient
 from app.safety import estimate_fill_price, run_pre_trade_checks
+from app.ws_feeds import OrderbookFeedManager
 
 logger = logging.getLogger("tradeautonom.arbitrage")
 
@@ -50,6 +51,7 @@ class SpreadSnapshot:
     # if the EXIT spread will be at least this much wider than the entry spread.
     slippage_cost: float = 0.0
     break_even_spread: float = 0.0
+    data_source: str = "rest"  # "websocket" or "rest"
 
 
 @dataclass
@@ -111,11 +113,19 @@ class ArbitrageEngine:
         self.limit_offset_ticks = settings.arb_limit_offset_ticks
         self.min_profit = settings.arb_min_profit           # min USD profit above break-even
         self.fill_timeout_ms = settings.arb_fill_timeout_ms
+        # WebSocket feed manager (set externally via set_feed_manager)
+        self._feed_manager: OrderbookFeedManager | None = None
+        self._ws_enabled = settings.arb_ws_enabled
+        self._ws_stale_ms = settings.arb_ws_stale_ms
         # Position state
         self._has_position = False
         self._long_sym: str | None = None   # always PAXG when open
         self._short_sym: str | None = None  # always XAU when open
         self._entry_spread_actual: float | None = None
+
+    def set_feed_manager(self, mgr: OrderbookFeedManager) -> None:
+        """Attach a WebSocket feed manager for real-time orderbook data."""
+        self._feed_manager = mgr
 
     def _get_client(self, exchange_name: str) -> ExchangeClient:
         """Resolve an exchange client by name."""
@@ -131,6 +141,18 @@ class ArbitrageEngine:
     def _client_b(self) -> ExchangeClient:
         """Client for instrument_b (leg B)."""
         return self._get_client(self.leg_b_exchange)
+
+    def _get_orderbook(self, exchange: str, instrument: str, limit: int = 10) -> dict:
+        """Get orderbook from WS feed if available and fresh, else fall back to REST."""
+        if self._ws_enabled and self._feed_manager is not None:
+            if not self._feed_manager.is_stale(exchange, instrument, self._ws_stale_ms):
+                book = self._feed_manager.get_book(exchange, instrument)
+                if book is not None:
+                    return book
+                logger.debug("WS book empty for %s:%s — falling back to REST", exchange, instrument)
+            else:
+                logger.debug("WS data stale for %s:%s — falling back to REST", exchange, instrument)
+        return self._get_client(exchange).fetch_order_book(instrument, limit=limit)
 
     # ------------------------------------------------------------------
     # Position state sync from exchange
@@ -248,8 +270,8 @@ class ArbitrageEngine:
         enters when spread_abs >= spread_entry_low (a meaningful price gap exists)
         and exits when spread_abs <= spread_exit_high is no longer met.
         """
-        book_a = self._client_a().fetch_order_book(self.xau_instrument, limit=10)
-        book_b = self._client_b().fetch_order_book(self.paxg_instrument, limit=10)
+        book_a = self._get_orderbook(self.leg_a_exchange, self.xau_instrument)
+        book_b = self._get_orderbook(self.leg_b_exchange, self.paxg_instrument)
 
         mid_a = _mid_price(book_a)
         mid_b = _mid_price(book_b)
@@ -276,6 +298,11 @@ class ArbitrageEngine:
         slippage_cost = round(slip_pct * (ask_a + bid_a + ask_b + bid_b), 4)
         break_even_spread = round(abs(exec_spread) + slippage_cost, 4)
 
+        # Determine data source — if either book came from WS, mark as websocket
+        src_a = book_a.get("_source", "rest") if isinstance(book_a, dict) else "rest"
+        src_b = book_b.get("_source", "rest") if isinstance(book_b, dict) else "rest"
+        data_source = "websocket" if (src_a == "websocket" or src_b == "websocket") else "rest"
+
         snapshot = SpreadSnapshot(
             instrument_a=self.xau_instrument,
             instrument_b=self.paxg_instrument,
@@ -291,11 +318,13 @@ class ArbitrageEngine:
             exec_spread=round(exec_spread, 4),
             slippage_cost=slippage_cost,
             break_even_spread=break_even_spread,
+            data_source=data_source,
         )
         cheaper = self.xau_instrument if a_is_cheaper else self.paxg_instrument
         logger.info(
-            "Spread: %s-%s mid=%.4f abs=%.4f exec=%.4f slippage_cost=%.4f break_even=%.4f "
+            "Spread [%s]: %s-%s mid=%.4f abs=%.4f exec=%.4f slippage_cost=%.4f break_even=%.4f "
             "(%s bid/ask=%.4f/%.4f  %s bid/ask=%.4f/%.4f) cheaper=%s",
+            data_source,
             self.paxg_instrument, self.xau_instrument,
             spread, spread_abs, exec_spread, slippage_cost, break_even_spread,
             self.xau_instrument, bid_a, ask_a,

@@ -42,5 +42,7 @@ class Settings(BaseSettings):
     arb_limit_offset_ticks: int = 2     # ticks beyond best price for aggressive limit
     arb_min_profit: float = 0.005       # min profit margin in USD above break-even
     arb_fill_timeout_ms: int = 3000     # max ms to wait for fill confirmation
+    arb_ws_enabled: bool = True          # use WebSocket feeds for orderbook data
+    arb_ws_stale_ms: int = 5000          # max age (ms) before falling back to REST
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

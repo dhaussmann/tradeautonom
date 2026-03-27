@@ -85,6 +85,8 @@ class ArbConfigRequest(BaseModel):
     limit_offset_ticks: int | None = Field(None, ge=0, description="Ticks beyond best price for aggressive limit")
     min_profit: float | None = Field(None, ge=0, description="Min profit margin in USD above break-even")
     fill_timeout_ms: int | None = Field(None, ge=0, description="Max ms to wait for fill confirmation")
+    ws_enabled: bool | None = Field(None, description="Use WebSocket feeds for orderbook data")
+    ws_stale_ms: int | None = Field(None, ge=0, description="Max age (ms) before WS data is stale")
 
 
 class ArbStatusResponse(BaseModel):
@@ -108,6 +110,8 @@ class ArbStatusResponse(BaseModel):
     limit_offset_ticks: int
     min_profit: float
     fill_timeout_ms: int
+    ws_enabled: bool
+    ws_stale_ms: int
     long_sym: str | None = None
     short_sym: str | None = None
     entry_spread_actual: float | None = None
@@ -124,6 +128,7 @@ class SpreadInfo(BaseModel):
     exec_spread: float = 0.0
     slippage_cost: float = 0.0
     break_even_spread: float = 0.0
+    data_source: str = "rest"
 
 
 class ArbCheckResponse(BaseModel):

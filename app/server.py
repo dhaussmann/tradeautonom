@@ -15,6 +15,7 @@ from app.config import Settings
 from app.executor import TradeExecutor
 from app.extended_client import ExtendedClient
 from app.grvt_client import GrvtClient
+from app.ws_feeds import OrderbookFeedManager
 from app.schemas import (
     ArbAutoRequest,
     ArbCheckResponse,
@@ -48,6 +49,7 @@ def _spread_info(snapshot) -> SpreadInfo:
         exec_spread=getattr(snapshot, 'exec_spread', 0.0),
         slippage_cost=getattr(snapshot, 'slippage_cost', 0.0),
         break_even_spread=getattr(snapshot, 'break_even_spread', 0.0),
+        data_source=getattr(snapshot, 'data_source', 'rest'),
     )
 
 # Module-level singletons (populated in lifespan)
@@ -57,11 +59,12 @@ _extended_client: ExtendedClient | None = None
 _executor: TradeExecutor | None = None
 _arb_engine: ArbitrageEngine | None = None
 _exchange_clients: dict = {}
+_feed_manager: OrderbookFeedManager | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _client, _extended_client, _executor, _arb_engine, _exchange_clients
+    global _settings, _client, _extended_client, _executor, _arb_engine, _exchange_clients, _feed_manager
     _settings = Settings()
     _client = GrvtClient(_settings)
     _extended_client = ExtendedClient(
@@ -75,8 +78,24 @@ async def lifespan(app: FastAPI):
     _executor = TradeExecutor(_client, _settings)
     _arb_engine = ArbitrageEngine(_exchange_clients, _executor, _settings)
     _arb_engine.sync_position_from_exchange()
+    # Start WebSocket orderbook feeds
+    if _settings.arb_ws_enabled:
+        _feed_manager = OrderbookFeedManager(
+            grvt_env=_settings.grvt_env,
+            stale_ms=_settings.arb_ws_stale_ms,
+        )
+        _feed_manager.start({
+            _settings.arb_leg_a_exchange: _settings.arb_xau_instrument,
+            _settings.arb_leg_b_exchange: _settings.arb_paxg_instrument,
+        })
+        _arb_engine.set_feed_manager(_feed_manager)
+        logger.info("WebSocket feeds started for %s:%s + %s:%s",
+                    _settings.arb_leg_a_exchange, _settings.arb_xau_instrument,
+                    _settings.arb_leg_b_exchange, _settings.arb_paxg_instrument)
     logger.info("App started — GRVT env=%s, exchanges=%s", _settings.grvt_env, list(_exchange_clients.keys()))
     yield
+    if _feed_manager is not None:
+        _feed_manager.stop()
     logger.info("App shutting down.")
 
 
@@ -320,6 +339,8 @@ async def arb_status():
         limit_offset_ticks=_arb_engine.limit_offset_ticks,
         min_profit=_arb_engine.min_profit,
         fill_timeout_ms=_arb_engine.fill_timeout_ms,
+        ws_enabled=_arb_engine._ws_enabled,
+        ws_stale_ms=_arb_engine._ws_stale_ms,
         long_sym=pi["long_sym"],
         short_sym=pi["short_sym"],
         entry_spread_actual=pi["entry_spread"],
@@ -372,6 +393,10 @@ async def arb_config(req: ArbConfigRequest):
         _arb_engine.min_profit = req.min_profit
     if req.fill_timeout_ms is not None:
         _arb_engine.fill_timeout_ms = req.fill_timeout_ms
+    if req.ws_enabled is not None:
+        _arb_engine._ws_enabled = req.ws_enabled
+    if req.ws_stale_ms is not None:
+        _arb_engine._ws_stale_ms = req.ws_stale_ms
     # Reset position state when instruments change — old position no longer applies
     if instruments_changed:
         _arb_engine._has_position = False
@@ -379,6 +404,14 @@ async def arb_config(req: ArbConfigRequest):
         _arb_engine._short_sym = None
         _arb_engine._entry_spread_actual = None
         logger.info("Instruments changed — position state reset")
+        # Restart WS feeds for new instruments
+        if _feed_manager is not None:
+            _feed_manager.stop()
+            _feed_manager.start({
+                _arb_engine.leg_a_exchange: _arb_engine.xau_instrument,
+                _arb_engine.leg_b_exchange: _arb_engine.paxg_instrument,
+            })
+            logger.info("WS feeds restarted for new instruments")
     return {"status": "ok", "message": "Configuration updated"}
 
 
@@ -495,6 +528,18 @@ async def exchange_markets(exchange: str = "grvt"):
 async def list_exchanges():
     """List available exchange names."""
     return {"exchanges": list(_exchange_clients.keys())}
+
+
+# ------------------------------------------------------------------
+# WebSocket feed status
+# ------------------------------------------------------------------
+
+@app.get("/ws/status")
+async def ws_status():
+    """Return WebSocket feed connection status."""
+    if _feed_manager is None:
+        return {"enabled": False, "feeds": {}}
+    return {"enabled": _arb_engine._ws_enabled, "feeds": _feed_manager.status()}
 
 
 # ------------------------------------------------------------------
