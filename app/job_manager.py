@@ -363,18 +363,18 @@ class JobManager:
                 job.status = "awaiting_exit"
                 return None
 
-            spread_abs = snapshot.spread_abs
+            exec_abs = abs(snapshot.exec_spread)
             should_exit = False
             reason = ""
 
-            # 1. Scheduled exit: after hold_duration, if spread <= min_exit_spread
+            # 1. Scheduled exit: after hold_duration, if exec spread <= min_exit_spread
             if job.entry_time and job.schedule.hold_duration_h is not None:
                 elapsed_h = (datetime.now(timezone.utc) - datetime.fromisoformat(job.entry_time)).total_seconds() / 3600
-                if elapsed_h >= job.schedule.hold_duration_h and spread_abs <= job.schedule.min_exit_spread:
+                if elapsed_h >= job.schedule.hold_duration_h and exec_abs <= job.schedule.min_exit_spread:
                     should_exit = True
                     reason = (
                         f"Scheduled exit: {elapsed_h:.1f}h >= {job.schedule.hold_duration_h}h "
-                        f"and spread ${spread_abs:.4f} <= min_exit ${job.schedule.min_exit_spread:.4f}"
+                        f"and exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) <= min_exit ${job.schedule.min_exit_spread:.4f}"
                     )
 
             # 2. Original threshold exit (spread_exit_high from engine config)

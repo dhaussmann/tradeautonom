@@ -392,45 +392,47 @@ class ArbitrageEngine:
     def evaluate(self, snapshot: SpreadSnapshot | None = None) -> ArbCheckResult:
         """Determine whether we should ENTER, EXIT, or do NOTHING.
 
-        Spread-convergence strategy:
-          ENTRY: spread_abs >= spread_entry_low
-                 (spread is large enough — Long cheap / Short expensive, bet on convergence)
-          EXIT:  spread_abs <= spread_exit_high when holding a position
+        Spread-convergence strategy (uses exec_spread = real cost after bid-ask):
+          ENTRY: abs(exec_spread) >= spread_entry_low
+                 (executable spread is large enough — Long cheap / Short expensive)
+          EXIT:  abs(exec_spread) <= spread_exit_high when holding a position
                  (spread has converged — take profit)
         """
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
 
-        spread_abs = snapshot.spread_abs
+        exec_abs = abs(snapshot.exec_spread)
 
         if not self._has_position:
-            if spread_abs >= self.spread_entry_low:
+            if exec_abs >= self.spread_entry_low:
                 return ArbCheckResult(
                     action="ENTRY",
                     snapshot=snapshot,
                     reason=(
-                        f"Spread ${spread_abs:.4f} >= entry min ${self.spread_entry_low:.4f} "
+                        f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) >= "
+                        f"entry min ${self.spread_entry_low:.4f} "
                         f"({'A cheaper' if snapshot.a_is_cheaper else 'B cheaper'}: "
                         f"Long {self.xau_instrument if snapshot.a_is_cheaper else self.paxg_instrument} / "
-                        f"Short {self.paxg_instrument if snapshot.a_is_cheaper else self.xau_instrument}) "
-                        f"exec=${snapshot.exec_spread:.4f}"
+                        f"Short {self.paxg_instrument if snapshot.a_is_cheaper else self.xau_instrument})"
                     ),
                 )
             return ArbCheckResult(
                 action="NONE",
                 snapshot=snapshot,
                 reason=(
-                    f"Spread ${spread_abs:.4f} < entry min ${self.spread_entry_low:.4f} — spread too small"
+                    f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) < "
+                    f"entry min ${self.spread_entry_low:.4f} — spread too small"
                 ),
             )
 
         # Has position: exit when spread has converged below exit threshold
-        if self._has_position and spread_abs <= self.spread_exit_high:
+        if self._has_position and exec_abs <= self.spread_exit_high:
             return ArbCheckResult(
                 action="EXIT",
                 snapshot=snapshot,
                 reason=(
-                    f"Spread ${spread_abs:.4f} <= exit threshold ${self.spread_exit_high:.4f} "
+                    f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) <= "
+                    f"exit threshold ${self.spread_exit_high:.4f} "
                     f"(spread converged — taking profit)"
                 ),
             )
@@ -439,8 +441,8 @@ class ArbitrageEngine:
             action="NONE",
             snapshot=snapshot,
             reason=(
-                f"Spread ${spread_abs:.4f} — holding position "
-                f"(exit if spread <= ${self.spread_exit_high:.4f})"
+                f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) — holding position "
+                f"(exit if abs(exec) <= ${self.spread_exit_high:.4f})"
             ),
         )
 
@@ -467,14 +469,15 @@ class ArbitrageEngine:
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
 
-        # --- SPREAD GUARD: entry only when spread is large enough ---
-        if snapshot.spread_abs < self.spread_entry_low:
+        # --- SPREAD GUARD: entry only when exec spread is large enough ---
+        exec_abs = abs(snapshot.exec_spread)
+        if exec_abs < self.spread_entry_low:
             return ArbExecutionResult(
                 success=False, leg_a=None, leg_b=None,
                 snapshot=snapshot,
                 error=(
-                    f"Entry blocked: spread_abs ${snapshot.spread_abs:.4f} "
-                    f"< entry min ${self.spread_entry_low:.4f}"
+                    f"Entry blocked: exec spread ${snapshot.exec_spread:.4f} "
+                    f"(abs ${exec_abs:.4f}) < entry min ${self.spread_entry_low:.4f}"
                 ),
             )
 
