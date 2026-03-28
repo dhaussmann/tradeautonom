@@ -127,6 +127,9 @@ class ArbJob:
 class JobManager:
     """Manages multiple ArbJob instances with shared resources."""
 
+    _JOBS_FILE = Path("data/jobs.json")
+    _TRADE_LOG_DIR = Path("data/trade_logs")
+
     def __init__(
         self,
         exchange_clients: dict[str, ExchangeClient],
@@ -203,6 +206,7 @@ class JobManager:
         logger.info("Job created: %s (%s) — %s@%s / %s@%s",
                      job_id, name, engine.instrument_a, engine.leg_a_exchange,
                      engine.instrument_b, engine.leg_b_exchange)
+        self._save_jobs()
         return job
 
     def delete_job(self, job_id: str) -> None:
@@ -215,6 +219,7 @@ class JobManager:
             self._maybe_remove_feed(job.engine.leg_a_exchange, job.engine.instrument_a)
             self._maybe_remove_feed(job.engine.leg_b_exchange, job.engine.instrument_b)
         logger.info("Job deleted: %s", job_id)
+        self._save_jobs()
 
     def get_job(self, job_id: str) -> ArbJob:
         job = self._jobs.get(job_id)
@@ -301,7 +306,74 @@ class JobManager:
             job.status = "idle"
 
         logger.info("Job %s config updated", job_id)
+        self._save_jobs()
         return job
+
+    # ------------------------------------------------------------------
+    # Job persistence
+    # ------------------------------------------------------------------
+
+    def _job_to_config(self, job: ArbJob) -> dict:
+        """Extract a serialisable config dict from a live ArbJob."""
+        eng = job.engine
+        return {
+            "job_id": job.job_id,
+            "name": job.name,
+            "instrument_a": eng.instrument_a,
+            "instrument_b": eng.instrument_b,
+            "leg_a_exchange": eng.leg_a_exchange,
+            "leg_b_exchange": eng.leg_b_exchange,
+            "spread_entry_low": eng.spread_entry_low,
+            "spread_exit_high": eng.spread_exit_high,
+            "max_exec_spread": eng.max_exec_spread,
+            "quantity": float(eng.quantity),
+            "simulation_mode": eng.simulation_mode,
+            "order_type": eng.order_type,
+            "limit_offset_ticks": eng.limit_offset_ticks,
+            "min_profit": eng.min_profit,
+            "fill_timeout_ms": eng.fill_timeout_ms,
+            "chunk_size": float(eng.chunk_size),
+            "chunk_delay_ms": eng.chunk_delay_ms,
+            "liquidity_multiplier": eng.liquidity_multiplier,
+            "auto_trade": job.auto_trade,
+            "hold_duration_h": job.schedule.hold_duration_h,
+            "min_exit_spread": job.schedule.min_exit_spread,
+        }
+
+    def _save_jobs(self) -> None:
+        """Persist all job configs to disk."""
+        try:
+            self._JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            configs = [self._job_to_config(j) for j in self._jobs.values()]
+            with open(self._JOBS_FILE, "w") as fh:
+                json.dump(configs, fh, indent=2)
+            logger.debug("Saved %d job config(s) to %s", len(configs), self._JOBS_FILE)
+        except Exception as exc:
+            logger.warning("Failed to save jobs: %s", exc)
+
+    def load_jobs(self) -> int:
+        """Load job configs from disk and create them. Returns count of jobs loaded."""
+        if not self._JOBS_FILE.exists():
+            return 0
+        try:
+            with open(self._JOBS_FILE) as fh:
+                configs = json.load(fh)
+        except Exception as exc:
+            logger.warning("Failed to read %s: %s", self._JOBS_FILE, exc)
+            return 0
+        count = 0
+        for cfg in configs:
+            job_id = cfg.get("job_id", "")
+            if job_id in self._jobs:
+                logger.debug("Skipping already-loaded job %s", job_id)
+                continue
+            try:
+                self.create_job(cfg)
+                count += 1
+            except Exception as exc:
+                logger.warning("Failed to restore job %s: %s", job_id, exc)
+        logger.info("Loaded %d job(s) from %s", count, self._JOBS_FILE)
+        return count
 
     # ------------------------------------------------------------------
     # Tick — called periodically by the auto-trade loop
@@ -457,8 +529,6 @@ class JobManager:
     # ------------------------------------------------------------------
     # Trade log persistence
     # ------------------------------------------------------------------
-
-    _TRADE_LOG_DIR = Path("data/trade_logs")
 
     def _persist_trade_log_entry(self, entry: TradeLogEntry) -> None:
         """Append a single trade log entry to a per-job JSONL file."""

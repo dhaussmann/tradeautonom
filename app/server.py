@@ -106,32 +106,35 @@ async def lifespan(app: FastAPI):
                     _settings.arb_leg_b_exchange, _settings.arb_paxg_instrument)
     # Job manager (multi-pair)
     _job_manager = JobManager(_exchange_clients, _executor, _settings, _feed_manager)
-    # Create a default job from env config so existing setup works out of the box
-    try:
-        _job_manager.create_job({
-            "job_id": "default",
-            "name": f"{_settings.arb_xau_instrument} / {_settings.arb_paxg_instrument}",
-            "instrument_a": _settings.arb_xau_instrument,
-            "instrument_b": _settings.arb_paxg_instrument,
-            "leg_a_exchange": _settings.arb_leg_a_exchange,
-            "leg_b_exchange": _settings.arb_leg_b_exchange,
-            "spread_entry_low": _settings.arb_spread_entry_low,
-            "spread_exit_high": _settings.arb_spread_exit_high,
-            "max_exec_spread": _settings.arb_max_exec_spread,
-            "quantity": _settings.arb_quantity,
-            "simulation_mode": _settings.arb_simulation_mode,
-            "order_type": _settings.arb_order_type,
-            "limit_offset_ticks": _settings.arb_limit_offset_ticks,
-            "min_profit": _settings.arb_min_profit,
-            "fill_timeout_ms": _settings.arb_fill_timeout_ms,
-            "chunk_size": _settings.arb_chunk_size,
-            "chunk_delay_ms": _settings.arb_chunk_delay_ms,
-            "liquidity_multiplier": _settings.arb_liquidity_multiplier,
-            "auto_trade": _settings.arb_auto_trade,
-        })
-        logger.info("Default job created from env config (auto_trade=%s)", _settings.arb_auto_trade)
-    except Exception as exc:
-        logger.warning("Could not create default job: %s", exc)
+    # Restore persisted jobs from disk (survives container restarts)
+    loaded = _job_manager.load_jobs()
+    # Create a default job from env config if it wasn't loaded from disk
+    if loaded == 0 or "default" not in [j["job_id"] for j in _job_manager.list_jobs()]:
+        try:
+            _job_manager.create_job({
+                "job_id": "default",
+                "name": f"{_settings.arb_xau_instrument} / {_settings.arb_paxg_instrument}",
+                "instrument_a": _settings.arb_xau_instrument,
+                "instrument_b": _settings.arb_paxg_instrument,
+                "leg_a_exchange": _settings.arb_leg_a_exchange,
+                "leg_b_exchange": _settings.arb_leg_b_exchange,
+                "spread_entry_low": _settings.arb_spread_entry_low,
+                "spread_exit_high": _settings.arb_spread_exit_high,
+                "max_exec_spread": _settings.arb_max_exec_spread,
+                "quantity": _settings.arb_quantity,
+                "simulation_mode": _settings.arb_simulation_mode,
+                "order_type": _settings.arb_order_type,
+                "limit_offset_ticks": _settings.arb_limit_offset_ticks,
+                "min_profit": _settings.arb_min_profit,
+                "fill_timeout_ms": _settings.arb_fill_timeout_ms,
+                "chunk_size": _settings.arb_chunk_size,
+                "chunk_delay_ms": _settings.arb_chunk_delay_ms,
+                "liquidity_multiplier": _settings.arb_liquidity_multiplier,
+                "auto_trade": _settings.arb_auto_trade,
+            })
+            logger.info("Default job created from env config (auto_trade=%s)", _settings.arb_auto_trade)
+        except Exception as exc:
+            logger.warning("Could not create default job: %s", exc)
     logger.info("App started — GRVT env=%s, exchanges=%s", _settings.grvt_env, list(_exchange_clients.keys()))
 
     # Background auto-trade loop: runs tick_all() every arb_tick_interval_s seconds
