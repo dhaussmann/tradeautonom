@@ -422,7 +422,7 @@ function startSSE(jobId){
     try{
       const d=JSON.parse(e.data);
       if(d.error)return;
-      st.sHist.push(d.exec_spread);
+      st.sHist.push(Math.abs(d.exec_spread));
       if(st.sHist.length>120)st.sHist.shift();
       renderChart(jobId);
     }catch(x){}
@@ -435,10 +435,10 @@ function renderChart(jobId){
   const st=jobState[jobId];if(!st)return;
   const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
   const el=$('jChart_'+p);if(!el)return;
-  const hist=st.sHist,absHist=hist.map(v=>Math.abs(v)),mx=Math.max(...absHist,0.01);
+  const hist=st.sHist,mx=Math.max(...hist,0.01);
   el.innerHTML=hist.map(v=>{
-    const av=Math.abs(v),h=Math.max(1,(av/mx)*68);
-    const co=v<0?'var(--green)':v>0.05?'var(--red)':'var(--yellow)';
+    const h=Math.max(1,(v/mx)*68);
+    const co=v>0.1?'var(--green)':v<0.03?'var(--red)':'var(--yellow)';
     return '<div class="sc-bar" style="height:'+h+'px;background:'+co+'" title="$'+v.toFixed(4)+'"></div>';
   }).join('');
 }
@@ -455,7 +455,7 @@ async function tickJob(jobId){
     if(s){
       el('jPrA_'+p).textContent='$'+s.mid_price_a.toFixed(2);
       el('jPrB_'+p).textContent='$'+s.mid_price_b.toFixed(2);
-      el('jSVexec_'+p).textContent='$'+(s.exec_spread||0).toFixed(4);
+      el('jSVexec_'+p).textContent='$'+Math.abs(s.exec_spread||0).toFixed(4);
       el('jSV_'+p).textContent='$'+(s.spread||0).toFixed(4);
       el('jIA_'+p).textContent=s.instrument_a;el('jIB_'+p).textContent=s.instrument_b;
       el('jSrc_'+p).textContent='Source: '+(s.data_source||'rest').toUpperCase();
@@ -579,7 +579,7 @@ function renderTradeLog(p,entries,jobId){
     const fa=e.leg_a_fill_price!=null?'$'+parseFloat(e.leg_a_fill_price).toFixed(4):'—';
     const fb=e.leg_b_fill_price!=null?'$'+parseFloat(e.leg_b_fill_price).toFixed(4):'—';
     const ok=e.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>';
-    html+='<tr><td>'+ts+'</td><td class="'+ac+'">'+e.action+'</td><td class="fill-price">'+fa+'</td><td class="fill-price">'+fb+'</td><td>$'+parseFloat(e.spread_at_execution).toFixed(4)+'</td><td>'+e.quantity+'</td><td>'+ok+'</td></tr>';
+    html+='<tr><td>'+ts+'</td><td class="'+ac+'">'+e.action+'</td><td class="fill-price">'+fa+'</td><td class="fill-price">'+fb+'</td><td>$'+Math.abs(parseFloat(e.spread_at_execution)).toFixed(4)+'</td><td>'+e.quantity+'</td><td>'+ok+'</td></tr>';
   }
   html+='</tbody></table>';
   el.innerHTML=html;
