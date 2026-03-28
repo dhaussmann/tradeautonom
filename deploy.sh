@@ -25,65 +25,81 @@ NAS_USER="${NAS_USER:-admin}"
 NAS_DEPLOY_PATH="${NAS_DEPLOY_PATH:-/volume1/docker/tradeautonom}"
 
 SSH_TARGET="${NAS_USER}@${NAS_HOST}"
-COMPOSE_FILE="docker/docker-compose.nas.yml"
+SSH_KEY="${HOME}/.ssh/id_ed25519"
+SSH_OPTS="-o ConnectTimeout=5 -o IdentitiesOnly=yes -i ${SSH_KEY}"
+IMAGE_NAME="tradeautonom"
+CONTAINER_NAME="tradeautonom"
+APP_PORT=$(grep -E '^APP_PORT=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "8002")
 
 info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
 err()   { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; }
 
-ssh_cmd() { ssh -o ConnectTimeout=5 "$SSH_TARGET" "$@"; }
+P="/usr/local/bin"  # docker lives here on Synology
+ssh_nas() { ssh ${SSH_OPTS} "$SSH_TARGET" "$@"; }
 
 # ── Commands ──────────────────────────────────────────────────
 
 cmd_sync() {
     info "Syncing code to ${SSH_TARGET}:${NAS_DEPLOY_PATH}"
-    rsync -avz --delete \
-        --exclude '.venv/' \
-        --exclude 'venv/' \
-        --exclude '.git/' \
-        --exclude '__pycache__/' \
-        --exclude '*.pyc' \
-        --exclude '.env' \
-        --exclude 'data/' \
-        --exclude 'server.log' \
-        --exclude '.mypy_cache/' \
-        --exclude '.ruff_cache/' \
-        "$SCRIPT_DIR/" "${SSH_TARGET}:${NAS_DEPLOY_PATH}/"
+    tar -C "$SCRIPT_DIR" \
+        --exclude='.venv' \
+        --exclude='venv' \
+        --exclude='.git' \
+        --exclude='__pycache__' \
+        --exclude='*.pyc' \
+        --exclude='.env' \
+        --exclude='data' \
+        --exclude='server.log' \
+        --exclude='.mypy_cache' \
+        --exclude='.ruff_cache' \
+        --exclude='.windsurf' \
+        -czf - . \
+    | ssh_nas "mkdir -p '${NAS_DEPLOY_PATH}' && tar -C '${NAS_DEPLOY_PATH}' -xzf -"
     ok "Code synced"
 }
 
 cmd_build() {
     info "Building Docker image on NAS"
-    ssh_cmd "cd '${NAS_DEPLOY_PATH}' && docker compose -f '${COMPOSE_FILE}' build"
+    ssh_nas "cd '${NAS_DEPLOY_PATH}' && ${P}/docker build -f docker/Dockerfile.nas -t ${IMAGE_NAME}:latest ."
     ok "Image built"
 }
 
 cmd_up() {
     info "Starting container on NAS"
-    ssh_cmd "cd '${NAS_DEPLOY_PATH}' && docker compose -f '${COMPOSE_FILE}' up -d"
+    # Stop and remove existing container if present
+    ssh_nas "${P}/docker rm -f ${CONTAINER_NAME} 2>/dev/null || true"
+    ssh_nas "${P}/docker run -d \
+        --name ${CONTAINER_NAME} \
+        --restart unless-stopped \
+        -p ${APP_PORT}:${APP_PORT} \
+        -e APP_HOST=0.0.0.0 \
+        --env-file '${NAS_DEPLOY_PATH}/.env' \
+        -v '${NAS_DEPLOY_PATH}/data:/app/data' \
+        ${IMAGE_NAME}:latest"
     ok "Container started"
 }
 
 cmd_restart() {
     info "Restarting container on NAS"
-    ssh_cmd "docker restart tradeautonom"
+    ssh_nas "${P}/docker restart ${CONTAINER_NAME}"
     ok "Container restarted"
 }
 
 cmd_stop() {
     info "Stopping container on NAS"
-    ssh_cmd "cd '${NAS_DEPLOY_PATH}' && docker compose -f '${COMPOSE_FILE}' down"
+    ssh_nas "${P}/docker stop ${CONTAINER_NAME} && ${P}/docker rm ${CONTAINER_NAME}"
     ok "Container stopped"
 }
 
 cmd_logs() {
     info "Tailing container logs (Ctrl+C to stop)"
-    ssh_cmd "docker logs tradeautonom --tail 100 -f"
+    ssh_nas "${P}/docker logs ${CONTAINER_NAME} --tail 100 -f"
 }
 
 cmd_status() {
     info "Container status:"
-    ssh_cmd "docker ps --filter name=tradeautonom --format 'table {{.Status}}\t{{.Ports}}'"
+    ssh_nas "${P}/docker ps --filter name=${CONTAINER_NAME} --format 'table {{.Status}}	{{.Ports}}'"
     echo ""
     APP_PORT=$(grep -E '^APP_PORT=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "8002")
     info "Health check:"

@@ -26,6 +26,8 @@ NAS_USER="${NAS_USER:-admin}"
 APP_PORT="${APP_PORT:-8002}"
 BASE_URL="http://${NAS_HOST}:${APP_PORT}"
 SSH_TARGET="${NAS_USER}@${NAS_HOST}"
+SSH_KEY="${HOME}/.ssh/id_ed25519"
+SSH_OPTS="-o ConnectTimeout=5 -o IdentitiesOnly=yes -i ${SSH_KEY}"
 
 info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
@@ -33,13 +35,14 @@ err()   { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; }
 dim()   { printf '\033[0;37m%s\033[0m\n' "$*"; }
 
 api() { curl -sf --connect-timeout 5 "${BASE_URL}$1" 2>/dev/null; }
-ssh_cmd() { ssh -o ConnectTimeout=5 "$SSH_TARGET" "$@"; }
+P="/usr/local/bin"  # docker lives here on Synology
+ssh_nas() { ssh ${SSH_OPTS} "$SSH_TARGET" "$@"; }
 
 # ── Commands ──────────────────────────────────────────────────
 
 cmd_logs() {
     info "Live container logs (Ctrl+C to stop)"
-    ssh_cmd "docker logs tradeautonom --tail 100 -f"
+    ssh_nas "${P}/docker logs tradeautonom --tail 100 -f"
 }
 
 cmd_trades() {
@@ -69,7 +72,7 @@ for e in entries:
 
 cmd_status() {
     info "Container:"
-    ssh_cmd "docker ps --filter name=tradeautonom --format 'table {{.Status}}\t{{.Ports}}'" 2>/dev/null || err "SSH failed"
+    ssh_nas "${P}/docker ps --filter name=tradeautonom --format 'table {{.Status}}	{{.Ports}}'" 2>/dev/null || err "SSH failed"
     echo ""
 
     info "Health:"
@@ -126,12 +129,12 @@ for acc in data:
 cmd_errors() {
     local lines="${1:-50}"
     info "Last ${lines} error/warning lines from container logs"
-    ssh_cmd "docker logs tradeautonom --tail 500 2>&1 | grep -iE 'ERROR|FAIL|WARNING|exception|traceback' | tail -${lines}"
+    ssh_nas "${P}/docker logs tradeautonom --tail 500 2>&1 | grep -iE 'ERROR|FAIL|WARNING|exception|traceback' | tail -${lines}"
 }
 
 cmd_restart() {
     info "Restarting container..."
-    ssh_cmd "docker restart tradeautonom"
+    ssh_nas "${P}/docker restart tradeautonom"
     ok "Container restarted"
 }
 
