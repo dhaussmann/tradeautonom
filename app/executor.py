@@ -187,13 +187,30 @@ class TradeExecutor:
         levels = order_book.get("asks" if side == "buy" else "bids", [])
         best_price = float(levels[0][0]) if levels else None
 
-        try:
-            resp = active_client.create_aggressive_limit_order(
-                symbol=symbol, side=side, amount=quantity,
-                offset_ticks=offset_ticks, best_price=best_price,
-            )
-        except Exception as exc:
-            msg = f"Aggressive limit order failed: {exc}"
+        last_exc = None
+        for attempt in range(1, 3):  # up to 2 attempts
+            try:
+                resp = active_client.create_aggressive_limit_order(
+                    symbol=symbol, side=side, amount=quantity,
+                    offset_ticks=offset_ticks, best_price=best_price,
+                )
+                last_exc = None
+                break
+            except (ConnectionError, OSError) as exc:
+                # Stale TCP connection (RemoteDisconnected, ConnectionReset, etc.)
+                logger.warning(
+                    "Aggressive limit order attempt %d/%d connection error: %s — retrying",
+                    attempt, 2, exc,
+                )
+                last_exc = exc
+                import time as _t; _t.sleep(0.5)
+                continue
+            except Exception as exc:
+                msg = f"Aggressive limit order failed: {exc}"
+                logger.error(msg)
+                return TradeResult(success=False, order_response=None, depth=depth, slippage=slippage, error=msg)
+        if last_exc is not None:
+            msg = f"Aggressive limit order failed after 2 attempts: {last_exc}"
             logger.error(msg)
             return TradeResult(success=False, order_response=None, depth=depth, slippage=slippage, error=msg)
 

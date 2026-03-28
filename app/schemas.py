@@ -173,7 +173,6 @@ class ScheduleConfig(BaseModel):
     """Exit schedule configuration."""
     hold_duration_h: float | None = Field(None, ge=0, description="Max hours before scheduled exit (0 or null = no limit)")
     min_exit_spread: float = Field(0.05, ge=0, description="Min spread for exit after hold_duration expires")
-    always_exit_spread: float = Field(0.10, ge=0, description="Profit-take: exit any time if spread >= this")
 
 
 class JobCreateRequest(BaseModel):
@@ -201,7 +200,6 @@ class JobCreateRequest(BaseModel):
     # Schedule
     hold_duration_h: float | None = Field(None, ge=0, description="Max hours before scheduled exit")
     min_exit_spread: float = Field(0.05, ge=0, description="Min spread for exit after hold expires")
-    always_exit_spread: float = Field(0.10, ge=0, description="Profit-take spread threshold")
 
 
 class JobConfigUpdateRequest(BaseModel):
@@ -226,7 +224,6 @@ class JobConfigUpdateRequest(BaseModel):
     auto_trade: bool | None = None
     hold_duration_h: float | None = Field(None, ge=0)
     min_exit_spread: float | None = Field(None, ge=0)
-    always_exit_spread: float | None = Field(None, ge=0)
 
 
 class TradeLogEntryResponse(BaseModel):
@@ -276,7 +273,6 @@ class JobStatusResponse(BaseModel):
     # Schedule
     hold_duration_h: float | None = None
     min_exit_spread: float
-    always_exit_spread: float
     # Position
     has_position: bool
     long_sym: str | None = None

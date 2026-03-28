@@ -290,18 +290,17 @@ class ExtendedClient:
 
         tick = self._get_tick_size(symbol)
 
-        if best_price is not None:
-            best = Decimal(str(best_price))
+        # Always fetch a fresh orderbook — the best_price from pre-trade checks
+        # can be several seconds stale (parallel execution), causing IOC cancellation.
+        book = self.fetch_order_book(symbol, limit=1)
+        if side == "buy":
+            if not book["asks"]:
+                raise RuntimeError(f"No asks in {symbol} orderbook")
+            best = Decimal(str(book["asks"][0][0]))
         else:
-            book = self.fetch_order_book(symbol, limit=1)
-            if side == "buy":
-                if not book["asks"]:
-                    raise RuntimeError(f"No asks in {symbol} orderbook")
-                best = Decimal(str(book["asks"][0][0]))
-            else:
-                if not book["bids"]:
-                    raise RuntimeError(f"No bids in {symbol} orderbook")
-                best = Decimal(str(book["bids"][0][0]))
+            if not book["bids"]:
+                raise RuntimeError(f"No bids in {symbol} orderbook")
+            best = Decimal(str(book["bids"][0][0]))
 
         if side == "buy":
             # BUY aggressive: limit above best_ask → crosses into asks, fills immediately

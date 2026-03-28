@@ -670,7 +670,6 @@ def _job_status_response(job: ArbJob) -> JobStatusResponse:
         liquidity_multiplier=eng.liquidity_multiplier,
         hold_duration_h=job.schedule.hold_duration_h,
         min_exit_spread=job.schedule.min_exit_spread,
-        always_exit_spread=job.schedule.always_exit_spread,
         has_position=pi["has_position"],
         long_sym=pi["long_sym"],
         short_sym=pi["short_sym"],

@@ -33,7 +33,6 @@ class JobSchedule:
     """Exit schedule for an arb job."""
     hold_duration_h: float | None = None   # max hours before scheduled exit (None = no limit)
     min_exit_spread: float = 0.05          # exit spread after hold_duration expires
-    always_exit_spread: float = 0.10       # profit-take: exit any time if spread >= this
 
 
 @dataclass
@@ -117,7 +116,6 @@ class ArbJob:
             "schedule": {
                 "hold_duration_h": self.schedule.hold_duration_h,
                 "min_exit_spread": self.schedule.min_exit_spread,
-                "always_exit_spread": self.schedule.always_exit_spread,
             },
         }
 
@@ -182,7 +180,6 @@ class JobManager:
         schedule = JobSchedule(
             hold_duration_h=config.get("hold_duration_h"),
             min_exit_spread=config.get("min_exit_spread", 0.05),
-            always_exit_spread=config.get("always_exit_spread", 0.10),
         )
 
         name = config.get("name") or f"{engine.instrument_a} / {engine.instrument_b}"
@@ -279,8 +276,6 @@ class JobManager:
             job.schedule.hold_duration_h = config["hold_duration_h"] if config["hold_duration_h"] != 0 else None
         if config.get("min_exit_spread") is not None:
             job.schedule.min_exit_spread = config["min_exit_spread"]
-        if config.get("always_exit_spread") is not None:
-            job.schedule.always_exit_spread = config["always_exit_spread"]
 
         if config.get("auto_trade") is not None:
             job.auto_trade = config["auto_trade"]
@@ -372,13 +367,8 @@ class JobManager:
             should_exit = False
             reason = ""
 
-            # 1. Always-exit (profit-take): any time spread converges below target
-            if spread_abs <= job.schedule.always_exit_spread:
-                should_exit = True
-                reason = f"Profit-take: spread ${spread_abs:.4f} <= always_exit ${job.schedule.always_exit_spread:.4f}"
-
-            # 2. Scheduled exit: after hold_duration, if spread <= min_exit_spread
-            elif job.entry_time and job.schedule.hold_duration_h is not None:
+            # 1. Scheduled exit: after hold_duration, if spread <= min_exit_spread
+            if job.entry_time and job.schedule.hold_duration_h is not None:
                 elapsed_h = (datetime.now(timezone.utc) - datetime.fromisoformat(job.entry_time)).total_seconds() / 3600
                 if elapsed_h >= job.schedule.hold_duration_h and spread_abs <= job.schedule.min_exit_spread:
                     should_exit = True
@@ -387,7 +377,7 @@ class JobManager:
                         f"and spread ${spread_abs:.4f} <= min_exit ${job.schedule.min_exit_spread:.4f}"
                     )
 
-            # 3. Original threshold exit (spread_exit_high from engine config)
+            # 2. Original threshold exit (spread_exit_high from engine config)
             elif check.action == "EXIT":
                 should_exit = True
                 reason = check.reason
