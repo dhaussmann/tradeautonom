@@ -13,4 +13,8 @@ build/
 .mypy_cache/
 .ruff_cache/
 docker/
+data/
+server.log
+deploy.sh
+monitor.sh
 *.md

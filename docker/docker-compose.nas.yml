@@ -1,0 +1,23 @@
+services:
+  tradeautonom:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nas
+    image: tradeautonom:latest
+    container_name: tradeautonom
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8002}:${APP_PORT:-8002}"
+    env_file:
+      - ../.env
+    environment:
+      - APP_HOST=0.0.0.0
+    volumes:
+      # Persistent trade logs — survive rebuilds and restarts
+      - ../data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,os; urllib.request.urlopen('http://localhost:'+os.environ.get('APP_PORT','8002')+'/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
