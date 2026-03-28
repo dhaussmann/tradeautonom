@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   tradeautonom:
     build:
@@ -8,14 +6,20 @@ services:
     container_name: tradeautonom
     restart: unless-stopped
     ports:
-      - "8002:8002"
+      - "${APP_PORT:-8002}:${APP_PORT:-8002}"
     env_file:
       - ../.env
     environment:
       - APP_HOST=0.0.0.0
-      - APP_PORT=8002
+    volumes:
+      # Code mounts — change code, restart container, no rebuild needed
+      - ../app:/app/app:ro
+      - ../static:/app/static:ro
+      - ../main.py:/app/main.py:ro
+      # Persistent data (trade logs)
+      - ../data:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${APP_PORT:-8002}/health')"]
       interval: 30s
       timeout: 5s
       retries: 3

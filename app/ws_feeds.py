@@ -92,7 +92,11 @@ class _ExtendedFeedThread(threading.Thread):
 
     def _connect_and_listen(self) -> None:
         logger.info("Extended WS connecting: %s", self._url)
-        with ws_sync.connect(self._url, close_timeout=5) as conn:
+        # Extended uses self-signed certs — disable SSL verification
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        with ws_sync.connect(self._url, ssl=ssl_ctx, close_timeout=5) as conn:
             self.connected = True
             self._reconnect_delay = 1.0
             logger.info("Extended WS connected: %s", self.instrument)
