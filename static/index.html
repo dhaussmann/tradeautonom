@@ -331,7 +331,7 @@ function buildJobHTML(jid){
     <div class="card-title">Live Spread Monitor <span class="badge" id="jStatus_${p}" style="margin-left:8px"></span></div>
     <div class="spread-row">
       <div class="pb"><div class="lbl" id="jLblB_${p}">LEG B</div><div class="pr" id="jPrB_${p}">—</div><div class="inst"><span id="jIB_${p}">—</span> <span id="jExB_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
-      <div class="sc"><div class="sv" id="jSV_${p}">—</div><div class="sl">SPREAD</div><div class="sv" id="jSVexec_${p}" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">EXEC COST</div></div>
+      <div class="sc"><div class="sv" id="jSVexec_${p}">—</div><div class="sl">EXEC SPREAD</div><div class="sv" id="jSV_${p}" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">MID SPREAD</div></div>
       <div class="pb"><div class="lbl" id="jLblA_${p}">LEG A</div><div class="pr" id="jPrA_${p}">—</div><div class="inst"><span id="jIA_${p}">—</span> <span id="jExA_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
     </div>
     <div class="sig none" id="jSig_${p}"><span class="dot"></span><span id="jSigTxt_${p}">Waiting...</span></div>
@@ -422,7 +422,7 @@ function startSSE(jobId){
     try{
       const d=JSON.parse(e.data);
       if(d.error)return;
-      st.sHist.push(d.spread_abs);
+      st.sHist.push(d.exec_spread);
       if(st.sHist.length>120)st.sHist.shift();
       renderChart(jobId);
     }catch(x){}
@@ -435,10 +435,10 @@ function renderChart(jobId){
   const st=jobState[jobId];if(!st)return;
   const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
   const el=$('jChart_'+p);if(!el)return;
-  const hist=st.sHist,mx=Math.max(...hist,0.01);
+  const hist=st.sHist,absHist=hist.map(v=>Math.abs(v)),mx=Math.max(...absHist,0.01);
   el.innerHTML=hist.map(v=>{
-    const h=Math.max(1,(v/mx)*68);
-    const co=v<0.05?'var(--green)':v>0.1?'var(--red)':'var(--yellow)';
+    const av=Math.abs(v),h=Math.max(1,(av/mx)*68);
+    const co=v<0?'var(--green)':v>0.05?'var(--red)':'var(--yellow)';
     return '<div class="sc-bar" style="height:'+h+'px;background:'+co+'" title="$'+v.toFixed(4)+'"></div>';
   }).join('');
 }
@@ -455,8 +455,8 @@ async function tickJob(jobId){
     if(s){
       el('jPrA_'+p).textContent='$'+s.mid_price_a.toFixed(2);
       el('jPrB_'+p).textContent='$'+s.mid_price_b.toFixed(2);
-      el('jSV_'+p).textContent='$'+(s.spread||0).toFixed(4);
       el('jSVexec_'+p).textContent='$'+(s.exec_spread||0).toFixed(4);
+      el('jSV_'+p).textContent='$'+(s.spread||0).toFixed(4);
       el('jIA_'+p).textContent=s.instrument_a;el('jIB_'+p).textContent=s.instrument_b;
       el('jSrc_'+p).textContent='Source: '+(s.data_source||'rest').toUpperCase();
     }
@@ -572,7 +572,7 @@ function renderTradeLog(p,entries,jobId){
   const st2=(jobId&&jobState[jobId])||{};
   const legALabel=(st2.legAExchange||'Leg A').toUpperCase();
   const legBLabel=(st2.legBExchange||'Leg B').toUpperCase();
-  let html='<table class="tlog"><thead><tr><th>Time</th><th>Action</th><th>'+legALabel+' Fill</th><th>'+legBLabel+' Fill</th><th>Spread</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
+  let html='<table class="tlog"><thead><tr><th>Time</th><th>Action</th><th>'+legALabel+' Fill</th><th>'+legBLabel+' Fill</th><th>Exec Spread</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
   for(const e of entries){
     const ts=new Date(e.timestamp).toLocaleTimeString();
     const ac=e.action==='ENTRY'?'act-entry':'act-exit';

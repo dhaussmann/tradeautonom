@@ -431,7 +431,7 @@ class JobManager:
             leg_b_side=leg_b_side,
             leg_a_fill_price=_extract_fill_price(result.leg_a),
             leg_b_fill_price=_extract_fill_price(result.leg_b),
-            spread_at_execution=snapshot.spread_abs,
+            spread_at_execution=snapshot.exec_spread,
             quantity=float(engine.quantity),
             success=result.success,
             error=result.error,

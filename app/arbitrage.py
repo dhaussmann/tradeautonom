@@ -529,12 +529,12 @@ class ArbitrageEngine:
             self._has_position = True
             self._long_sym = long_sym
             self._short_sym = short_sym
-            self._entry_spread_actual = snapshot.spread_abs
+            self._entry_spread_actual = snapshot.exec_spread
             logger.info(
-                "[SIM] ARB ENTRY complete — LONG %s@%s @ %.4f / SHORT %s@%s @ %.4f, spread_abs=$%.4f",
+                "[SIM] ARB ENTRY complete — LONG %s@%s @ %.4f / SHORT %s@%s @ %.4f, exec_spread=$%.4f",
                 long_sym, long_exchange, long_price,
                 short_sym, short_exchange, short_price,
-                snapshot.spread_abs,
+                snapshot.exec_spread,
             )
             return ArbExecutionResult(
                 success=True, leg_a=sim_leg, leg_b=sim_leg_b,
@@ -704,10 +704,10 @@ class ArbitrageEngine:
         self._has_position = True
         self._long_sym = long_sym
         self._short_sym = short_sym
-        self._entry_spread_actual = snapshot.spread_abs
+        self._entry_spread_actual = snapshot.exec_spread
         logger.info(
-            "ARB ENTRY orders sent — LONG %s@%s / SHORT %s@%s, spread_abs=$%.4f — soft-syncing with exchange...",
-            long_sym, long_exchange, short_sym, short_exchange, snapshot.spread_abs,
+            "ARB ENTRY orders sent — LONG %s@%s / SHORT %s@%s, exec_spread=$%.4f — soft-syncing with exchange...",
+            long_sym, long_exchange, short_sym, short_exchange, snapshot.exec_spread,
         )
         # Soft sync: only reset to flat if exchange shows absolutely no positions.
         # One-sided result is ignored here because position API lags after fills.
