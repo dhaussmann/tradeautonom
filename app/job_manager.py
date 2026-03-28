@@ -4,12 +4,15 @@ Each ArbJob wraps an ArbitrageEngine with schedule-based exit logic,
 trade logging with real fill prices, and independent lifecycle management.
 """
 
+import json
 import logging
+import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from app.arbitrage import ArbitrageEngine, ArbCheckResult, ArbExecutionResult, SpreadSnapshot
@@ -195,6 +198,9 @@ class JobManager:
         # If engine already has a position (synced from exchange), mark as holding
         if engine._has_position:
             job.status = "holding"
+
+        # Load persisted trade log from disk
+        job.trade_log = self._load_trade_log(job_id)
 
         self._jobs[job_id] = job
         logger.info("Job created: %s (%s) — %s@%s / %s@%s",
@@ -444,6 +450,9 @@ class JobManager:
         if len(job.trade_log) > 500:
             job.trade_log = job.trade_log[-500:]
 
+        # Persist to disk
+        self._persist_trade_log_entry(entry)
+
         logger.info(
             "TRADE LOG [%s] %s %s: success=%s spread=$%.4f "
             "leg_a=%s@%s fill=$%s | leg_b=%s@%s fill=$%s",
@@ -454,6 +463,41 @@ class JobManager:
             engine.instrument_b, engine.leg_b_exchange,
             entry.leg_b_fill_price or "?",
         )
+
+    # ------------------------------------------------------------------
+    # Trade log persistence
+    # ------------------------------------------------------------------
+
+    _TRADE_LOG_DIR = Path("data/trade_logs")
+
+    def _persist_trade_log_entry(self, entry: TradeLogEntry) -> None:
+        """Append a single trade log entry to a per-job JSONL file."""
+        try:
+            self._TRADE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            path = self._TRADE_LOG_DIR / f"{entry.job_id}.jsonl"
+            with open(path, "a") as fh:
+                fh.write(json.dumps(asdict(entry)) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to persist trade log entry: %s", exc)
+
+    def _load_trade_log(self, job_id: str) -> list[TradeLogEntry]:
+        """Load trade log from disk for a given job."""
+        path = self._TRADE_LOG_DIR / f"{job_id}.jsonl"
+        if not path.exists():
+            return []
+        entries = []
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    entries.append(TradeLogEntry(**d))
+        except Exception as exc:
+            logger.warning("Failed to load trade log for %s: %s", job_id, exc)
+        # Keep only last 500
+        return entries[-500:]
 
     # ------------------------------------------------------------------
     # Helpers

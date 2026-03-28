@@ -489,12 +489,16 @@ async function tickJob(jobId){
       if(lblAEl){lblAEl.textContent=exA;lblAEl.style.color=''}
       if(lblBEl){lblBEl.textContent=exB;lblBEl.style.color=''}
     }
-    el('jES_'+p).value=st.spread_entry_low;el('jXS_'+p).value=st.spread_exit_high;
-    el('jME_'+p).value=st.max_exec_spread;el('jQ_'+p).value=st.quantity;
-    el('jOT_'+p).value=st.order_type;el('jLOT_'+p).value=st.limit_offset_ticks;
-    el('jAT_'+p).checked=st.auto_trade;el('jSim_'+p).checked=st.simulation_mode;
-    el('jHD_'+p).value=st.hold_duration_h!=null?st.hold_duration_h:'';
-    el('jMES_'+p).value=st.min_exit_spread;el('jAES_'+p).value=st.always_exit_spread;
+    const ae=document.activeElement;
+    const sf=id=>{const e=el(id);if(e&&e!==ae)return e;return null};
+    const sv=(id,v)=>{const e=sf(id);if(e)e.value=v};
+    const sc=(id,v)=>{const e=sf(id);if(e)e.checked=v};
+    sv('jES_'+p,st.spread_entry_low);sv('jXS_'+p,st.spread_exit_high);
+    sv('jME_'+p,st.max_exec_spread);sv('jQ_'+p,st.quantity);
+    sv('jOT_'+p,st.order_type);sv('jLOT_'+p,st.limit_offset_ticks);
+    sc('jAT_'+p,st.auto_trade);sc('jSim_'+p,st.simulation_mode);
+    sv('jHD_'+p,st.hold_duration_h!=null?st.hold_duration_h:'');
+    sv('jMES_'+p,st.min_exit_spread);sv('jAES_'+p,st.always_exit_spread);
     // Status badge
     const sb=el('jStatus_'+p);
     sb.textContent=st.status.toUpperCase()+(st.simulation_mode?' [SIM]':'');
