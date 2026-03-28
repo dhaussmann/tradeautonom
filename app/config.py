@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     arb_chunk_delay_ms: int = 500       # ms to wait between chunks (book replenishment)
     arb_simulation_mode: bool = False   # True = paper-trade (no real orders)
     arb_order_type: str = "aggressive_limit"  # "aggressive_limit" or "market"
-    arb_limit_offset_ticks: int = 2     # ticks beyond best price for aggressive limit
+    arb_limit_offset_ticks: int = 5     # ticks beyond best price for aggressive limit
     arb_min_profit: float = 0.005       # min profit margin in USD above break-even
     arb_fill_timeout_ms: int = 3000     # max ms to wait for fill confirmation
     arb_ws_enabled: bool = True          # use WebSocket feeds for orderbook data
