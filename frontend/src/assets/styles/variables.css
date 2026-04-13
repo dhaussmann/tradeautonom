@@ -1,0 +1,119 @@
+:root {
+  /* ── Fonts ──────────────────────────────────── */
+  --font-inter:     "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  --font-bricolage: "Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+
+  /* ── Backgrounds ────────────────────────────── */
+  --color-bg-primary:              #0a0a0a;
+  --color-bg-secondary:            #17181f;
+  --color-bg-transparent-dark-30:  rgba(10, 10, 10, 0.3);
+  --color-white-2:                 rgba(255, 255, 255, 0.02);
+  --color-white-4:                 rgba(255, 255, 255, 0.04);
+  --color-white-10:                rgba(255, 255, 255, 0.1);
+
+  /* ── Text ───────────────────────────────────── */
+  --color-text-primary:   #ffffff;
+  --color-text-secondary: #95979e;
+  --color-text-tertiary:  #4e5055;
+  --color-text-dark:      #0a0a0a;
+  --color-white:          #ffffff;
+
+  /* ── Borders / Divider ─────────────────────── */
+  --color-stroke-divider: #23282e;
+  --color-stroke-primary: #4d4d4d;
+  --color-stroke-white:   #ffffff;
+
+  /* ── Semantic ───────────────────────────────── */
+  --color-success:        #28a745;
+  --color-success-light:  #64d17d;
+  --color-success-bg:     rgba(40, 167, 69, 0.1);
+  --color-success-stroke: rgba(40, 167, 69, 0.3);
+
+  --color-error:          #dc3545;
+  --color-error-light:    #ff849c;
+  --color-error-bg:       rgba(220, 53, 69, 0.1);
+  --color-error-stroke:   rgba(220, 53, 69, 0.3);
+
+  --color-warning:        #ffb200;
+  --color-warning-bg:     rgba(255, 178, 0, 0.05);
+  --color-warning-stroke: rgba(255, 178, 0, 0.2);
+
+  /* ── Brand ─────────────────────────────────── */
+  --color-brand:          #1fd24f;
+  --color-brand-bg:       rgba(31, 210, 79, 0.15);
+  --color-brand-stroke:   rgba(31, 210, 79, 0.3);
+
+  /* ── Platform Colors ───────────────────────── */
+  --color-extended-brand:       #00bc83;
+  --color-extended-brand-light: #11E389;
+  --color-extended-bg:          rgba(0, 188, 131, 0.15);
+  --color-extended-stroke:      rgba(0, 188, 131, 0.3);
+
+  --color-grvt-brand:           #B0E870;
+  --color-grvt-bg:              rgba(176, 232, 112, 0.15);
+  --color-grvt-stroke:          rgba(176, 232, 112, 0.3);
+
+  --color-variational-brand:    #4c9af8;
+  --color-variational-bg:       rgba(76, 154, 248, 0.15);
+  --color-variational-stroke:   rgba(76, 154, 248, 0.3);
+
+  --color-nado-brand:           #ffffff;
+  --color-nado-bg:              rgba(255, 255, 255, 0.1);
+  --color-nado-stroke:          rgba(255, 255, 255, 0.22);
+
+  /* ── Dynamic platform (set via JS) ─────────── */
+  --color-platform-brand:   ;
+  --color-platform-bg:      ;
+  --color-platform-stroke:  ;
+
+  /* ── Font Sizes ─────────────────────────────── */
+  --text-xs:  11px;
+  --text-sm:  12px;
+  --text-md:  14px;
+  --text-lg:  16px;
+  --text-h6:  20px;
+  --text-h5:  26px;
+  --text-h4:  32px;
+  --text-h3:  38px;
+  --text-h2:  44px;
+  --text-h1:  50px;
+
+  /* ── Line Heights ───────────────────────────── */
+  --lh-sm: 14px;  --lh-md: 16px;  --lh-lg: 18px;
+  --lh-h6: 20px;  --lh-h5: 26px;  --lh-h4: 32px;
+  --lh-h3: 38px;  --lh-h2: 44px;  --lh-h1: 50px;
+
+  /* ── Letter Spacing ─────────────────────────── */
+  --ls-sm: -0.12px;  --ls-md: -0.14px;  --ls-lg: -0.16px;
+  --ls-h6: -0.60px;  --ls-h5: -0.26px;  --ls-h4: -0.32px;
+  --ls-h3: -0.76px;  --ls-h2: -0.88px;  --ls-h1: -0.84px;
+
+  /* ── Spacing ────────────────────────────────── */
+  --space-0:   0px;    --space-01:  2px;
+  --space-1:   4px;    --space-2:   8px;
+  --space-3:   12px;   --space-4:   16px;
+  --space-5:   20px;   --space-6:   24px;
+  --space-7:   28px;   --space-8:   32px;
+  --space-9:   36px;   --space-10:  40px;
+  --space-12:  48px;   --space-14:  56px;
+  --space-16:  64px;
+
+  /* ── Border Radius ──────────────────────────── */
+  --radius-sm:    8px;
+  --radius-md:    10px;
+  --radius-lg:    12px;
+  --radius-xl:    16px;
+  --radius-round: 9999px;
+
+  /* ── Transitions ────────────────────────────── */
+  --duration-sm:  75ms;
+  --duration-md:  125ms;
+  --duration-lg:  200ms;
+  --duration-xl:  400ms;
+
+  --ease-out-1:   cubic-bezier(0.12, 0.04, 0.20, 1.06);
+  --ease-out-2:   cubic-bezier(0.23, 0.09, 0.08, 1.13);
+  --ease-in-1:    cubic-bezier(0.88, -0.06, 0.80, 0.96);
+  --ease-inout-1: cubic-bezier(0.88, 0.04, 0.12, 1.06);
+  --ease-inout-2: cubic-bezier(0.77, 0.09, 0.23, 1.13);
+}

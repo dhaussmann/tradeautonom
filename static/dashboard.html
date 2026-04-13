@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TradeAutonom — Account Dashboard</title>
+<style>
+:root{--bg:#0f1117;--surface:#1a1d27;--surface2:#232733;--border:#2e3345;--text:#e1e4ed;--dim:#8b8fa3;--accent:#6366f1;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--blue:#3b82f6}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:17px;font-weight:600}
+header h1 span{color:var(--accent)}
+.hdr-right{display:flex;align-items:center;gap:10px}
+.badge{background:var(--surface2);border:1px solid var(--border);padding:3px 10px;border-radius:10px;font-size:11px;color:var(--dim)}
+.refresh-btn{background:var(--surface2);border:1px solid var(--border);color:var(--dim);padding:5px 12px;border-radius:6px;font-size:11px;cursor:pointer;transition:all .15s}
+.refresh-btn:hover{border-color:var(--accent);color:var(--text)}
+
+/* Tab navigation */
+.tab-nav{display:flex;background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px;gap:0;overflow-x:auto}
+.tab-nav .tab{padding:10px 18px;font-size:12px;font-weight:600;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;transition:all .15s}
+.tab-nav .tab:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.tab-nav .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+
+.container{max-width:1400px;margin:0 auto;padding:20px}
+.section{display:none}
+.section.active{display:block}
+
+/* Overview cards */
+.overview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:20px}
+.ov-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px}
+.ov-card .ov-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:12px;display:flex;align-items:center;gap:6px}
+.ov-card .ov-title .ex-badge{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:700}
+.ex-grvt{background:rgba(99,102,241,.15);color:var(--accent)}
+.ex-ext{background:rgba(59,130,246,.15);color:var(--blue)}
+.ex-nado{background:rgba(234,179,8,.15);color:var(--yellow)}
+.ex-total{background:rgba(34,197,94,.15);color:var(--green)}
+.ov-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(46,51,69,.5)}
+.ov-row:last-child{border-bottom:none}
+.ov-row .ov-label{font-size:12px;color:var(--dim)}
+.ov-row .ov-value{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums}
+
+/* Tables */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:16px}
+.card-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:14px;display:flex;align-items:center;justify-content:space-between}
+.card-title .count{font-size:10px;background:var(--surface2);padding:2px 8px;border-radius:10px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:8px 10px;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface)}
+td{padding:7px 10px;border-bottom:1px solid rgba(46,51,69,.5);font-variant-numeric:tabular-nums}
+tr:hover td{background:rgba(255,255,255,.02)}
+.scrollable{max-height:600px;overflow-y:auto}
+
+.long{color:var(--green)}.short{color:var(--red)}
+.buy{color:var(--green)}.sell{color:var(--red)}
+.positive{color:var(--green)}.negative{color:var(--red)}
+.filled{color:var(--green)}.cancelled{color:var(--red)}.expired{color:var(--yellow)}
+.taker{color:var(--yellow)}.maker{color:var(--green)}
+.empty{text-align:center;padding:30px;color:var(--dim);font-size:12px}
+.ex-tag{font-size:9px;padding:1px 5px;border-radius:3px;font-weight:600}
+
+/* Summary bar */
+.summary-bar{display:flex;gap:16px;padding:10px 14px;background:var(--surface2);border-radius:8px;margin-bottom:14px;font-size:12px;flex-wrap:wrap}
+.summary-bar .si{display:flex;gap:4px;align-items:center}
+.summary-bar .si .sl{color:var(--dim)}
+.summary-bar .si .sv{font-weight:700;font-variant-numeric:tabular-nums}
+
+/* Loading */
+.loading{text-align:center;padding:40px;color:var(--dim)}
+.loading .spinner{display:inline-block;width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;margin-bottom:8px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Fee cards */
+.fee-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
+.fee-card{background:var(--surface2);border-radius:8px;padding:14px;text-align:center}
+.fee-card .fl{font-size:10px;color:var(--dim);text-transform:uppercase;margin-bottom:4px}
+.fee-card .fv{font-size:20px;font-weight:800;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>Trade</span>Autonom <span style="font-weight:400;color:var(--dim);font-size:13px">Account Dashboard</span></h1>
+  <div class="hdr-right">
+    <span class="badge" id="lastUpdate">Last update: —</span>
+    <button class="refresh-btn" onclick="refreshAll()">Refresh</button>
+  </div>
+</header>
+
+<div class="tab-nav">
+  <div class="tab active" data-tab="overview" onclick="switchTab('overview')">Overview</div>
+  <div class="tab" data-tab="positions" onclick="switchTab('positions')">Positions</div>
+  <div class="tab" data-tab="trades" onclick="switchTab('trades')">Trades</div>
+  <div class="tab" data-tab="orders" onclick="switchTab('orders')">Orders</div>
+  <div class="tab" data-tab="fees" onclick="switchTab('fees')">Fees</div>
+</div>
+
+<div class="container">
+
+  <!-- OVERVIEW -->
+  <div class="section active" id="sec-overview">
+    <div class="overview-grid" id="overviewGrid">
+      <div class="loading"><div class="spinner"></div><br>Loading...</div>
+    </div>
+  </div>
+
+  <!-- POSITIONS -->
+  <div class="section" id="sec-positions">
+    <div class="card">
+      <div class="card-title">Open Positions <span class="count" id="posCount">0</span></div>
+      <div class="scrollable" id="posTable"><div class="loading"><div class="spinner"></div><br>Loading...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Position History (Extended) <span class="count" id="posHistCount">0</span></div>
+      <div class="scrollable" id="posHistTable"><div class="loading"><div class="spinner"></div><br>Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- TRADES -->
+  <div class="section" id="sec-trades">
+    <div id="tradesSummary"></div>
+    <div class="card">
+      <div class="card-title">Trade / Fill History <span class="count" id="tradesCount">0</span></div>
+      <div class="scrollable" id="tradesTable"><div class="loading"><div class="spinner"></div><br>Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- ORDERS -->
+  <div class="section" id="sec-orders">
+    <div id="ordersSummary"></div>
+    <div class="card">
+      <div class="card-title">Order History <span class="count" id="ordersCount">0</span></div>
+      <div class="scrollable" id="ordersTable"><div class="loading"><div class="spinner"></div><br>Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- FEES -->
+  <div class="section" id="sec-fees">
+    <div id="feeSummary"></div>
+    <div class="card">
+      <div class="card-title">Fee Rates</div>
+      <div id="feeRatesTable"><div class="loading"><div class="spinner"></div><br>Loading...</div></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = location.origin;
+let autoRefresh = null;
+
+function $(id){ return document.getElementById(id); }
+function fmt(v, d=4){ return v != null ? parseFloat(v).toFixed(d) : '—'; }
+function fmtUsd(v, d=2){ return v != null ? '$' + parseFloat(v).toFixed(d) : '—'; }
+function pnlColor(v){ return v >= 0 ? 'positive' : 'negative'; }
+function exBadge(ex){ const cls=ex==='GRVT'?'ex-grvt':ex==='NADO'?'ex-nado':'ex-ext'; return '<span class="ex-tag '+cls+'">'+ex+'</span>'; }
+function sideClass(s){ return (s||'').toLowerCase(); }
+function statusClass(s){ s=(s||'').toLowerCase(); if(s==='filled')return 'filled'; if(s==='cancelled')return 'cancelled'; if(s==='expired')return 'expired'; return ''; }
+
+async function apiFetch(path){
+  try{
+    const r = await fetch(API + path);
+    if(!r.ok) return null;
+    return await r.json();
+  } catch(e){ console.error('API error:', path, e); return null; }
+}
+
+// ---- Tab switching ----
+function switchTab(name){
+  document.querySelectorAll('.tab-nav .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.section').forEach(s => s.classList.toggle('active', s.id === 'sec-'+name));
+  // Lazy load
+  if(name==='positions') loadPositions();
+  if(name==='trades') loadTrades();
+  if(name==='orders') loadOrders();
+  if(name==='fees') loadFees();
+}
+
+// ---- Overview ----
+async function loadOverview(){
+  const d = await apiFetch('/api/overview');
+  if(!d) { $('overviewGrid').innerHTML='<div class="empty">Failed to load overview</div>'; return; }
+
+  let html = '';
+  for(const a of d.accounts){
+    const badge = a.exchange === 'GRVT' ? 'ex-grvt' : a.exchange === 'NADO' ? 'ex-nado' : 'ex-ext';
+    html += `<div class="ov-card">
+      <div class="ov-title"><span class="ex-badge ${badge}">${a.exchange}</span> Account</div>
+      <div class="ov-row"><span class="ov-label">Total Equity</span><span class="ov-value">${fmtUsd(a.total_equity)}</span></div>
+      <div class="ov-row"><span class="ov-label">Available Balance</span><span class="ov-value">${fmtUsd(a.available_balance)}</span></div>
+      <div class="ov-row"><span class="ov-label">Unrealized PnL</span><span class="ov-value ${pnlColor(a.unrealized_pnl)}">${fmtUsd(a.unrealized_pnl,4)}</span></div>
+      <div class="ov-row"><span class="ov-label">Initial Margin</span><span class="ov-value">${fmtUsd(a.initial_margin)}</span></div>
+    </div>`;
+  }
+  // Total card
+  html += `<div class="ov-card">
+    <div class="ov-title"><span class="ex-badge ex-total">TOTAL</span> Combined</div>
+    <div class="ov-row"><span class="ov-label">Total Equity</span><span class="ov-value" style="font-size:18px">${fmtUsd(d.total_equity)}</span></div>
+    <div class="ov-row"><span class="ov-label">Available Balance</span><span class="ov-value">${fmtUsd(d.total_available_balance)}</span></div>
+    <div class="ov-row"><span class="ov-label">Unrealized PnL</span><span class="ov-value ${pnlColor(d.total_unrealized_pnl)}">${fmtUsd(d.total_unrealized_pnl,4)}</span></div>
+  </div>`;
+
+  $('overviewGrid').innerHTML = html;
+}
+
+// ---- Positions ----
+async function loadPositions(){
+  const [pos, hist] = await Promise.all([apiFetch('/api/positions'), apiFetch('/api/positions/history')]);
+
+  if(pos){
+    $('posCount').textContent = pos.count;
+    if(!pos.positions.length){ $('posTable').innerHTML='<div class="empty">No open positions</div>'; }
+    else {
+      let h='<table><thead><tr><th>Exchange</th><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>uPnL</th><th>rPnL</th><th>Leverage</th><th>Fees</th></tr></thead><tbody>';
+      for(const p of pos.positions){
+        h+=`<tr>
+          <td>${exBadge(p.exchange)}</td>
+          <td>${p.instrument}</td>
+          <td class="${sideClass(p.side)}">${p.side}</td>
+          <td>${fmt(p.size)}</td>
+          <td>${fmtUsd(p.entry_price,4)}</td>
+          <td>${fmtUsd(p.mark_price,4)}</td>
+          <td class="${pnlColor(p.unrealized_pnl)}">${fmtUsd(p.unrealized_pnl,4)}</td>
+          <td class="${pnlColor(p.realized_pnl)}">${fmtUsd(p.realized_pnl,4)}</td>
+          <td>${fmt(p.leverage,1)}x</td>
+          <td>${fmtUsd(p.cumulative_fee,4)}</td>
+        </tr>`;
+      }
+      h+='</tbody></table>';
+      $('posTable').innerHTML=h;
+    }
+  }
+
+  if(hist){
+    $('posHistCount').textContent = hist.count;
+    if(!hist.positions.length){ $('posHistTable').innerHTML='<div class="empty">No position history</div>'; }
+    else {
+      let h='<table><thead><tr><th>Exchange</th><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th><th>Exit</th><th>Realized PnL</th><th>Leverage</th><th>Exit Type</th><th>Opened</th><th>Closed</th></tr></thead><tbody>';
+      for(const p of hist.positions){
+        const opened = p.opened ? new Date(p.opened).toLocaleString() : '—';
+        const closed = p.closed ? new Date(p.closed).toLocaleString() : '—';
+        h+=`<tr>
+          <td>${exBadge(p.exchange)}</td>
+          <td>${p.instrument}</td>
+          <td class="${sideClass(p.side)}">${p.side}</td>
+          <td>${fmt(p.size)}</td>
+          <td>${fmtUsd(p.entry_price,4)}</td>
+          <td>${fmtUsd(p.exit_price,4)}</td>
+          <td class="${pnlColor(p.realized_pnl)}">${fmtUsd(p.realized_pnl,4)}</td>
+          <td>${fmt(p.leverage,1)}x</td>
+          <td>${p.exit_type||'—'}</td>
+          <td>${opened}</td>
+          <td>${closed}</td>
+        </tr>`;
+      }
+      h+='</tbody></table>';
+      $('posHistTable').innerHTML=h;
+    }
+  }
+}
+
+// ---- Trades ----
+async function loadTrades(){
+  const d = await apiFetch('/api/trades');
+  if(!d){ $('tradesTable').innerHTML='<div class="empty">Failed to load trades</div>'; return; }
+
+  $('tradesCount').textContent = d.count;
+  $('tradesSummary').innerHTML=`<div class="summary-bar">
+    <div class="si"><span class="sl">Total Trades:</span><span class="sv">${d.count}</span></div>
+    <div class="si"><span class="sl">Total Fees:</span><span class="sv negative">${fmtUsd(d.total_fees,4)}</span></div>
+    <div class="si"><span class="sl">Total Realized PnL:</span><span class="sv ${pnlColor(d.total_realized_pnl)}">${fmtUsd(d.total_realized_pnl,4)}</span></div>
+  </div>`;
+
+  if(!d.trades.length){ $('tradesTable').innerHTML='<div class="empty">No trades</div>'; return; }
+
+  let h='<table><thead><tr><th>Time</th><th>Exchange</th><th>Instrument</th><th>Side</th><th>Price</th><th>Qty</th><th>Value</th><th>Fee</th><th>rPnL</th><th>Type</th></tr></thead><tbody>';
+  for(const t of d.trades){
+    const time = t.time ? new Date(t.time).toLocaleString() : '—';
+    h+=`<tr>
+      <td>${time}</td>
+      <td>${exBadge(t.exchange)}</td>
+      <td>${t.instrument}</td>
+      <td class="${sideClass(t.side)}">${t.side}</td>
+      <td>${fmtUsd(t.price,4)}</td>
+      <td>${fmt(t.qty)}</td>
+      <td>${fmtUsd(t.value,4)}</td>
+      <td class="negative">${fmtUsd(t.fee,6)}</td>
+      <td class="${pnlColor(t.realized_pnl)}">${fmtUsd(t.realized_pnl,4)}</td>
+      <td class="${t.is_taker?'taker':'maker'}">${t.is_taker?'Taker':'Maker'}</td>
+    </tr>`;
+  }
+  h+='</tbody></table>';
+  $('tradesTable').innerHTML=h;
+}
+
+// ---- Orders ----
+async function loadOrders(){
+  const d = await apiFetch('/api/orders');
+  if(!d){ $('ordersTable').innerHTML='<div class="empty">Failed to load orders</div>'; return; }
+
+  $('ordersCount').textContent = d.count;
+  $('ordersSummary').innerHTML=`<div class="summary-bar">
+    <div class="si"><span class="sl">Total Orders:</span><span class="sv">${d.count}</span></div>
+    <div class="si"><span class="sl">Total Fees Paid:</span><span class="sv negative">${fmtUsd(d.total_fees,4)}</span></div>
+  </div>`;
+
+  if(!d.orders.length){ $('ordersTable').innerHTML='<div class="empty">No orders</div>'; return; }
+
+  let h='<table><thead><tr><th>Time</th><th>Exchange</th><th>Instrument</th><th>Status</th><th>Side</th><th>Type</th><th>Price</th><th>Qty</th><th>Filled</th><th>Fee</th><th>TIF</th></tr></thead><tbody>';
+  for(const o of d.orders){
+    const time = o.time ? new Date(o.time).toLocaleString() : '—';
+    h+=`<tr>
+      <td>${time}</td>
+      <td>${exBadge(o.exchange)}</td>
+      <td>${o.instrument}</td>
+      <td class="${statusClass(o.status)}">${o.status}</td>
+      <td class="${sideClass(o.side)}">${o.side}</td>
+      <td>${o.order_type||'—'}</td>
+      <td>${fmtUsd(o.price,4)}</td>
+      <td>${fmt(o.qty)}</td>
+      <td>${fmt(o.filled_qty)}</td>
+      <td class="negative">${fmtUsd(o.paid_fee,6)}</td>
+      <td>${o.time_in_force||'—'}</td>
+    </tr>`;
+  }
+  h+='</tbody></table>';
+  $('ordersTable').innerHTML=h;
+}
+
+// ---- Fees ----
+async function loadFees(){
+  const d = await apiFetch('/api/fees');
+  if(!d){ $('feeRatesTable').innerHTML='<div class="empty">Failed to load fees</div>'; return; }
+
+  let summary = '<div class="fee-grid">';
+  const tp = d.total_fees_paid || {};
+  for(const [k,v] of Object.entries(tp)){
+    if(k==='total') continue;
+    summary += `<div class="fee-card"><div class="fl">${k.toUpperCase()} Total Fees</div><div class="fv negative">${fmtUsd(v,4)}</div></div>`;
+  }
+  summary += `<div class="fee-card"><div class="fl">Combined Total Fees</div><div class="fv negative">${fmtUsd(tp.total,4)}</div></div>`;
+  summary += '</div>';
+  $('feeSummary').innerHTML = summary;
+
+  if(!d.fee_rates || !d.fee_rates.length){ $('feeRatesTable').innerHTML='<div class="empty">No fee rate data</div>'; return; }
+
+  let h='<table><thead><tr><th>Exchange</th><th>Market</th><th>Maker Fee</th><th>Taker Fee</th></tr></thead><tbody>';
+  for(const f of d.fee_rates){
+    h+=`<tr>
+      <td>${exBadge(f.exchange)}</td>
+      <td>${f.market}</td>
+      <td>${(f.maker_fee_rate*100).toFixed(4)}%</td>
+      <td>${(f.taker_fee_rate*100).toFixed(4)}%</td>
+    </tr>`;
+  }
+  h+='</tbody></table>';
+  $('feeRatesTable').innerHTML=h;
+}
+
+// ---- Refresh ----
+async function refreshAll(){
+  $('lastUpdate').textContent = 'Updating...';
+  await loadOverview();
+  const activeTab = document.querySelector('.tab-nav .tab.active');
+  if(activeTab){
+    const tab = activeTab.dataset.tab;
+    if(tab==='positions') await loadPositions();
+    if(tab==='trades') await loadTrades();
+    if(tab==='orders') await loadOrders();
+    if(tab==='fees') await loadFees();
+  }
+  $('lastUpdate').textContent = 'Last update: ' + new Date().toLocaleTimeString();
+}
+
+// ---- Init ----
+loadOverview().then(()=>{
+  $('lastUpdate').textContent = 'Last update: ' + new Date().toLocaleTimeString();
+});
+autoRefresh = setInterval(refreshAll, 30000);
+</script>
+</body>
+</html>

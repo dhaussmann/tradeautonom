@@ -40,7 +40,7 @@ header h1 span{color:var(--accent)}
 .spread-row{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;margin-bottom:16px}
 .pb{text-align:center}
 .pb .lbl{font-size:11px;color:var(--dim);margin-bottom:2px}
-.pb .pr{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
+.pb .pr{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
 .pb .inst{font-size:10px;color:var(--dim);margin-top:1px}
 .sc{text-align:center;padding:10px 18px;background:var(--surface2);border-radius:8px;min-width:130px}
 .sc .sv{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}
@@ -153,17 +153,156 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:460px;max-height:80vh;overflow-y:auto}
 .modal h2{font-size:16px;margin-bottom:16px}
 .modal .cg{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+
+/* ── Funding-Arb Panel ─────────────────────────────────── */
+.fn-panel{display:none;max-width:1200px;margin:0 auto;padding:20px}
+.fn-panel.active{display:block}
+.fn-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.fn-full{grid-column:1/-1}
+.fn-timer-bar{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:16px}
+.fn-timer-left{display:flex;align-items:center;gap:14px}
+.fn-status-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.fn-status-dot.idle{background:var(--dim)}
+.fn-status-dot.running{background:var(--green);box-shadow:0 0 8px rgba(34,197,94,.4);animation:fn-pulse 2s infinite}
+.fn-status-dot.entering{background:var(--yellow);animation:fn-pulse 1s infinite}
+.fn-status-dot.exiting{background:var(--red);animation:fn-pulse 1s infinite}
+@keyframes fn-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.fn-state-label{font-size:14px;font-weight:700}
+.fn-timer-countdown{font-size:28px;font-weight:800;font-variant-numeric:tabular-nums;color:var(--accent);letter-spacing:1px}
+.fn-timer-sub{font-size:10px;color:var(--dim);text-align:right}
+.fn-controls{display:flex;gap:10px;align-items:flex-end}
+.fn-controls .btn{padding:10px 20px;font-size:13px}
+.fn-input-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:14px}
+.fn-input-grid .fld input,.fn-input-grid .fld select{width:100%}
+.fn-rate-cards{display:grid;grid-template-columns:1fr auto 1fr;gap:14px;align-items:center}
+.fn-rate-card{background:var(--surface2);padding:14px;border-radius:8px;text-align:center}
+.fn-rate-card .fn-rc-exch{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}
+.fn-rate-card .fn-rc-rate{font-size:22px;font-weight:800;font-variant-numeric:tabular-nums}
+.fn-rate-card .fn-rc-label{font-size:9px;color:var(--dim);margin-top:2px}
+.fn-spread-box{background:var(--surface2);padding:12px 18px;border-radius:8px;text-align:center}
+.fn-spread-box .fn-sp-val{font-size:20px;font-weight:800;font-variant-numeric:tabular-nums}
+.fn-spread-box .fn-sp-lbl{font-size:9px;color:var(--dim);margin-top:2px}
+.fn-suggestion{padding:10px;border-radius:6px;font-size:12px;font-weight:600;text-align:center;margin-top:10px}
+.fn-suggestion.positive{background:rgba(34,197,94,.1);color:var(--green)}
+.fn-suggestion.negative{background:rgba(239,68,68,.1);color:var(--red)}
+.fn-suggestion.neutral{background:rgba(139,143,163,.1);color:var(--dim)}
+.fn-pos-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}
+.fn-pos-card{background:var(--surface2);padding:12px;border-radius:8px}
+.fn-pos-card .fn-pc-hdr{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.fn-pos-card .fn-pc-side{font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px}
+.fn-pos-card .fn-pc-side.long{background:rgba(34,197,94,.15);color:var(--green)}
+.fn-pos-card .fn-pc-side.short{background:rgba(239,68,68,.15);color:var(--red)}
+.fn-pos-card .fn-pc-exch{font-size:10px;color:var(--dim);text-transform:uppercase}
+.fn-pos-card .fn-pc-qty{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+.fn-pos-card .fn-pc-info{font-size:10px;color:var(--dim);margin-top:4px}
+.fn-risk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.fn-risk-item{background:var(--surface2);padding:10px;border-radius:6px;text-align:center}
+.fn-risk-item .fn-ri-val{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
+.fn-risk-item .fn-ri-lbl{font-size:9px;color:var(--dim);margin-top:2px}
+.fn-log{max-height:300px;overflow-y:auto}
+.fn-log table{width:100%;border-collapse:collapse;font-size:11px}
+.fn-log th{text-align:left;padding:6px 8px;color:var(--dim);font-size:9px;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border)}
+.fn-log td{padding:5px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+.fn-nav-tab{padding:10px 18px;font-size:12px;font-weight:700;color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;text-transform:uppercase;letter-spacing:.04em}
+.fn-nav-tab:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.fn-nav-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.fn-stop-reason{font-size:11px;color:var(--yellow);margin-top:4px}
+.fn-timer-adjust{display:flex;align-items:center;gap:4px}
+.fn-timer-input{width:42px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:5px;font-size:13px;font-variant-numeric:tabular-nums;text-align:center;outline:none;transition:border-color .2s}
+.fn-timer-input:focus{border-color:var(--accent)}
+.fn-timer-unit{font-size:11px;color:var(--dim);font-weight:600}
+.fn-timer-adj-btn{background:var(--surface2)!important;border:1px solid var(--border)!important;color:var(--text)!important;padding:4px 10px!important;font-size:11px!important;font-weight:600!important;border-radius:5px!important;cursor:pointer;transition:all .15s}
+.fn-timer-adj-btn:hover{border-color:var(--accent)!important;color:var(--accent)!important}
+
+/* Settings modal */
+.gear-btn{font-size:18px;cursor:pointer;color:var(--dim);transition:color .15s;padding:2px 6px;border-radius:4px}
+.gear-btn:hover{color:var(--text);background:rgba(255,255,255,.05)}
+.settings-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;justify-content:center;align-items:center}
+.settings-overlay.show{display:flex}
+.settings-modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:520px;max-height:85vh;overflow-y:auto}
+.settings-modal h2{font-size:16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between}
+.settings-modal h2 .close-x{font-size:18px;color:var(--dim);cursor:pointer;padding:2px 6px}
+.settings-modal h2 .close-x:hover{color:var(--text)}
+.settings-section{margin-bottom:20px}
+.settings-section h3{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.key-field{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+.key-field label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+.key-field .key-input-wrap{display:flex;gap:4px}
+.key-field input{flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-size:12px;font-family:'SF Mono','Fira Code',monospace;outline:none;transition:border-color .2s}
+.key-field input:focus{border-color:var(--accent)}
+.key-field .toggle-vis{background:var(--surface2);border:1px solid var(--border);color:var(--dim);padding:4px 8px;border-radius:5px;cursor:pointer;font-size:11px;white-space:nowrap}
+.key-field .toggle-vis:hover{color:var(--text);border-color:var(--dim)}
+.settings-actions{display:flex;gap:8px;align-items:center;margin-top:16px}
+.settings-actions .settings-status{font-size:11px;color:var(--dim);margin-left:8px}
+.settings-actions .settings-status.ok{color:var(--green)}
+.settings-actions .settings-status.err{color:var(--red)}
+
+/* Lock screen */
+.lock-overlay{position:fixed;inset:0;background:var(--bg);z-index:500;display:flex;align-items:center;justify-content:center}
+.lock-overlay.hidden{display:none}
+.lock-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:32px;width:380px;text-align:center}
+.lock-box h2{font-size:18px;margin-bottom:6px}
+.lock-box h2 span{color:var(--accent)}
+.lock-box .lock-subtitle{font-size:12px;color:var(--dim);margin-bottom:20px}
+.lock-box .lock-icon{font-size:48px;margin-bottom:16px;opacity:.6}
+.lock-box input{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:6px;font-size:14px;outline:none;margin-bottom:12px;transition:border-color .2s}
+.lock-box input:focus{border-color:var(--accent)}
+.lock-box .lock-btn{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
+.lock-box .lock-btn:hover{opacity:.85}
+.lock-box .lock-btn:disabled{opacity:.5;cursor:wait}
+.lock-box .lock-error{font-size:11px;color:var(--red);margin-top:8px;min-height:16px}
+.lock-box .lock-confirm{margin-bottom:12px}
+.lock-btn-lock{background:none;border:1px solid var(--border);color:var(--dim);padding:4px 10px;border-radius:5px;cursor:pointer;font-size:12px;margin-left:4px}
+.lock-btn-lock:hover{color:var(--text);border-color:var(--dim)}
 </style>
 </head>
 <body>
+
+<!-- ============ LOCK SCREEN OVERLAY ============ -->
+<div class="lock-overlay" id="lockOverlay">
+  <div class="lock-box">
+    <div class="lock-icon">&#128274;</div>
+    <h2><span>TradeAutonom</span></h2>
+    <!-- Setup mode (first time) -->
+    <div id="lockSetupView" style="display:none">
+      <div class="lock-subtitle">Set a password to encrypt your API keys</div>
+      <input type="password" id="lockSetupPw" placeholder="Password (min 8 characters)" autocomplete="new-password">
+      <input type="password" id="lockSetupPwConfirm" placeholder="Confirm password" class="lock-confirm" autocomplete="new-password">
+      <button class="lock-btn" id="lockSetupBtn" onclick="vaultSetup()">Set Password &amp; Continue</button>
+      <div class="lock-error" id="lockSetupErr"></div>
+    </div>
+    <!-- Unlock mode -->
+    <div id="lockUnlockView" style="display:none">
+      <div class="lock-subtitle">Enter your password to unlock</div>
+      <input type="password" id="lockUnlockPw" placeholder="Password" autocomplete="current-password">
+      <button class="lock-btn" id="lockUnlockBtn" onclick="vaultUnlock()">Unlock</button>
+      <div class="lock-error" id="lockUnlockErr"></div>
+    </div>
+    <!-- Loading -->
+    <div id="lockLoadingView">
+      <div class="lock-subtitle">Connecting...</div>
+    </div>
+  </div>
+</div>
+
 <header>
   <h1><span>TradeAutonom</span> Arbitrage Dashboard</h1>
   <div class="hdr-right">
     <div class="badge" id="envBadge">connecting...</div>
     <div class="badge" id="wsBadge" style="display:none;font-weight:600">WS</div>
+    <div class="gear-btn" onclick="showSettingsModal()" title="Settings">&#9881;</div>
+    <button class="lock-btn-lock" onclick="vaultLock()" title="Lock vault" id="lockBtn" style="display:none">&#128274; Lock</button>
   </div>
 </header>
 
+<!-- Top-level navigation: Arbitrage Jobs vs Funding Arb -->
+<div class="tab-bar" style="gap:0;padding:0 24px;border-bottom:1px solid var(--border)">
+  <!-- <div class="fn-nav-tab" onclick="switchMainView('arb')" id="navArb">Arbitrage Jobs</div> -->
+  <div class="fn-nav-tab active" onclick="switchMainView('fn')" id="navFn">Funding Arb</div>
+</div>
+
+<!-- ============ ARBITRAGE JOBS VIEW (disabled) ============ -->
+<div id="arbView" style="display:none">
 <!-- Tab bar -->
 <div class="tab-bar" id="tabBar">
   <div class="tab-add" onclick="showNewJobModal()" title="Add new job">+</div>
@@ -171,20 +310,34 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
 
 <!-- Job panels rendered dynamically -->
 <div id="jobPanels"></div>
+</div>
+
+<!-- ============ FUNDING ARB VIEW (Multi-Bot v2) ============ -->
+<div class="fn-panel" id="fnView">
+  <!-- Bot Tab Bar -->
+  <div class="tab-bar" id="fnBotTabBar" style="padding:0 20px;margin-bottom:0">
+    <!-- tabs rendered dynamically -->
+    <div class="tab-add" onclick="fnShowCreateBot()" title="Add new bot">+</div>
+  </div>
+  <!-- Bot panels rendered dynamically -->
+  <div id="fnBotPanels"></div>
+</div>
 
 <!-- New Job Modal -->
 <div class="modal-overlay" id="newJobModal">
   <div class="modal">
-    <h2>New Arbitrage Job</h2>
+    <h2>New Job</h2>
     <div class="cg">
       <div class="fld"><label>Job ID (optional)</label><input type="text" id="njId" placeholder="auto"></div>
       <div class="fld"><label>Name (optional)</label><input type="text" id="njName" placeholder="auto"></div>
-      <div class="fld"><label>Leg A Exchange</label><select id="njExA" onchange="loadMarkets('njExA','njInstA')"><option value="extended">Extended</option><option value="grvt">GRVT</option></select></div>
+      <div class="fld"><label>Strategy</label><select id="njStrat" onchange="toggleNewJobStrategy()"><option value="arbitrage">Arbitrage</option><option value="delta_neutral">Delta-Neutral</option></select></div>
+      <div class="fld"><label>Leg A Exchange</label><select id="njExA" onchange="loadMarkets('njExA','njInstA')"><option value="">Loading...</option></select></div>
       <div class="fld"><label>Leg A Instrument</label><select id="njInstA"><option value="">Loading...</option></select></div>
-      <div class="fld"><label>Leg B Exchange</label><select id="njExB" onchange="loadMarkets('njExB','njInstB')"><option value="grvt">GRVT</option><option value="extended">Extended</option></select></div>
+      <div class="fld"><label>Leg B Exchange</label><select id="njExB" onchange="loadMarkets('njExB','njInstB')"><option value="">Loading...</option></select></div>
       <div class="fld"><label>Leg B Instrument</label><select id="njInstB"><option value="">Loading...</option></select></div>
-      <div class="fld"><label>Entry Min Spread ($)</label><input type="number" id="njES" value="0.08" step="0.01"></div>
-      <div class="fld"><label>Exit Max Spread ($)</label><input type="number" id="njXS" value="0.02" step="0.01"></div>
+      <div class="fld njArb"><label>Entry Min Spread ($)</label><input type="number" id="njES" value="0.08" step="0.01"></div>
+      <div class="fld njArb"><label>Exit Max Spread ($)</label><input type="number" id="njXS" value="0.02" step="0.01"></div>
+      <div class="fld njDN" style="display:none"><label>Max Spread (%)</label><input type="number" id="njMSP" value="0.01" step="0.001"></div>
       <div class="fld"><label>Quantity</label><input type="number" id="njQ" value="0.1" step="0.001"></div>
       <div class="fld"><label>Simulation</label><select id="njSim"><option value="false">Off</option><option value="true">On</option></select></div>
       <div class="fld"><label>Hold Duration (h)</label><input type="number" id="njHD" value="" step="0.5" placeholder="no limit"></div>
@@ -198,15 +351,99 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:ta
   </div>
 </div>
 
+<!-- ============ SETTINGS MODAL ============ -->
+<div class="settings-overlay" id="settingsModal">
+  <div class="settings-modal">
+    <h2>Settings <span class="close-x" onclick="hideSettingsModal()">&times;</span></h2>
+
+    <div class="settings-section">
+      <h3>Extended Exchange</h3>
+      <div class="key-field">
+        <label>API Key</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skExtApiKey" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skExtApiKey',this)">Show</button>
+        </div>
+      </div>
+      <div class="key-field">
+        <label>Public Key</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skExtPubKey" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skExtPubKey',this)">Show</button>
+        </div>
+      </div>
+      <div class="key-field">
+        <label>Private Key</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skExtPrivKey" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skExtPrivKey',this)">Show</button>
+        </div>
+      </div>
+      <div class="key-field">
+        <label>Vault ID</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skExtVault" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skExtVault',this)">Show</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <h3>GRVT Exchange</h3>
+      <div class="key-field">
+        <label>API Key</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skGrvtApiKey" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skGrvtApiKey',this)">Show</button>
+        </div>
+      </div>
+      <div class="key-field">
+        <label>Private Key</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skGrvtPrivKey" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skGrvtPrivKey',this)">Show</button>
+        </div>
+      </div>
+      <div class="key-field">
+        <label>Trading Account ID</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skGrvtAcctId" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skGrvtAcctId',this)">Show</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <h3>Variational Exchange</h3>
+      <div class="key-field">
+        <label>JWT Token</label>
+        <div class="key-input-wrap">
+          <input type="password" id="skVarJwt" autocomplete="off" spellcheck="false">
+          <button class="toggle-vis" onclick="toggleKeyVis('skVarJwt',this)">Show</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-actions">
+      <button class="btn bp" onclick="saveSettings()">Save Keys</button>
+      <button class="btn bo" onclick="hideSettingsModal()">Cancel</button>
+      <span class="settings-status" id="settingsStatus"></span>
+    </div>
+  </div>
+</div>
+
 <script>
 const API=location.origin;
 let rInt=null,rMs=3000,activeJobId=null;
 const jobState={};  // {jobId: {sHist:[], sseSource:null, logs:[]}}
 
 function $(id){return document.getElementById(id)}
+const _dirtyFields=new Set();
+document.addEventListener('input',e=>{if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'){_dirtyFields.add(e.target.id)}});
 async function f(p,o={}){try{const r=await fetch(API+p,{headers:{'Content-Type':'application/json'},...o});return await r.json()}catch(e){return null}}
 function fmtP(p){return typeof p==='number'?p.toFixed(4):parseFloat(p).toFixed(4)}
 function fmtS(s){const v=typeof s==='number'?s:parseFloat(s);return v>=1?v.toFixed(2):v>=0.01?v.toFixed(4):v.toFixed(6)}
+function toggleNewJobStrategy(){const dn=$('njStrat').value==='delta_neutral';document.querySelectorAll('.njArb').forEach(e=>e.style.display=dn?'none':'');document.querySelectorAll('.njDN').forEach(e=>e.style.display=dn?'':'none')}
 
 // ---- Markets cache ----
 const _marketsCache={};
@@ -227,18 +464,30 @@ async function loadMarkets(exSelId,instSelId){
   const syms=await fetchMarkets(ex);
   sel.innerHTML='';
   if(!syms.length){sel.innerHTML='<option value="">No markets</option>';return}
-  syms.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o)});
+  syms.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=(ex==='variational')?s.replace(/^P-/,'').replace(/-USDC-\d+$/,''):s;sel.appendChild(o)});
 }
 
 // ---- Modal ----
 async function showNewJobModal(){
   $('newJobModal').classList.add('show');
+  // Dynamically populate exchange dropdowns from API
+  const exData=await f('/exchanges');
+  const exList=(exData&&exData.exchanges)||['grvt','extended'];
+  const exLabels={grvt:'GRVT',extended:'Extended',nado:'NADO'};
+  for(const selId of ['njExA','njExB']){
+    const sel=$(selId);
+    const prev=sel.value;
+    sel.innerHTML='';
+    exList.forEach(ex=>{const o=document.createElement('option');o.value=ex;o.textContent=exLabels[ex]||ex.toUpperCase();sel.appendChild(o)});
+    if(prev&&exList.includes(prev))sel.value=prev;
+  }
   await Promise.all([loadMarkets('njExA','njInstA'),loadMarkets('njExB','njInstB')]);
 }
 function hideNewJobModal(){$('newJobModal').classList.remove('show')}
 
 async function createJob(){
   const hd=parseFloat($('njHD').value);
+  const strat=$('njStrat').value;
   const b={
     job_id:$('njId').value||undefined,
     name:$('njName').value||undefined,
@@ -246,8 +495,10 @@ async function createJob(){
     instrument_b:$('njInstB').value,
     leg_a_exchange:$('njExA').value,
     leg_b_exchange:$('njExB').value,
+    strategy:strat,
     spread_entry_low:parseFloat($('njES').value)||0.05,
     spread_exit_high:parseFloat($('njXS').value)||0.50,
+    max_spread_pct:parseFloat($('njMSP').value)||0.01,
     quantity:parseFloat($('njQ').value)||0.1,
     simulation_mode:$('njSim').value==='true',
     auto_trade:$('njAT').value==='true',
@@ -269,7 +520,8 @@ async function refreshJobList(){
     const t=document.createElement('div');
     t.className='tab'+(j.job_id===activeJobId?' active':'');
     t.dataset.jobId=j.job_id;
-    t.innerHTML='<span class="tab-status '+j.status+'"></span><span>'+j.name+'</span>'
+    const stratBadge=j.strategy==='delta_neutral'?' <span style="font-size:9px;padding:1px 4px;background:rgba(99,102,241,.2);color:#818cf8;border-radius:3px;margin-left:4px">DN</span>':'';
+    t.innerHTML='<span class="tab-status '+j.status+'"></span><span>'+j.name+stratBadge+'</span>'
       +(j.job_id!=='default'?'<span class="tab-close" onclick="event.stopPropagation();deleteJob(\''+j.job_id+'\')">&times;</span>':'');
     t.onclick=()=>switchTab(j.job_id);
     bar.appendChild(t);
@@ -330,9 +582,9 @@ function buildJobHTML(jid){
   <div class="card full">
     <div class="card-title">Live Spread Monitor <span class="badge" id="jStatus_${p}" style="margin-left:8px"></span></div>
     <div class="spread-row">
-      <div class="pb"><div class="lbl" id="jLblB_${p}">LEG B</div><div class="pr" id="jPrB_${p}">—</div><div class="inst"><span id="jIB_${p}">—</span> <span id="jExB_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
+      <div class="pb"><div id="jExShort_${p}" style="display:inline-block;background:rgba(239,68,68,.15);color:var(--red);font-size:11px;font-weight:700;padding:3px 10px;border-radius:5px;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">—</div><div class="lbl" style="color:var(--red)" id="jLblShort_${p}">SHORT (SELL)</div><div class="pr" style="color:var(--red)" id="jPrShort_${p}">—</div><div style="font-size:9px;color:var(--dim);margin-top:2px">BEST BID</div><div class="inst"><span id="jInstShort_${p}">—</span></div></div>
       <div class="sc"><div class="sv" id="jSVexec_${p}">—</div><div class="sl">EXEC SPREAD</div><div class="sv" id="jSV_${p}" style="font-size:14px;color:var(--dim);margin-top:4px">—</div><div class="sl" style="font-size:9px">MID SPREAD</div></div>
-      <div class="pb"><div class="lbl" id="jLblA_${p}">LEG A</div><div class="pr" id="jPrA_${p}">—</div><div class="inst"><span id="jIA_${p}">—</span> <span id="jExA_${p}" style="color:var(--accent);font-size:9px"></span></div></div>
+      <div class="pb"><div id="jExLong_${p}" style="display:inline-block;background:rgba(34,197,94,.15);color:var(--green);font-size:11px;font-weight:700;padding:3px 10px;border-radius:5px;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">—</div><div class="lbl" style="color:var(--green)" id="jLblLong_${p}">LONG (BUY)</div><div class="pr" style="color:var(--green)" id="jPrLong_${p}">—</div><div style="font-size:9px;color:var(--dim);margin-top:2px">BEST ASK</div><div class="inst"><span id="jInstLong_${p}">—</span></div></div>
     </div>
     <div class="sig none" id="jSig_${p}"><span class="dot"></span><span id="jSigTxt_${p}">Waiting...</span></div>
     <div class="pos-bar flat" id="jPos_${p}">No position</div>
@@ -378,12 +630,15 @@ function buildJobHTML(jid){
       </div>
     </div>
     <div class="cg">
-      <div class="fld"><label>Entry Min Spread ($)</label><input type="number" id="jES_${p}" step="0.01" title="Enter when spread diverges above this"></div>
-      <div class="fld"><label>Exit Max Spread ($)</label><input type="number" id="jXS_${p}" step="0.01" title="Exit when spread converges below this"></div>
+      <div class="fld"><label>Strategy</label><select id="jStrat_${p}" disabled><option value="arbitrage">Arbitrage</option><option value="delta_neutral">Delta-Neutral</option></select></div>
+      <div class="fld cfgArb_${p}"><label>Entry Min Spread ($)</label><input type="number" id="jES_${p}" step="0.01" title="Enter when spread diverges above this"></div>
+      <div class="fld cfgArb_${p}"><label>Exit Max Spread ($)</label><input type="number" id="jXS_${p}" step="0.01" title="Exit when spread converges below this"></div>
+      <div class="fld cfgDN_${p}" style="display:none"><label>Max Spread (%)</label><input type="number" id="jMSP_${p}" step="0.001" title="Max spread % for delta-neutral entry/exit"></div>
       <div class="fld"><label>Max Exec ($)</label><input type="number" id="jME_${p}" step="0.5"></div>
       <div class="fld"><label>Quantity</label><input type="number" id="jQ_${p}" step="0.001"></div>
       <div class="fld"><label>Order Type</label><select id="jOT_${p}"><option value="aggressive_limit">Aggressive Limit</option><option value="market">Market</option></select></div>
       <div class="fld"><label>Offset (ticks)</label><input type="number" id="jLOT_${p}" step="1" min="0"></div>
+      <div class="fld"><label>Signal Confirms</label><input type="number" id="jSC_${p}" step="1" min="1" title="Consecutive ticks confirming signal before executing"></div>
     </div>
     <div class="br">
       <button class="btn bp" onclick="saveJobCfg('${jid}')">Save Config</button>
@@ -398,8 +653,8 @@ function buildJobHTML(jid){
     </div>
   </div>
   <div class="card full">
-    <div class="card-title">Trade Log (Fill Prices)</div>
-    <div id="jTLog_${p}" style="max-height:300px;overflow-y:auto"><div class="empty">No trades yet.</div></div>
+    <div style="display:flex;align-items:center;justify-content:space-between"><div class="card-title" style="margin-bottom:0">Trade Log (Fill Prices)</div><button class="btn bo" style="font-size:10px;padding:4px 10px" onclick="clearTradeLog('${jid}')">Clear Logs</button></div>
+    <div id="jTLog_${p}" style="max-height:300px;overflow-y:auto;margin-top:10px"><div class="empty">No trades yet.</div></div>
   </div>
   <div class="card full">
     <div class="card-title">Event Log</div>
@@ -453,11 +708,22 @@ async function tickJob(jobId){
     const s=d.snapshot;
     const el=id=>$(id);
     if(s){
-      el('jPrA_'+p).textContent='$'+s.mid_price_a.toFixed(2);
-      el('jPrB_'+p).textContent='$'+s.mid_price_b.toFixed(2);
+      // SHORT = expensive side (sell at bid), LONG = cheap side (buy at ask)
+      if(s.a_is_cheaper){
+        // A cheap → LONG A (ask), SHORT B (bid)
+        el('jPrLong_'+p).textContent=s.best_ask_a.toFixed(4);
+        el('jPrShort_'+p).textContent=s.best_bid_b.toFixed(4);
+        el('jInstLong_'+p).textContent=s.instrument_a;
+        el('jInstShort_'+p).textContent=s.instrument_b;
+      }else{
+        // B cheap → LONG B (ask), SHORT A (bid)
+        el('jPrLong_'+p).textContent=s.best_ask_b.toFixed(4);
+        el('jPrShort_'+p).textContent=s.best_bid_a.toFixed(4);
+        el('jInstLong_'+p).textContent=s.instrument_b;
+        el('jInstShort_'+p).textContent=s.instrument_a;
+      }
       el('jSVexec_'+p).textContent='$'+Math.abs(s.exec_spread||0).toFixed(4);
-      el('jSV_'+p).textContent='$'+(s.spread||0).toFixed(4);
-      el('jIA_'+p).textContent=s.instrument_a;el('jIB_'+p).textContent=s.instrument_b;
+      el('jSV_'+p).textContent='$'+(s.spread||0).toFixed(4)+(s.spread_pct!=null?' ('+s.spread_pct.toFixed(4)+'%)':'');
       el('jSrc_'+p).textContent='Source: '+(s.data_source||'rest').toUpperCase();
     }
     const sig=el('jSig_'+p),stxt=el('jSigTxt_'+p);
@@ -469,30 +735,31 @@ async function tickJob(jobId){
   const st=await f('/jobs/'+jobId);
   if(st){
     const el=id=>$(id);
-    el('jExA_'+p).textContent=st.leg_a_exchange;el('jExB_'+p).textContent=st.leg_b_exchange;
     // Store exchange names for trade log header
     if(!jobState[jobId])jobState[jobId]={sHist:[],sseSource:null};
     jobState[jobId].legAExchange=st.leg_a_exchange;jobState[jobId].legBExchange=st.leg_b_exchange;
-    // Update LONG/SHORT labels based on current position or spread direction
-    const exA=(st.leg_a_exchange||'LEG A').toUpperCase();
-    const exB=(st.leg_b_exchange||'LEG B').toUpperCase();
-    if(st.has_position&&st.long_sym&&st.short_sym){
-      const aIsLong=st.long_sym===st.instrument_a;
-      const lblAEl=el('jLblA_'+p),lblBEl=el('jLblB_'+p);
-      if(lblAEl){lblAEl.textContent=exA+(aIsLong?' LONG':' SHORT');lblAEl.style.color=aIsLong?'var(--green)':'var(--red)'}
-      if(lblBEl){lblBEl.textContent=exB+(aIsLong?' SHORT':' LONG');lblBEl.style.color=aIsLong?'var(--red)':'var(--green)'}
-    }else{
-      const lblAEl=el('jLblA_'+p),lblBEl=el('jLblB_'+p);
-      if(lblAEl){lblAEl.textContent=exA;lblAEl.style.color=''}
-      if(lblBEl){lblBEl.textContent=exB;lblBEl.style.color=''}
+    // Update SHORT/LONG exchange labels based on last spread snapshot
+    const lastSnap=d&&d.snapshot?d.snapshot:null;
+    if(lastSnap){
+      if(lastSnap.a_is_cheaper){
+        el('jExLong_'+p).textContent=st.leg_a_exchange;
+        el('jExShort_'+p).textContent=st.leg_b_exchange;
+      }else{
+        el('jExLong_'+p).textContent=st.leg_b_exchange;
+        el('jExShort_'+p).textContent=st.leg_a_exchange;
+      }
     }
     const ae=document.activeElement;
-    const sf=id=>{const e=el(id);if(e&&e!==ae)return e;return null};
+    const sf=id=>{const e=el(id);if(e&&e!==ae&&!_dirtyFields.has(id))return e;return null};
     const sv=(id,v)=>{const e=sf(id);if(e)e.value=v};
     const sc=(id,v)=>{const e=sf(id);if(e)e.checked=v};
     sv('jES_'+p,st.spread_entry_low);sv('jXS_'+p,st.spread_exit_high);
     sv('jME_'+p,st.max_exec_spread);sv('jQ_'+p,st.quantity);
-    sv('jOT_'+p,st.order_type);sv('jLOT_'+p,st.limit_offset_ticks);
+    sv('jOT_'+p,st.order_type);sv('jLOT_'+p,st.limit_offset_ticks);sv('jSC_'+p,st.signal_confirmations);
+    sv('jStrat_'+p,st.strategy||'arbitrage');sv('jMSP_'+p,st.max_spread_pct||0.01);
+    const isDN=(st.strategy||'arbitrage')==='delta_neutral';
+    document.querySelectorAll('.cfgArb_'+p).forEach(e=>e.style.display=isDN?'none':'');
+    document.querySelectorAll('.cfgDN_'+p).forEach(e=>e.style.display=isDN?'':'none');
     sc('jAT_'+p,st.auto_trade);sc('jSim_'+p,st.simulation_mode);
     sv('jHD_'+p,st.hold_duration_h!=null?st.hold_duration_h:'');
     sv('jMES_'+p,st.min_exit_spread);
@@ -506,6 +773,7 @@ async function tickJob(jobId){
     if(st.has_position&&st.long_sym&&st.short_sym){
       pb.className='pos-bar open';
       let einfo=st.entry_spread_actual?' — Entry: $'+st.entry_spread_actual.toFixed(4):'';
+      if(st.entry_fill_long!=null&&st.entry_fill_short!=null)einfo+=' (L@$'+st.entry_fill_long.toFixed(4)+' S@$'+st.entry_fill_short.toFixed(4)+')';
       if(st.entry_time){const et=new Date(st.entry_time);const elapsed=((Date.now()-et.getTime())/3600000).toFixed(1);einfo+=' ('+elapsed+'h ago)'}
       pb.innerHTML='POSITION OPEN — <span class="pos-tag long">LONG '+st.long_sym+'</span> <span class="pos-tag short">SHORT '+st.short_sym+'</span>'+einfo;
     }else{pb.className='pos-bar flat';pb.textContent='No position'}
@@ -544,7 +812,7 @@ function renderJobOB(p,leg,data){
 
 function renderAcct(p,all){
   const el=$('jAcct_'+p);if(!el)return;
-  const exColors={grvt:'var(--accent)',extended:'var(--blue)'};
+  const exColors={grvt:'var(--accent)',extended:'var(--blue)',nado:'var(--yellow)'};
   let html='',totalEquity=0,totalPnl=0;
   for(const ex of all){
     const eq=parseFloat(ex.equity||0),av=parseFloat(ex.available||0),pnl=parseFloat(ex.unrealized_pnl||0);
@@ -572,14 +840,18 @@ function renderTradeLog(p,entries,jobId){
   const st2=(jobId&&jobState[jobId])||{};
   const legALabel=(st2.legAExchange||'Leg A').toUpperCase();
   const legBLabel=(st2.legBExchange||'Leg B').toUpperCase();
-  let html='<table class="tlog"><thead><tr><th>Time</th><th>Action</th><th>'+legALabel+' Fill</th><th>'+legBLabel+' Fill</th><th>Exec Spread</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
+  let html='<table class="tlog"><thead><tr><th>Time</th><th>Action</th><th>'+legALabel+' Fill</th><th>'+legBLabel+' Fill</th><th>Exec Spread</th><th>Qty</th><th>PnL</th><th>Status</th></tr></thead><tbody>';
   for(const e of entries){
     const ts=new Date(e.timestamp).toLocaleTimeString();
     const ac=e.action==='ENTRY'?'act-entry':'act-exit';
-    const fa=e.leg_a_fill_price!=null?'$'+parseFloat(e.leg_a_fill_price).toFixed(4):'—';
-    const fb=e.leg_b_fill_price!=null?'$'+parseFloat(e.leg_b_fill_price).toFixed(4):'—';
+    let fa=e.leg_a_fill_price!=null?'$'+parseFloat(e.leg_a_fill_price).toFixed(4):'—';
+    let fb=e.leg_b_fill_price!=null?'$'+parseFloat(e.leg_b_fill_price).toFixed(4):'—';
+    if(e.action==='EXIT'&&e.entry_fill_a!=null)fa+='<br><span class="dim" style="font-size:10px">entry $'+parseFloat(e.entry_fill_a).toFixed(4)+'</span>';
+    if(e.action==='EXIT'&&e.entry_fill_b!=null)fb+='<br><span class="dim" style="font-size:10px">entry $'+parseFloat(e.entry_fill_b).toFixed(4)+'</span>';
     const ok=e.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>';
-    html+='<tr><td>'+ts+'</td><td class="'+ac+'">'+e.action+'</td><td class="fill-price">'+fa+'</td><td class="fill-price">'+fb+'</td><td>$'+Math.abs(parseFloat(e.spread_at_execution)).toFixed(4)+'</td><td>'+e.quantity+'</td><td>'+ok+'</td></tr>';
+    let pnlStr='—';
+    if(e.pnl!=null){const v=parseFloat(e.pnl);pnlStr='<span style="color:'+(v>=0?'var(--green)':'var(--red)')+'">$'+v.toFixed(4)+'</span>';}
+    html+='<tr><td>'+ts+'</td><td class="'+ac+'">'+e.action+'</td><td class="fill-price">'+fa+'</td><td class="fill-price">'+fb+'</td><td>$'+Math.abs(parseFloat(e.spread_at_execution)).toFixed(4)+'</td><td>'+e.quantity+'</td><td>'+pnlStr+'</td><td>'+ok+'</td></tr>';
   }
   html+='</tbody></table>';
   el.innerHTML=html;
@@ -596,11 +868,13 @@ async function saveJobCfg(jobId){
     quantity:parseFloat($('jQ_'+p).value),
     order_type:$('jOT_'+p).value,
     limit_offset_ticks:parseInt($('jLOT_'+p).value),
+    signal_confirmations:parseInt($('jSC_'+p).value),
     hold_duration_h:isNaN(hd)?0:hd,
     min_exit_spread:parseFloat($('jMES_'+p).value),
+    max_spread_pct:parseFloat($('jMSP_'+p).value)||0.01,
   };
   const r=await f('/jobs/'+jobId+'/config',{method:'PUT',body:JSON.stringify(b)});
-  if(r&&r.status==='ok')jLog(jobId,'info','Config saved');
+  if(r&&r.status==='ok'){_dirtyFields.clear();jLog(jobId,'info','Config saved')}
   await tickJob(jobId);
 }
 
@@ -618,15 +892,29 @@ async function toggleJobSim(jobId){
 }
 
 async function manualJobEntry(jobId){
+  if(!confirm('Manual ENTRY at current spread?'))return;
   jLog(jobId,'info','Manual ENTRY triggered');
   const r=await f('/jobs/'+jobId+'/trigger',{method:'POST',body:JSON.stringify({action:'ENTRY'})});
   if(r){r.success?jLog(jobId,'success','ENTRY executed'):jLog(jobId,'error','ENTRY failed: '+r.error)}
   await tickJob(jobId);
 }
 async function manualJobExit(jobId){
-  jLog(jobId,'info','Manual EXIT triggered');
+  if(!confirm('Manual EXIT at current spread? (Auto-trading will be disabled)'))return;
+  // Disable auto-trading first to prevent immediate re-entry
+  await f('/jobs/'+jobId+'/config',{method:'PUT',body:JSON.stringify({auto_trade:false})});
+  const p=jobId.replace(/[^a-zA-Z0-9]/g,'_');
+  const cb=$('jAuto_'+p); if(cb) cb.checked=false;
+  jLog(jobId,'warn','Auto-trading DISABLED (Manual Exit)');
   const r=await f('/jobs/'+jobId+'/trigger',{method:'POST',body:JSON.stringify({action:'EXIT'})});
   if(r){r.success?jLog(jobId,'success','EXIT executed'):jLog(jobId,'error','EXIT failed: '+r.error)}
+  await tickJob(jobId);
+}
+
+async function clearTradeLog(jobId){
+  if(!confirm('Clear all trade logs for this job?'))return;
+  const r=await f('/jobs/'+jobId+'/log',{method:'DELETE'});
+  if(r&&r.status==='ok')jLog(jobId,'info','Trade log cleared');
+  else jLog(jobId,'error','Failed to clear trade log');
   await tickJob(jobId);
 }
 
@@ -646,8 +934,600 @@ async function tick(){
 
 function startR(){if(rInt)clearInterval(rInt);rInt=setInterval(tick,rMs)}
 
-async function init(){await tick();startR()}
+// ══════════════════════════════════════════════════════════
+// Funding-Arb Panel — Multi-Bot v2
+// ══════════════════════════════════════════════════════════
+
+let _fnView=false;
+let _fnTickInt=null;
+let _fnActiveBot=null;
+const _fnBotState={};
+const _fnLogCatColors={ORDER:'#6cabf7',FILL:'#4ade80',BOOK:'#a78bfa',ENGINE:'#fbbf24',ENTRY:'#4ade80',EXIT:'#f87171',RISK:'#fb923c',CHUNK:'#22d3ee',SIM:'#d4d4d4'};
+function _b(bid,sfx){return $(bid+'__'+sfx)}
+
+function switchMainView(view){
+  _fnView=(view==='fn');
+  const navArb=$('navArb');if(navArb)navArb.classList.toggle('active',!_fnView);
+  $('navFn').classList.toggle('active',_fnView);
+  $('arbView').style.display=_fnView?'none':'block';
+  $('fnView').classList.toggle('active',_fnView);
+  if(_fnView){fnRefreshBotList();if(!_fnTickInt)_fnTickInt=setInterval(fnTickActive,4000)}
+  else{fnStopAllSSE();if(_fnTickInt){clearInterval(_fnTickInt);_fnTickInt=null}}
+}
+
+async function fnRefreshBotList(){
+  const d=await f('/fn/bots');if(!d||!d.bots)return;
+  const bar=$('fnBotTabBar'),addBtn=bar.querySelector('.tab-add');
+  bar.querySelectorAll('.tab').forEach(t=>t.remove());
+  for(const b of d.bots){
+    const bid=b.bot_id;
+    if(!_fnBotState[bid])_fnBotState[bid]={sse:null,logSeq:0};
+    const t=document.createElement('div');t.className='tab'+(bid===_fnActiveBot?' active':'');t.dataset.botId=bid;
+    const sc=b.is_running?'monitoring':(b.state||'idle').toLowerCase();
+    t.innerHTML='<span class="tab-status '+sc+'"></span><span>'+bid+'</span><span class="tab-close" onclick="event.stopPropagation();fnDeleteBot(\''+bid+'\')">&times;</span>';
+    t.onclick=()=>fnSwitchBot(bid);bar.insertBefore(t,addBtn);
+  }
+  const panels=$('fnBotPanels');
+  for(const b of d.bots){if(!$('fnP_'+b.bot_id)){const div=document.createElement('div');div.id='fnP_'+b.bot_id;div.className='fn-panel';div.style.display='none';div.innerHTML=fnBuildBotHTML(b.bot_id);panels.appendChild(div)}}
+  panels.querySelectorAll('[id^="fnP_"]').forEach(p=>{const bid=p.id.replace('fnP_','');if(!d.bots.find(b=>b.bot_id===bid)){p.remove();delete _fnBotState[bid]}});
+  if(!_fnActiveBot&&d.bots.length)fnSwitchBot(d.bots[0].bot_id);
+  else if(_fnActiveBot)fnSwitchBot(_fnActiveBot);
+  $('envBadge').textContent=d.bots.length+' bot'+(d.bots.length!==1?'s':'');
+}
+
+function fnSwitchBot(bid){
+  _fnActiveBot=bid;
+  document.querySelectorAll('#fnBotPanels > .fn-panel').forEach(p=>p.style.display='none');
+  const panel=$('fnP_'+bid);if(panel)panel.style.display='block';
+  $('fnBotTabBar').querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.botId===bid));
+  fnStartBotSSE(bid);fnStartObWS(bid);fnTickBot(bid);
+}
+
+async function fnShowCreateBot(){const bid=prompt('Bot ID (e.g. bot1):');if(!bid)return;const r=await f('/fn/bots',{method:'POST',body:JSON.stringify({bot_id:bid})});if(r&&r.success){await fnRefreshBotList();fnSwitchBot(bid)}else alert('Create failed: '+(r?r.detail||JSON.stringify(r):'error'))}
+async function fnDeleteBot(bid){if(!confirm('Delete bot "'+bid+'"?'))return;const r=await f('/fn/bots/'+encodeURIComponent(bid),{method:'DELETE'});if(r&&r.success){if(_fnBotState[bid]&&_fnBotState[bid].sse)_fnBotState[bid].sse.close();delete _fnBotState[bid];if(_fnActiveBot===bid)_fnActiveBot=null;await fnRefreshBotList()}else alert('Delete failed: '+(r?r.detail||JSON.stringify(r):'error'))}
+
+function fnStartBotSSE(bid){
+  for(const[id,st]of Object.entries(_fnBotState)){if(st.sse&&id!==bid){st.sse.close();st.sse=null}}
+  const st=_fnBotState[bid];if(!st||st.sse)return;
+  const es=new EventSource(API+'/fn/bots/'+encodeURIComponent(bid)+'/stream?interval_ms=2000');
+  es.onmessage=function(e){try{const d=JSON.parse(e.data);if(!d.error)fnUpdateLive(bid,d)}catch(x){}};
+  es.onerror=function(){es.close();st.sse=null;setTimeout(()=>{if(_fnActiveBot===bid&&_fnView)fnStartBotSSE(bid)},5000)};
+  st.sse=es;
+}
+function fnStopAllSSE(){for(const st of Object.values(_fnBotState)){if(st.sse){st.sse.close();st.sse=null}if(st.obWs){st.obWs.close();st.obWs=null}}}
+
+function fnStartObWS(bid){
+  // Close any existing OB WS for other bots
+  for(const[id,st]of Object.entries(_fnBotState)){if(st.obWs&&id!==bid){st.obWs.close();st.obWs=null}}
+  const st=_fnBotState[bid];if(!st||st.obWs)return;
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  const wsUrl=proto+'//'+location.host+'/fn/bots/'+encodeURIComponent(bid)+'/ws/orderbooks';
+  const ws=new WebSocket(wsUrl);
+  ws.onmessage=function(e){try{const d=JSON.parse(e.data);fnRenderOrderbooks(bid,d)}catch(x){}};
+  ws.onerror=function(){ws.close()};
+  ws.onclose=function(){if(st.obWs===ws)st.obWs=null;setTimeout(()=>{if(_fnActiveBot===bid&&_fnView)fnStartObWS(bid)},3000)};
+  st.obWs=ws;
+}
+
+// ---- Per-bot HTML builder ----
+function fnBuildBotHTML(bid){
+  const p=bid;
+  return `
+  <div class="fn-timer-bar">
+    <div class="fn-timer-left">
+      <div class="fn-status-dot idle" id="${p}__Dot"></div>
+      <div><div class="fn-state-label" id="${p}__StateLabel">IDLE</div><div class="fn-stop-reason" id="${p}__StopReason" style="display:none"></div></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:14px">
+      <div class="fn-timer-adjust">
+        <input type="number" id="${p}__AdjH" min="0" max="99" step="1" value="1" class="fn-timer-input" title="Hours">
+        <span class="fn-timer-unit">h</span>
+        <input type="number" id="${p}__AdjM" min="0" max="59" step="5" value="0" class="fn-timer-input" title="Minutes">
+        <span class="fn-timer-unit">m</span>
+        <button class="btn fn-timer-adj-btn" onclick="fnAdjustTimer('${bid}')" title="Set new timer from now">Adjust</button>
+        <span id="${p}__AdjStatus" style="font-size:10px;color:var(--dim);margin-left:4px"></span>
+      </div>
+      <div style="text-align:right"><div class="fn-timer-countdown" id="${p}__Countdown">--:--:--</div><div class="fn-timer-sub" id="${p}__TimerSub">No timer set</div></div>
+    </div>
+  </div>
+  <div class="card fn-full" style="margin-bottom:16px">
+    <div class="card-title">Configuration</div>
+    <div class="fn-input-grid">
+      <div class="fld"><label>Long Exchange</label><select id="${p}__LongExch" onchange="fnLoadMarkets('${p}__LongExch','${p}__InstA')"><option value="">default</option><option value="extended">Extended</option><option value="grvt">GRVT</option><option value="nado">NADO</option><option value="variational">Variational</option></select></div>
+      <div class="fld"><label>Instrument (Long)</label><select id="${p}__InstA"><option value="">default</option></select></div>
+      <div class="fld"><label>Short Exchange</label><select id="${p}__ShortExch" onchange="fnLoadMarkets('${p}__ShortExch','${p}__InstB')"><option value="">default</option><option value="extended">Extended</option><option value="grvt">GRVT</option><option value="nado">NADO</option><option value="variational">Variational</option></select></div>
+      <div class="fld"><label>Instrument (Short)</label><select id="${p}__InstB"><option value="">default</option></select></div>
+      <div class="fld"><label>Maker Exchange</label><select id="${p}__MakerExch"><option value="">default</option><option value="extended">Extended</option><option value="grvt">GRVT</option><option value="nado">NADO</option><option value="variational">Variational</option></select></div>
+      <div class="fld"><label>Leverage Long</label><input type="number" id="${p}__LevLong" value="25" min="1" max="50" step="1"></div>
+      <div class="fld"><label>Leverage Short</label><input type="number" id="${p}__LevShort" value="25" min="1" max="50" step="1"></div>
+      <div class="fld"><label>Duration (h)</label><input type="number" id="${p}__DurH" value="1" min="0" step="1"></div>
+      <div class="fld"><label>Duration (m)</label><input type="number" id="${p}__DurM" value="0" min="0" step="5"></div>
+      <div class="fld"><label>Quantity</label><input type="number" id="${p}__Qty" value="20" step="0.001" placeholder="default"></div>
+      <div class="fld"><label>TWAP Chunks</label><input type="number" id="${p}__Chunks" value="10" min="1" max="100" step="1"></div>
+      <div class="fld"><label>Chunk Interval (s)</label><input type="number" id="${p}__ChunkInterval" value="10" min="0.5" max="60" step="0.5"></div>
+      <div class="fld"><label>Max Spread ($)</label><input type="number" id="${p}__MaxSpreadUsd" value="1.0" min="0" step="0.01" title="Max absolute cross-exchange spread in USD per chunk"></div>
+      <div class="fld"><label>Max Spread (%)</label><input type="number" id="${p}__MaxSpreadPct" value="0.05" min="0" step="0.001" title="Max spread as % of mid-price per chunk"></div>
+      <div class="fld" style="grid-column:span 3;display:flex;align-items:flex-end;gap:10px">
+        <button class="btn" id="${p}__SaveBtn" onclick="fnSaveConfig('${bid}')" style="background:var(--accent);color:#000;font-weight:700;padding:10px 24px">Save Config</button>
+        <span id="${p}__SaveStatus" style="font-size:11px;color:var(--dim)"></span>
+      </div>
+    </div>
+  </div>
+  <div class="card fn-full" id="${p}__ObCard" style="display:none;margin-bottom:16px">
+    <div class="card-title">Live Order Books <span id="${p}__ObSrc" style="font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600;margin-left:6px;background:rgba(139,143,163,.15);color:var(--dim)">--</span></div>
+    <div class="ob-grid">
+      <div class="ob-panel">
+        <div class="ob-header"><span class="ob-title" id="${p}__ObTitleLong">LONG</span><span class="ob-src" id="${p}__ObSrcLong">--</span></div>
+        <div class="ob-side ob-asks" id="${p}__ObAsksLong"><div class="ob-side-hdr"><span>PRICE</span><span>SIZE</span></div></div>
+        <div class="ob-spread-row" id="${p}__ObSpreadLong">--</div>
+        <div class="ob-side ob-bids" id="${p}__ObBidsLong"><div class="ob-side-hdr"><span>PRICE</span><span>SIZE</span></div></div>
+      </div>
+      <div class="ob-panel">
+        <div class="ob-header"><span class="ob-title" id="${p}__ObTitleShort">SHORT</span><span class="ob-src" id="${p}__ObSrcShort">--</span></div>
+        <div class="ob-side ob-asks" id="${p}__ObAsksShort"><div class="ob-side-hdr"><span>PRICE</span><span>SIZE</span></div></div>
+        <div class="ob-spread-row" id="${p}__ObSpreadShort">--</div>
+        <div class="ob-side ob-bids" id="${p}__ObBidsShort"><div class="ob-side-hdr"><span>PRICE</span><span>SIZE</span></div></div>
+      </div>
+    </div>
+  </div>
+  <div id="${p}__Dashboard" style="display:none">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:10px">
+      <div class="fn-controls">
+        <button class="btn bs" id="${p}__StartBtn" onclick="fnStart('${bid}')" disabled>Start Bot</button>
+        <button class="btn bd" id="${p}__StopBtn" onclick="fnStop('${bid}')" disabled>Stop Bot</button>
+        <button class="btn" id="${p}__KillBtn" onclick="fnKill('${bid}')" disabled style="background:#b91c1c;color:#fff;font-weight:600">Kill</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <div style="display:flex;align-items:center;gap:6px;font-size:11px"><span id="${p}__FeedDotA" style="width:8px;height:8px;border-radius:50%;background:var(--red);display:inline-block"></span><span id="${p}__FeedLabelA" style="color:var(--dim)">OB Feed A: --</span></div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:11px"><span id="${p}__FeedDotB" style="width:8px;height:8px;border-radius:50%;background:var(--red);display:inline-block"></span><span id="${p}__FeedLabelB" style="color:var(--dim)">OB Feed B: --</span></div>
+      </div>
+      <div id="${p}__ConfigSummary" style="font-size:11px;color:var(--dim);flex:1"></div>
+    </div>
+    <div class="card fn-full" style="margin-bottom:16px">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center"><span>Activity Log</span>
+        <button onclick="var el=document.getElementById('${p}__LogBody');el.innerHTML='<div class=\\'empty\\'>Waiting for activity...</div>';if(_fnBotState['${bid}'])_fnBotState['${bid}'].logSeq=0" style="background:none;border:1px solid var(--border);color:var(--dim);font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer">Clear</button>
+      </div>
+      <div id="${p}__LogBody" style="max-height:220px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--dim)"><div class="empty">Waiting for activity...</div></div>
+    </div>
+    <div class="card fn-full" style="margin-bottom:16px">
+      <div class="card-title">Live Prices</div>
+      <div class="fn-rate-cards">
+        <div class="fn-rate-card"><div class="fn-rc-exch" id="${p}__PriceExchA">--</div><div class="fn-rc-rate" id="${p}__PriceMidA" style="color:var(--text)">--</div><div class="fn-rc-label" id="${p}__PriceSpreadA" style="font-size:10px">bid -- / ask --</div></div>
+        <div class="fn-spread-box"><div class="fn-sp-val" id="${p}__PriceSpread">--</div><div class="fn-sp-lbl">PRICE SPREAD</div></div>
+        <div class="fn-rate-card"><div class="fn-rc-exch" id="${p}__PriceExchB">--</div><div class="fn-rc-rate" id="${p}__PriceMidB" style="color:var(--text)">--</div><div class="fn-rc-label" id="${p}__PriceSpreadB" style="font-size:10px">bid -- / ask --</div></div>
+      </div>
+    </div>
+    <div class="fn-grid">
+      <div class="card fn-full"><div class="card-title">Funding Rates</div>
+        <div class="fn-rate-cards">
+          <div class="fn-rate-card"><div class="fn-rc-exch" id="${p}__RateExchA">--</div><div class="fn-rc-rate" id="${p}__RateA" style="color:var(--dim)">--.----%</div><div class="fn-rc-label" id="${p}__RateInstA">--</div></div>
+          <div class="fn-spread-box"><div class="fn-sp-val" id="${p}__RateSpread">--</div><div class="fn-sp-lbl">SPREAD (ann.)</div></div>
+          <div class="fn-rate-card"><div class="fn-rc-exch" id="${p}__RateExchB">--</div><div class="fn-rc-rate" id="${p}__RateB" style="color:var(--dim)">--.----%</div><div class="fn-rc-label" id="${p}__RateInstB">--</div></div>
+        </div>
+        <div class="fn-suggestion neutral" id="${p}__Suggestion">Waiting for data...</div>
+      </div>
+      <div class="card"><div class="card-title">Position &amp; PnL</div><div id="${p}__Position"><div class="empty">No position</div></div></div>
+      <div class="card"><div class="card-title">Risk</div>
+        <div class="fn-risk-grid">
+          <div class="fn-risk-item"><div class="fn-ri-val" id="${p}__Delta">--</div><div class="fn-ri-lbl">DELTA ($)</div></div>
+          <div class="fn-risk-item"><div class="fn-ri-val" id="${p}__Pnl">--</div><div class="fn-ri-lbl">CUM. PnL</div></div>
+          <div class="fn-risk-item"><div class="fn-ri-val" id="${p}__Halted">--</div><div class="fn-ri-lbl">HALTED</div></div>
+          <div class="fn-risk-item"><div class="fn-ri-val" id="${p}__SpreadPct">--</div><div class="fn-ri-lbl">SPREAD %</div></div>
+        </div>
+      </div>
+      <div class="card fn-full"><div class="card-title">Execution Status</div><div id="${p}__Execution"><div class="empty">No active execution</div></div></div>
+      <div class="card"><div class="card-title">Engine Config</div><div id="${p}__Config" style="font-size:11px;color:var(--dim)"><div class="empty">Loading...</div></div></div>
+      <div class="card"><div class="card-title">Leverage</div>
+        <div class="fn-pos-row">
+          <div class="fn-pos-card"><div class="fn-pc-hdr"><span class="fn-pc-side long">LONG</span><span class="fn-pc-exch" id="${p}__LevLongExch">--</span></div><div class="fn-pc-qty" id="${p}__LevLongVal">--x</div></div>
+          <div class="fn-pos-card"><div class="fn-pc-hdr"><span class="fn-pc-side short">SHORT</span><span class="fn-pc-exch" id="${p}__LevShortExch">--</span></div><div class="fn-pc-qty" id="${p}__LevShortVal">--x</div></div>
+        </div>
+      </div>
+      <div class="card fn-full"><div class="card-title">Trade Log</div><div class="fn-log" id="${p}__TradeLog"><div class="empty">No trades yet.</div></div></div>
+    </div>
+  </div>`;
+}
+
+function fnUpdateLive(bid,d){
+  const state=(d.state||'IDLE').toUpperCase(),running=d.is_running||false;
+  const dot=_b(bid,'Dot');if(dot)dot.className='fn-status-dot '+(running?(state==='ENTERING'?'entering':state==='EXITING'?'exiting':'running'):'idle');
+  const sl=_b(bid,'StateLabel');if(sl)sl.textContent=running?state+' (RUNNING)':state;
+  fnRenderTimer(bid,d.timer||{},running);
+  const lev=d.leverage||{};
+  const llv=_b(bid,'LevLongVal');if(llv)llv.textContent=(lev.long||'--')+'x';
+  const lsv=_b(bid,'LevShortVal');if(lsv)lsv.textContent=(lev.short||'--')+'x';
+  fnRenderPrices(bid,d.prices||{});
+  fnRenderPositionPnl(bid,d.position||{},d.pnl||{});
+  const risk=d.risk||{};
+  const dEl=_b(bid,'Delta');if(dEl)dEl.textContent=risk.delta_usd!=null?'$'+parseFloat(risk.delta_usd).toFixed(2):'--';
+  const pEl=_b(bid,'Pnl');if(pEl)pEl.textContent=risk.cumulative_pnl!=null?'$'+parseFloat(risk.cumulative_pnl).toFixed(2):'--';
+  const hEl=_b(bid,'Halted');if(hEl){hEl.textContent=risk.halted?'YES':'NO';hEl.style.color=risk.halted?'var(--red)':'var(--green)'}
+  const feedsReady=d.feeds_ready||false;
+  fnRenderFeedStatus(bid,d.data||{});
+  // Render orderbooks from SSE as fallback if dedicated OB WS is not connected
+  const bst=_fnBotState[bid];if(d.orderbooks&&(!bst||!bst.obWs||bst.obWs.readyState!==1))fnRenderOrderbooks(bid,d.orderbooks);
+  const stBtn=_b(bid,'StartBtn');if(stBtn){stBtn.disabled=running||state==='HOLDING'||!feedsReady;stBtn.title=feedsReady?'':'Waiting for orderbook WS feeds...'}
+  const spBtn=_b(bid,'StopBtn');if(spBtn)spBtn.disabled=!running&&state!=='HOLDING';
+  const kBtn=_b(bid,'KillBtn');if(kBtn)kBtn.disabled=state==='IDLE';
+  fnRenderActivityLog(bid,d.activity_log||[]);
+  const cfg=d.config||{};
+  if(cfg.instrument_a&&cfg.instrument_b){const db=_b(bid,'Dashboard');if(db)db.style.display='block'}
+  if(cfg&&cfg.long_exchange){const cs=_b(bid,'ConfigSummary');if(cs)cs.innerHTML='<b>'+cfg.long_exchange+'</b>:'+cfg.instrument_a+' / <b>'+cfg.short_exchange+'</b>:'+cfg.instrument_b+' &mdash; Qty: '+cfg.quantity+' &mdash; Lev: '+lev.long+'x/'+lev.short+'x'}
+  const exec=d.execution||{},execEl=_b(bid,'Execution');
+  if(execEl){if(exec.state&&exec.state!=='IDLE'){execEl.innerHTML='<div style="font-size:12px"><b>State:</b> '+exec.state+(exec.current_chunk!=null?' &mdash; Chunk '+(exec.current_chunk+1)+'/'+exec.total_chunks:'')+(exec.maker_status?' &mdash; Maker: '+exec.maker_status:'')+'</div>'}else{execEl.innerHTML='<div class="empty">No active execution</div>'}}
+  const tab=$('fnBotTabBar').querySelector('.tab[data-bot-id="'+bid+'"] .tab-status');
+  if(tab)tab.className='tab-status '+(running?'monitoring':(state||'idle').toLowerCase());
+}
+
+function fnRenderActivityLog(bid,entries){
+  if(!entries||!entries.length)return;
+  const el=_b(bid,'LogBody');if(!el)return;
+  const st=_fnBotState[bid];if(!st)return;
+  const empty=el.querySelector('.empty');if(empty)empty.remove();
+  let html='';
+  for(const e of entries){
+    if(e.seq<=st.logSeq)continue;st.logSeq=e.seq;
+    const d=new Date(e.ts*1000);
+    const ts=d.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'.'+String(d.getMilliseconds()).padStart(3,'0');
+    const cc=_fnLogCatColors[e.cat]||'#9ca3af';
+    const lvl=(e.extra&&e.extra.level)||'';
+    const msgColor=lvl==='error'?'var(--red)':lvl==='warn'?'var(--yellow)':'var(--text)';
+    html+='<div style="display:flex;gap:8px;border-bottom:1px solid var(--border);padding:2px 0"><span style="color:var(--dim);min-width:90px">'+ts+'</span><span style="color:'+cc+';min-width:55px;font-weight:600">'+e.cat+'</span><span style="color:'+msgColor+'">'+e.msg+'</span></div>';
+  }
+  if(html){const atBottom=el.scrollHeight-el.scrollTop-el.clientHeight<30;el.insertAdjacentHTML('beforeend',html);if(atBottom)el.scrollTop=el.scrollHeight}
+}
+
+function fnRenderFeedStatus(bid,data){
+  const obs=data.orderbooks||{},keys=Object.keys(obs);
+  const dotA=_b(bid,'FeedDotA'),lblA=_b(bid,'FeedLabelA'),dotB=_b(bid,'FeedDotB'),lblB=_b(bid,'FeedLabelB');
+  if(keys.length>=1&&dotA){const a=obs[keys[0]],okA=a.connected&&a.synced;dotA.style.background=okA?'var(--green)':'var(--red)';const exA=keys[0].split(':')[0].toUpperCase();lblA.textContent=exA+' OB: '+(okA?'Connected'+(a.updates?' ('+a.updates+')':''):'Connecting...');lblA.style.color=okA?'var(--green)':'var(--red)'}
+  if(keys.length>=2&&dotB){const b=obs[keys[1]],okB=b.connected&&b.synced;dotB.style.background=okB?'var(--green)':'var(--red)';const exB=keys[1].split(':')[0].toUpperCase();lblB.textContent=exB+' OB: '+(okB?'Connected'+(b.updates?' ('+b.updates+')':''):'Connecting...');lblB.style.color=okB?'var(--green)':'var(--red)'}
+}
+
+function fnRenderOrderbooks(bid,obs){
+  const card=_b(bid,'ObCard');if(!card)return;
+  if(!obs||(!obs.long&&!obs.short)){return}
+  card.style.display='';
+  function renderSide(prefix,ob){
+    if(!ob||!ob.exchange)return;
+    const title=_b(bid,'ObTitle'+prefix);if(title)title.textContent=(ob.exchange||'').toUpperCase()+' — '+prefix.toUpperCase();
+    const srcBadge=_b(bid,'ObSrc'+prefix);
+    if(srcBadge){srcBadge.textContent=ob.connected?(ob.synced?'WS':'WS ⚠'):'OFF';srcBadge.className='ob-src '+(ob.connected&&ob.synced?'ws':'rest')}
+    const bids=ob.bids||[],asks=ob.asks||[];
+    const allSizes=[...bids,...asks].map(l=>l[1]);
+    const maxSize=Math.max(...allSizes,0.001);
+    const dp=bids.length&&bids[0][0]>1000?2:(bids.length&&bids[0][0]>10?4:4);
+    // Asks: reversed so lowest ask is at bottom (near spread)
+    const asksEl=_b(bid,'ObAsks'+prefix);
+    if(asksEl){
+      let h='<div class="ob-side-hdr"><span>PRICE</span><span>SIZE</span></div>';
+      const rev=[...asks].reverse();
+      for(const[p,s]of rev){const pct=(s/maxSize*100).toFixed(1);h+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+parseFloat(p).toFixed(dp)+'</span><span class="ob-size">'+parseFloat(s).toFixed(4)+'</span></div>'}
+      asksEl.innerHTML=h;
+    }
+    // Spread
+    const spEl=_b(bid,'ObSpread'+prefix);
+    if(spEl&&bids.length&&asks.length){const spread=(asks[0][0]-bids[0][0]).toFixed(dp);spEl.textContent='Spread: '+spread}
+    // Bids: top bid first
+    const bidsEl=_b(bid,'ObBids'+prefix);
+    if(bidsEl){
+      let h='<div class="ob-side-hdr"><span>PRICE</span><span>SIZE</span></div>';
+      for(const[p,s]of bids){const pct=(s/maxSize*100).toFixed(1);h+='<div class="ob-row"><div class="ob-bar" style="width:'+pct+'%"></div><span class="ob-price">'+parseFloat(p).toFixed(dp)+'</span><span class="ob-size">'+parseFloat(s).toFixed(4)+'</span></div>'}
+      bidsEl.innerHTML=h;
+    }
+  }
+  renderSide('Long',obs.long);
+  renderSide('Short',obs.short);
+  const srcMain=_b(bid,'ObSrc');
+  if(srcMain){const lc=obs.long&&obs.long.connected,sc=obs.short&&obs.short.connected;srcMain.textContent=lc&&sc?'LIVE':'CONNECTING';srcMain.style.background=lc&&sc?'rgba(34,197,94,.15)':'rgba(139,143,163,.15)';srcMain.style.color=lc&&sc?'var(--green)':'var(--dim)'}
+}
+
+function fnRenderPrices(bid,prices){
+  const exchs=Object.keys(prices);
+  if(exchs.length>=1){const a=prices[exchs[0]]||{};const eA=_b(bid,'PriceExchA');if(eA)eA.textContent=exchs[0].toUpperCase();const mA=_b(bid,'PriceMidA');if(mA)mA.textContent=a.mid!=null?'$'+parseFloat(a.mid).toFixed(2):'--';const sA=_b(bid,'PriceSpreadA');if(sA)sA.textContent='bid '+(a.best_bid!=null?parseFloat(a.best_bid).toFixed(2):'--')+' / ask '+(a.best_ask!=null?parseFloat(a.best_ask).toFixed(2):'--')}
+  if(exchs.length>=2){const b=prices[exchs[1]]||{};const eB=_b(bid,'PriceExchB');if(eB)eB.textContent=exchs[1].toUpperCase();const mB=_b(bid,'PriceMidB');if(mB)mB.textContent=b.mid!=null?'$'+parseFloat(b.mid).toFixed(2):'--';const sB=_b(bid,'PriceSpreadB');if(sB)sB.textContent='bid '+(b.best_bid!=null?parseFloat(b.best_bid).toFixed(2):'--')+' / ask '+(b.best_ask!=null?parseFloat(b.best_ask).toFixed(2):'--');const pa=prices[exchs[0]]||{};if(pa.mid!=null&&b.mid!=null){const sp=Math.abs(pa.mid-b.mid);const psEl=_b(bid,'PriceSpread');if(psEl){psEl.textContent='$'+sp.toFixed(2);psEl.style.color=sp>5?'var(--yellow)':'var(--dim)'}}}
+}
+
+function fnRenderPositionPnl(bid,pos,pnl){
+  const posEl=_b(bid,'Position');if(!posEl)return;
+  if(pos.long_qty&&parseFloat(pos.long_qty)!==0){
+    const le=pos.long_entry_price?parseFloat(pos.long_entry_price):0,se=pos.short_entry_price?parseFloat(pos.short_entry_price):0;
+    const lp=pnl.long_pnl||0,sp=pnl.short_pnl||0,tp=pnl.total_pnl||0,pnlColor=tp>=0?'var(--green)':'var(--red)';
+    posEl.innerHTML='<div class="fn-pos-row"><div class="fn-pos-card"><div class="fn-pc-hdr"><span class="fn-pc-side long">LONG</span><span class="fn-pc-exch">'+(pos.long_exchange||'')+'</span></div><div class="fn-pc-qty">'+parseFloat(pos.long_qty).toFixed(4)+'</div><div class="fn-pc-info">'+(pos.long_symbol||'')+'</div>'+(le?'<div class="fn-pc-info">Entry: <b>$'+le.toFixed(2)+'</b></div>':'')+'<div class="fn-pc-info" style="color:'+(lp>=0?'var(--green)':'var(--red)')+'">PnL: $'+lp.toFixed(4)+'</div></div><div class="fn-pos-card"><div class="fn-pc-hdr"><span class="fn-pc-side short">SHORT</span><span class="fn-pc-exch">'+(pos.short_exchange||'')+'</span></div><div class="fn-pc-qty">'+parseFloat(pos.short_qty).toFixed(4)+'</div><div class="fn-pc-info">'+(pos.short_symbol||'')+'</div>'+(se?'<div class="fn-pc-info">Entry: <b>$'+se.toFixed(2)+'</b></div>':'')+'<div class="fn-pc-info" style="color:'+(sp>=0?'var(--green)':'var(--red)')+'">PnL: $'+sp.toFixed(4)+'</div></div></div><div style="text-align:center;margin-top:8px;font-size:16px;font-weight:800;color:'+pnlColor+'">Total PnL: $'+tp.toFixed(4)+'</div>';
+  }else{posEl.innerHTML='<div class="empty">No position</div>'}
+}
+
+function fnRenderTimer(bid,timer,running){
+  const cd=_b(bid,'Countdown'),sub=_b(bid,'TimerSub'),sr=_b(bid,'StopReason');if(!cd)return;
+  if(timer.remaining_s!=null){const t=Math.round(timer.remaining_s),h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=t%60;cd.textContent=String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');cd.style.color=running?'var(--accent)':'var(--yellow)';sub.textContent=running?'Remaining ('+(timer.duration_h||0)+'h '+(timer.duration_m||0)+'m total)':'Timer active (bot not running)'}
+  else if(running&&timer.expires_at==null){cd.textContent='\u221E';cd.style.color='var(--green)';sub.textContent='Running indefinitely'}
+  else{cd.textContent='--:--:--';cd.style.color='var(--dim)';sub.textContent='No timer set'}
+  if(sr){if(timer.stop_reason&&!running){sr.textContent='Stopped: '+timer.stop_reason;sr.style.display='block'}else{sr.style.display='none'}}
+  // Pre-fill adjust inputs from remaining time (only if not focused)
+  const ae=document.activeElement;
+  const adjH=_b(bid,'AdjH'),adjM=_b(bid,'AdjM');
+  if(timer.remaining_s!=null&&adjH&&adjH!==ae&&adjM&&adjM!==ae){const rt=Math.round(timer.remaining_s);adjH.value=Math.floor(rt/3600);adjM.value=Math.floor((rt%3600)/60)}
+}
+
+// ---- REST tick for active bot ----
+async function fnTickActive(){if(_fnActiveBot)await fnTickBot(_fnActiveBot)}
+
+async function fnTickBot(bid){
+  const d=await f('/fn/bots/'+encodeURIComponent(bid)+'/status');
+  if(!d)return;
+  fnRenderBotStatus(bid,d);
+  await fnTickFunding(bid);
+  await fnTickTrades(bid);
+}
+
+function fnRenderBotStatus(bid,d){
+  const state=(d.state||'IDLE').toUpperCase(),running=d.is_running||false;
+  const dot=_b(bid,'Dot');if(dot)dot.className='fn-status-dot '+(running?(state==='ENTERING'?'entering':state==='EXITING'?'exiting':'running'):'idle');
+  const sl=_b(bid,'StateLabel');if(sl)sl.textContent=running?state+' (RUNNING)':state;
+  const feedsReady=d.feeds_ready||false;
+  fnRenderFeedStatus(bid,d.data||{});
+  const stBtn=_b(bid,'StartBtn');if(stBtn){stBtn.disabled=running||state==='HOLDING'||!feedsReady;stBtn.title=feedsReady?'':'Waiting for orderbook WS feeds...'}
+  const spBtn=_b(bid,'StopBtn');if(spBtn)spBtn.disabled=!running&&state!=='HOLDING';
+  const kBtn=_b(bid,'KillBtn');if(kBtn)kBtn.disabled=state==='IDLE';
+  fnRenderActivityLog(bid,d.activity_log||[]);
+  fnRenderTimer(bid,d.timer||{},running);
+  const lev=d.leverage||{},cfg=d.config||{};
+  const llv=_b(bid,'LevLongVal');if(llv)llv.textContent=(lev.long||'--')+'x';
+  const lsv=_b(bid,'LevShortVal');if(lsv)lsv.textContent=(lev.short||'--')+'x';
+  const lle=_b(bid,'LevLongExch');if(lle)lle.textContent=cfg.long_exchange||'--';
+  const lse=_b(bid,'LevShortExch');if(lse)lse.textContent=cfg.short_exchange||'--';
+  const cfgEl=_b(bid,'Config');
+  if(cfgEl&&cfg&&cfg.long_exchange){cfgEl.innerHTML='<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 12px"><span>Long: <b>'+cfg.long_exchange+'</b></span><span>Short: <b>'+cfg.short_exchange+'</b></span><span>Maker: <b>'+cfg.maker_exchange+'</b></span><span>Qty: <b>'+cfg.quantity+'</b></span><span>Inst A: <b>'+cfg.instrument_a+'</b></span><span>Inst B: <b>'+cfg.instrument_b+'</b></span><span>Chunks: <b>'+cfg.twap_num_chunks+'</b></span><span>Sim: <b>'+(cfg.simulation?'ON':'OFF')+'</b></span><span>MaxSpread: <b>$'+(cfg.max_chunk_spread_usd||'--')+' / '+(cfg.max_spread_pct||'--')+'%</b></span></div>'}
+  if(cfg.max_chunk_spread_usd!=null){const el=_b(bid,'MaxSpreadUsd');if(el&&!document.activeElement?.isSameNode(el))el.value=cfg.max_chunk_spread_usd}
+  if(cfg.max_spread_pct!=null){const el=_b(bid,'MaxSpreadPct');if(el&&!document.activeElement?.isSameNode(el))el.value=cfg.max_spread_pct}
+  if(cfg.twap_interval_s!=null){const el=_b(bid,'ChunkInterval');if(el&&!document.activeElement?.isSameNode(el))el.value=cfg.twap_interval_s}
+  if(cfg.twap_num_chunks!=null){const el=_b(bid,'Chunks');if(el&&!document.activeElement?.isSameNode(el))el.value=cfg.twap_num_chunks}
+  if(cfg.quantity!=null){const el=_b(bid,'Qty');if(el&&!document.activeElement?.isSameNode(el))el.value=cfg.quantity}
+  if(cfg&&cfg.long_exchange){const cs=_b(bid,'ConfigSummary');if(cs)cs.innerHTML='<b>'+cfg.long_exchange+'</b>:'+cfg.instrument_a+' / <b>'+cfg.short_exchange+'</b>:'+cfg.instrument_b+' &mdash; Qty: '+cfg.quantity+' &mdash; Lev: '+lev.long+'x/'+lev.short+'x';const db=_b(bid,'Dashboard');if(db)db.style.display='block'}
+  fnRenderPrices(bid,d.prices||{});
+  fnRenderPositionPnl(bid,d.position||{},d.pnl||{});
+  const risk=d.risk||{};
+  const dEl=_b(bid,'Delta');if(dEl)dEl.textContent=risk.delta_usd!=null?'$'+parseFloat(risk.delta_usd).toFixed(2):'--';
+  const pEl=_b(bid,'Pnl');if(pEl)pEl.textContent=risk.cumulative_pnl!=null?'$'+parseFloat(risk.cumulative_pnl).toFixed(2):'--';
+  const hEl=_b(bid,'Halted');if(hEl){hEl.textContent=risk.halted?'YES':'NO';hEl.style.color=risk.halted?'var(--red)':'var(--green)'}
+  const exec=d.execution||{},execEl=_b(bid,'Execution');
+  if(execEl){if(exec.state&&exec.state!=='IDLE'){execEl.innerHTML='<div style="font-size:12px"><b>State:</b> '+exec.state+(exec.current_chunk!=null?' &mdash; Chunk '+(exec.current_chunk+1)+'/'+exec.total_chunks:'')+(exec.maker_status?' &mdash; Maker: '+exec.maker_status:'')+'</div>'}else{execEl.innerHTML='<div class="empty">No active execution</div>'}}
+}
+
+async function fnTickFunding(bid){
+  const sg=await f('/fn/bots/'+encodeURIComponent(bid)+'/suggestion');if(!sg)return;
+  const eA=_b(bid,'RateExchA');if(eA)eA.textContent=(sg.exchange_a||'--').toUpperCase();
+  const eB=_b(bid,'RateExchB');if(eB)eB.textContent=(sg.exchange_b||'--').toUpperCase();
+  const iA=_b(bid,'RateInstA');if(iA)iA.textContent=sg.exchange_a||'';
+  const iB=_b(bid,'RateInstB');if(iB)iB.textContent=sg.exchange_b||'';
+  const ra=sg.funding_rate_a,rb=sg.funding_rate_b;
+  if(ra!=null){const rv=parseFloat(ra)*100;const el=_b(bid,'RateA');if(el){el.textContent=rv.toFixed(4)+'%';el.style.color=rv>=0?'var(--red)':'var(--green)'}}
+  if(rb!=null){const rv=parseFloat(rb)*100;const el=_b(bid,'RateB');if(el){el.textContent=rv.toFixed(4)+'%';el.style.color=rv>=0?'var(--red)':'var(--green)'}}
+  if(sg.spread_annualised!=null){const sv=parseFloat(sg.spread_annualised)*100;const el=_b(bid,'RateSpread');if(el){el.textContent=sv.toFixed(2)+'%';el.style.color=Math.abs(sv)>5?'var(--green)':'var(--dim)'}}
+  const sugEl=_b(bid,'Suggestion');
+  if(sugEl){if(sg.recommended_long&&sg.recommended_short){sugEl.className='fn-suggestion positive';sugEl.textContent='Long '+sg.recommended_long.toUpperCase()+' / Short '+sg.recommended_short.toUpperCase()+' \u2014 '+(sg.reason||'')}else{sugEl.className='fn-suggestion neutral';sugEl.textContent=sg.reason||'Waiting for data...'}}
+}
+
+async function fnTickTrades(bid){
+  const trades=await f('/fn/bots/'+encodeURIComponent(bid)+'/trades?limit=20');
+  const el=_b(bid,'TradeLog');if(!el)return;
+  if(!trades||!trades.length){el.innerHTML='<div class="empty">No trades yet.</div>';return}
+  let html='<table><thead><tr><th>Time</th><th>Action</th><th>Success</th><th>Maker Qty</th><th>Taker Qty</th><th>Chunks</th><th>Duration</th></tr></thead><tbody>';
+  for(const t of trades){const ts=new Date(t.timestamp*1000).toLocaleTimeString();const ok=t.success?'<span style="color:var(--green)">OK</span>':'<span style="color:var(--red)">FAIL</span>';const ac=t.action==='ENTRY'?'<span style="color:var(--green)">ENTRY</span>':'<span style="color:var(--red)">EXIT</span>';html+='<tr><td>'+ts+'</td><td>'+ac+'</td><td>'+ok+'</td><td>'+parseFloat(t.total_maker_qty).toFixed(4)+'</td><td>'+parseFloat(t.total_taker_qty).toFixed(4)+'</td><td>'+t.num_chunks+'</td><td>'+parseFloat(t.duration_s).toFixed(1)+'s</td></tr>'}
+  html+='</tbody></table>';el.innerHTML=html;
+}
+
+// ---- Instrument loading ----
+async function fnLoadMarkets(exchSelId,instSelId){
+  const ex=$(exchSelId).value;const sel=$(instSelId);
+  if(!ex){sel.innerHTML='<option value="">default</option>';return}
+  sel.innerHTML='<option value="">Loading...</option>';
+  const syms=await fetchMarkets(ex);
+  sel.innerHTML='<option value="">default</option>';
+  syms.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=(ex==='variational')?s.replace(/^P-/,'').replace(/-USDC-\d+$/,''):s;sel.appendChild(o)});
+}
+
+// ---- Save Config ----
+async function fnSaveConfig(bid){
+  const btn=_b(bid,'SaveBtn');if(btn)btn.disabled=true;
+  const sts=_b(bid,'SaveStatus');if(sts)sts.textContent='Saving...';
+  const body={};
+  const gv=(sfx)=>{const el=_b(bid,sfx);return el?el.value:''};
+  const le=gv('LongExch');if(le)body.long_exchange=le;
+  const se=gv('ShortExch');if(se)body.short_exchange=se;
+  const me=gv('MakerExch');if(me)body.maker_exchange=me;
+  const ia=gv('InstA');if(ia)body.instrument_a=ia;
+  const ib=gv('InstB');if(ib)body.instrument_b=ib;
+  const ll=parseInt(gv('LevLong'));if(!isNaN(ll))body.leverage_long=ll;
+  const ls=parseInt(gv('LevShort'));if(!isNaN(ls))body.leverage_short=ls;
+  const dh=parseInt(gv('DurH'));if(!isNaN(dh))body.duration_h=dh;
+  const dm=parseInt(gv('DurM'));if(!isNaN(dm))body.duration_m=dm;
+  const q=parseFloat(gv('Qty'));if(!isNaN(q)&&q>0)body.quantity=q;
+  const nc=parseInt(gv('Chunks'));if(!isNaN(nc)&&nc>=1)body.twap_num_chunks=nc;
+  const ci=parseFloat(gv('ChunkInterval'));if(!isNaN(ci)&&ci>0)body.twap_interval_s=ci;
+  const msu=parseFloat(gv('MaxSpreadUsd'));if(!isNaN(msu)&&msu>=0)body.max_chunk_spread_usd=msu;
+  const msp=parseFloat(gv('MaxSpreadPct'));if(!isNaN(msp)&&msp>=0)body.max_spread_pct=msp;
+  const r=await f('/fn/bots/'+encodeURIComponent(bid)+'/config',{method:'POST',body:JSON.stringify(body)});
+  if(btn)btn.disabled=false;
+  if(r&&r.status==='ok'){if(sts){sts.textContent='Saved!'+(r.feeds_restarted?' (feeds restarted)':'');sts.style.color='var(--green)'}const db=_b(bid,'Dashboard');if(db)db.style.display='block';setTimeout(()=>{if(sts)sts.textContent=''},3000);await fnTickBot(bid)}
+  else{if(sts){sts.textContent='Failed: '+(r?r.detail||JSON.stringify(r):'request error');sts.style.color='var(--red)'}}
+}
+
+// ---- Start / Stop / Kill ----
+async function fnStart(bid){
+  if(!confirm('Start bot "'+bid+'"?'))return;
+  const stBtn=_b(bid,'StartBtn');if(stBtn)stBtn.disabled=true;
+  const body={},gv=(sfx)=>{const el=_b(bid,sfx);return el?el.value:''};
+  const dh=parseInt(gv('DurH'));if(!isNaN(dh))body.duration_h=dh;
+  const dm=parseInt(gv('DurM'));if(!isNaN(dm))body.duration_m=dm;
+  const ll=parseInt(gv('LevLong'));if(!isNaN(ll))body.leverage_long=ll;
+  const ls=parseInt(gv('LevShort'));if(!isNaN(ls))body.leverage_short=ls;
+  const q=parseFloat(gv('Qty'));if(!isNaN(q)&&q>0)body.quantity=q;
+  const r=await f('/fn/bots/'+encodeURIComponent(bid)+'/start',{method:'POST',body:JSON.stringify(body)});
+  if(r){if(r.success){alert(r.message||'Bot starting...')}else{alert('Start failed: '+(r.error||r.detail||JSON.stringify(r)))}}else{alert('Request failed')}
+  await fnTickBot(bid);
+}
+
+async function fnStop(bid){
+  if(!confirm('Stop bot "'+bid+'"? This will unwind all positions.'))return;
+  const spBtn=_b(bid,'StopBtn');if(spBtn)spBtn.disabled=true;
+  const r=await f('/fn/bots/'+encodeURIComponent(bid)+'/stop',{method:'POST'});
+  if(r){if(r.success){alert(r.message||'Bot stopping...')}else{alert('Stop failed: '+(r.error||r.detail||JSON.stringify(r)))}}else{alert('Request failed')}
+  await fnTickBot(bid);
+}
+
+async function fnKill(bid){
+  if(!confirm('KILL bot "'+bid+'"? Open orders cancelled but positions NOT closed.'))return;
+  const kBtn=_b(bid,'KillBtn');if(kBtn)kBtn.disabled=true;
+  const r=await f('/fn/bots/'+encodeURIComponent(bid)+'/kill',{method:'POST'});
+  if(r){if(r.success){alert(r.message||'Bot killed')}else{alert('Kill failed: '+(r.error||r.detail||JSON.stringify(r)))}}else{alert('Request failed')}
+  await fnTickBot(bid);
+}
+
+async function fnAdjustTimer(bid){
+  const hEl=_b(bid,'AdjH'),mEl=_b(bid,'AdjM'),sts=_b(bid,'AdjStatus');
+  const h=parseInt(hEl?hEl.value:'0')||0,m=parseInt(mEl?mEl.value:'0')||0;
+  if(h===0&&m===0&&!confirm('Set timer to 0? Bot will run indefinitely.'))return;
+  if(sts)sts.textContent='...';
+  const r=await f('/fn/bots/'+encodeURIComponent(bid)+'/timer',{method:'POST',body:JSON.stringify({duration_h:h,duration_m:m})});
+  if(r&&r.success){if(sts){sts.textContent='Updated!';sts.style.color='var(--green)';setTimeout(()=>{sts.textContent=''},2000)}await fnTickBot(bid)}
+  else{if(sts){sts.textContent='Failed: '+(r?r.detail||JSON.stringify(r):'request error');sts.style.color='var(--red)'}}
+}
+
+async function init(){
+  // Check auth/vault status before loading dashboard
+  const auth = await f('/auth/status');
+  if(auth && !auth.unlocked){
+    // Show lock screen
+    $('lockLoadingView').style.display='none';
+    if(auth.setup_required){
+      $('lockSetupView').style.display='';
+      $('lockSetupPw').focus();
+    } else {
+      $('lockUnlockView').style.display='';
+      $('lockUnlockPw').focus();
+    }
+    // Add Enter key handlers
+    $('lockSetupPwConfirm').addEventListener('keydown',e=>{if(e.key==='Enter')vaultSetup()});
+    $('lockSetupPw').addEventListener('keydown',e=>{if(e.key==='Enter')$('lockSetupPwConfirm').focus()});
+    $('lockUnlockPw').addEventListener('keydown',e=>{if(e.key==='Enter')vaultUnlock()});
+    return; // Don't start dashboard yet
+  }
+  // Already unlocked (legacy mode or already unlocked)
+  _startDashboard();
+}
+
+function _startDashboard(){
+  $('lockOverlay').classList.add('hidden');
+  $('lockBtn').style.display='';
+  tick();startR();switchMainView('fn');
+}
+
+async function vaultSetup(){
+  const pw=$('lockSetupPw').value;
+  const pw2=$('lockSetupPwConfirm').value;
+  const err=$('lockSetupErr');
+  err.textContent='';
+  if(pw.length<8){err.textContent='Password must be at least 8 characters';return}
+  if(pw!==pw2){err.textContent='Passwords do not match';return}
+  $('lockSetupBtn').disabled=true;
+  const r=await f('/auth/setup',{method:'POST',body:JSON.stringify({password:pw})});
+  $('lockSetupBtn').disabled=false;
+  if(r&&r.unlocked){_startDashboard()}
+  else{err.textContent=(r&&r.detail)||'Setup failed'}
+}
+
+async function vaultUnlock(){
+  const pw=$('lockUnlockPw').value;
+  const err=$('lockUnlockErr');
+  err.textContent='';
+  if(!pw){err.textContent='Password required';return}
+  $('lockUnlockBtn').disabled=true;
+  const r=await f('/auth/unlock',{method:'POST',body:JSON.stringify({password:pw})});
+  $('lockUnlockBtn').disabled=false;
+  if(r&&(r.unlocked||r.already_unlocked)){_startDashboard()}
+  else{err.textContent=(r&&r.detail)||'Wrong password'}
+}
+
+async function vaultLock(){
+  if(!confirm('Lock vault? This will stop all bots and wipe keys from memory.'))return;
+  await f('/auth/lock',{method:'POST'});
+  // Reload page to show lock screen
+  location.reload();
+}
+
 init();
+
+// ── Settings Modal ──────────────────────────────────────────
+const _skMap={
+  skExtApiKey:'extended_api_key',
+  skExtPubKey:'extended_public_key',
+  skExtPrivKey:'extended_private_key',
+  skExtVault:'extended_vault',
+  skGrvtApiKey:'grvt_api_key',
+  skGrvtPrivKey:'grvt_private_key',
+  skGrvtAcctId:'grvt_trading_account_id',
+  skVarJwt:'variational_jwt_token'
+};
+
+function toggleKeyVis(inputId,btn){
+  const inp=$(inputId);
+  if(inp.type==='password'){inp.type='text';btn.textContent='Hide'}
+  else{inp.type='password';btn.textContent='Show'}
+}
+
+async function showSettingsModal(){
+  $('settingsStatus').textContent='';$('settingsStatus').className='settings-status';
+  // Load masked keys from server
+  const d=await f('/settings/keys');
+  if(d){
+    for(const[elId,key]of Object.entries(_skMap)){
+      const inp=$(elId);
+      inp.value=d[key]||'';
+      inp.type='password';
+      inp.dataset.original=d[key]||'';
+    }
+    // Reset all show/hide buttons
+    document.querySelectorAll('.settings-modal .toggle-vis').forEach(b=>b.textContent='Show');
+  }
+  $('settingsModal').classList.add('show');
+}
+
+function hideSettingsModal(){$('settingsModal').classList.remove('show')}
+
+async function saveSettings(){
+  const status=$('settingsStatus');
+  status.textContent='Saving...';status.className='settings-status';
+  const payload={};
+  let hasChanges=false;
+  for(const[elId,key]of Object.entries(_skMap)){
+    const inp=$(elId);
+    const val=inp.value.trim();
+    // Only send if user actually changed the value (not the masked placeholder)
+    if(val && val!==inp.dataset.original){
+      payload[key]=val;
+      hasChanges=true;
+    }
+  }
+  if(!hasChanges){
+    status.textContent='No changes detected';status.className='settings-status';
+    return;
+  }
+  const r=await f('/settings/keys',{method:'POST',body:JSON.stringify(payload)});
+  if(r&&r.status==='ok'){
+    const n=r.changed?r.changed.length:0;
+    status.textContent=n+' key'+(n!==1?'s':'')+' updated successfully';
+    status.className='settings-status ok';
+    // Reload masked values
+    setTimeout(()=>showSettingsModal(),800);
+  }else{
+    status.textContent='Save failed: '+(r?r.detail||JSON.stringify(r):'request error');
+    status.className='settings-status err';
+  }
+}
+
+// Close settings modal on overlay click
+$('settingsModal').addEventListener('click',e=>{if(e.target===$('settingsModal'))hideSettingsModal()});
 </script>
 </body>
 </html>

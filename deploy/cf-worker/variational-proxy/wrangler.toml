@@ -1,0 +1,8 @@
+name = "variational-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Custom domain (auto-creates DNS record + route)
+[[routes]]
+pattern = "proxy.defitool.de/*"
+zone_name = "defitool.de"

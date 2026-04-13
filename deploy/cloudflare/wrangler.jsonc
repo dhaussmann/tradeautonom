@@ -1,0 +1,42 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "tradeautonom",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-04-05",
+	"compatibility_flags": ["nodejs_compat"],
+	// Static frontend assets → Workers KV
+	"site": {
+		"bucket": "../../frontend/dist"
+	},
+	// Workers VPC — connect to NAS backend
+	// 1. Create a VPC Service in CF dashboard (Workers VPC → VPC Services)
+	// 2. Replace <YOUR_VPC_SERVICE_ID> with the actual Service ID
+	"vpc_services": [
+		{
+			"binding": "NAS_BACKEND",
+			"service_id": "019d5d2b-cd0c-72b0-ae1e-43dee260ab29"
+		}
+	],
+	"routes": [
+		{ "pattern": "bot.defitool.de/*", "zone_name": "defitool.de" }
+	],
+	"vars": {
+		// Orchestrator gateway on NAS (reachable via VPC on port 8090)
+		"ORCHESTRATOR_ORIGIN": "http://192.168.133.253:8090"
+		// INGEST_TOKEN is set via `wrangler secret put INGEST_TOKEN`
+		// BETTER_AUTH_SECRET is set via `wrangler secret put BETTER_AUTH_SECRET`
+		// ORCH_TOKEN is set via `wrangler secret put ORCH_TOKEN`
+	},
+	// Daily retention cleanup at 03:00 UTC
+	"triggers": {
+		"crons": ["0 3 * * *"]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "tradeautonom-history",
+			"database_id": "1ae6c186-e7d3-4baf-bc05-f9ba999eca93",
+			"remote": true
+		}
+	]
+}

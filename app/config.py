@@ -30,21 +30,82 @@ class Settings(BaseSettings):
     arb_leg_a_exchange: str = "extended"   # exchange for instrument_a (leg A)
     arb_leg_b_exchange: str = "grvt"       # exchange for instrument_b (leg B)
     arb_liquidity_multiplier: float = 2.0
+    arb_min_top_book_mult: float = 2.0  # best bid/ask must hold qty × mult; 0 = disabled
     extended_api_base_url: str = "https://api.starknet.extended.exchange/api/v1"
     extended_api_key: str = ""
     extended_public_key: str = ""
     extended_private_key: str = ""
     extended_vault: int = 0
+    # NADO credentials
+    nado_private_key: str = ""
+    nado_subaccount_name: str = "default"
+    nado_env: str = "mainnet"
+    nado_linked_signer_key: str = ""    # bot's trading key (linked signer — auto-generated)
+    nado_wallet_address: str = ""       # main wallet address (from MetaMask connect)
+    # Variational credentials (wallet address extracted from JWT automatically)
+    variational_jwt_token: str = ""
+    variational_proxy_url: str = "https://proxy.defitool.de/api"  # CF Worker proxy
     arb_chunk_size: float = 1.0         # split large orders into chunks of this size
     arb_chunk_delay_ms: int = 500       # ms to wait between chunks (book replenishment)
     arb_simulation_mode: bool = False   # True = paper-trade (no real orders)
     arb_order_type: str = "aggressive_limit"  # "aggressive_limit" or "market"
-    arb_limit_offset_ticks: int = 5     # ticks beyond best price for aggressive limit
+    arb_limit_offset_ticks: int = 5     # ticks beyond best price for aggressive limit (fallback)
+    arb_vwap_buffer_ticks: int = 2      # extra ticks beyond VWAP worst-fill for latency protection
     arb_min_profit: float = 0.005       # min profit margin in USD above break-even
     arb_fill_timeout_ms: int = 3000     # max ms to wait for fill confirmation
+    arb_strategy: str = "arbitrage"      # "arbitrage" or "delta_neutral"
+    arb_max_spread_pct: float = 0.01     # delta-neutral: max spread in % of mid-price for entry/exit
+    arb_funding_rate_bias: str | None = None  # stub for future funding-rate API integration
+    arb_signal_confirmations: int = 3    # consecutive ticks confirming signal before executing
     arb_ws_enabled: bool = True          # use WebSocket feeds for orderbook data
     arb_ws_stale_ms: int = 5000          # max age (ms) before falling back to REST
     arb_auto_trade: bool = False         # enable auto-trading for the default job on startup
     arb_tick_interval_s: float = 2.0    # seconds between auto-trade ticks
+
+    # ── Funding-Arb Maker-Taker Engine (new) ─────────────────────────
+    # Direction: user-defined per job (which DEX holds long vs short)
+    fn_long_exchange: str = "extended"        # exchange holding the LONG position
+    fn_short_exchange: str = "grvt"           # exchange holding the SHORT position
+    fn_maker_exchange: str = "extended"       # exchange used as maker (post-only) side
+    fn_instrument_a: str = "SOL-USD"          # instrument on long exchange
+    fn_instrument_b: str = "SOL_USDT_Perp"   # instrument on short exchange
+    fn_quantity: float = 0.1                  # total position size per entry
+
+    # Maker order execution
+    fn_maker_timeout_ms: int = 10000          # ms to wait for maker fill before repricing
+    fn_maker_reprice_ticks: int = 3           # ticks to chase per reprice round
+    fn_maker_max_chase_rounds: int = 5        # max reprice attempts before giving up
+    fn_maker_offset_ticks: int = 0            # initial offset from best bid/ask for maker order
+
+    # TWAP chunking
+    fn_twap_num_chunks: int = 10              # split total qty into N chunks
+    fn_twap_interval_s: float = 10.0          # seconds between TWAP chunks
+
+    # Risk management
+    fn_delta_max_usd: float = 50.0            # max absolute delta imbalance (USD) before rebalance
+    fn_circuit_breaker_loss_usd: float = 500.0  # cumulative loss threshold to halt all trading
+    fn_min_spread_pct: float = -0.5            # min spread % (safety floor — blocks extreme negative outliers)
+    fn_max_spread_pct: float = 0.05           # max spread % of mid-price to allow entry
+    fn_max_chunk_spread_usd: float = 1.0      # max absolute cross-exchange spread (USD) per chunk
+
+    # Funding rate monitoring
+    fn_funding_poll_interval_s: float = 60.0  # seconds between funding rate display refreshes
+
+    # Run duration (total = h*60 + m minutes; 0+0 = run indefinitely)
+    fn_duration_h: int = 0                    # hours component of run duration
+    fn_duration_m: int = 0                    # minutes component of run duration
+    fn_auto_entry: bool = True                # auto-enter position on start()
+
+    # Leverage (per exchange)
+    fn_leverage_long: int = 5                 # leverage for the long-side exchange
+    fn_leverage_short: int = 5                # leverage for the short-side exchange
+
+    # Simulation
+    fn_simulation_mode: bool = False          # True = paper-trade (no real orders)
+
+    # ── History ingest (push snapshots to Cloudflare D1) ───────
+    history_ingest_url: str = ""              # e.g. https://tradeautonom.workers.dev/api/history/ingest
+    history_ingest_token: str = ""            # Bearer token for auth
+    history_ingest_interval_s: int = 300      # seconds between pushes (default 5 min)
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

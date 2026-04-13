@@ -51,6 +51,7 @@ class SpreadSnapshot:
     # if the EXIT spread will be at least this much wider than the entry spread.
     slippage_cost: float = 0.0
     break_even_spread: float = 0.0
+    spread_pct: float = 0.0  # abs spread as % of avg mid-price
     data_source: str = "rest"  # "websocket" or "rest"
 
 
@@ -105,23 +106,35 @@ class ArbitrageEngine:
         self.max_exec_spread = settings.arb_max_exec_spread
         self.quantity = Decimal(str(settings.arb_quantity))
         self.liquidity_multiplier = settings.arb_liquidity_multiplier
+        self.min_top_book_mult = settings.arb_min_top_book_mult
         self.chunk_size = Decimal(str(settings.arb_chunk_size))
         self.chunk_delay_ms = settings.arb_chunk_delay_ms
         self.simulation_mode = settings.arb_simulation_mode
         # Aggressive limit order settings
         self.order_type = settings.arb_order_type           # "aggressive_limit" or "market"
         self.limit_offset_ticks = settings.arb_limit_offset_ticks
+        self.vwap_buffer_ticks = settings.arb_vwap_buffer_ticks
         self.min_profit = settings.arb_min_profit           # min USD profit above break-even
         self.fill_timeout_ms = settings.arb_fill_timeout_ms
         # WebSocket feed manager (set externally via set_feed_manager)
         self._feed_manager: OrderbookFeedManager | None = None
         self._ws_enabled = settings.arb_ws_enabled
         self._ws_stale_ms = settings.arb_ws_stale_ms
+        # Strategy mode
+        self.strategy = settings.arb_strategy  # "arbitrage" or "delta_neutral"
+        self.max_spread_pct = settings.arb_max_spread_pct  # delta-neutral: max spread %
+        self.funding_rate_bias: str | None = settings.arb_funding_rate_bias  # stub
+        # Signal confirmation
+        self.signal_confirmations = settings.arb_signal_confirmations
+        self._signal_count = 0
+        self._last_signal = "NONE"
         # Position state
         self._has_position = False
         self._long_sym: str | None = None   # always PAXG when open
         self._short_sym: str | None = None  # always XAU when open
         self._entry_spread_actual: float | None = None
+        self._entry_fill_long: float | None = None   # actual buy fill price at entry
+        self._entry_fill_short: float | None = None   # actual sell fill price at entry
 
     def set_feed_manager(self, mgr: OrderbookFeedManager) -> None:
         """Attach a WebSocket feed manager for real-time orderbook data."""
@@ -143,16 +156,94 @@ class ArbitrageEngine:
         return self._get_client(self.leg_b_exchange)
 
     def _get_orderbook(self, exchange: str, instrument: str, limit: int = 10) -> dict:
-        """Get orderbook from WS feed if available and fresh, else fall back to REST."""
+        """Get orderbook from WS feed if available, fresh, and synced, else fall back to REST."""
         if self._ws_enabled and self._feed_manager is not None:
             if not self._feed_manager.is_stale(exchange, instrument, self._ws_stale_ms):
                 book = self._feed_manager.get_book(exchange, instrument)
                 if book is not None:
-                    return book
-                logger.debug("WS book empty for %s:%s — falling back to REST", exchange, instrument)
+                    if not book.get("_is_synced", True):
+                        logger.debug("WS book out-of-sync for %s:%s — falling back to REST", exchange, instrument)
+                    else:
+                        return book
+                else:
+                    logger.debug("WS book empty for %s:%s — falling back to REST", exchange, instrument)
             else:
                 logger.debug("WS data stale for %s:%s — falling back to REST", exchange, instrument)
         return self._get_client(exchange).fetch_order_book(instrument, limit=limit)
+
+    def _get_orderbooks_atomic(self) -> tuple[dict, dict]:
+        """Get both orderbooks atomically when possible (WS), else sequentially."""
+        if self._ws_enabled and self._feed_manager is not None:
+            stale_a = self._feed_manager.is_stale(self.leg_a_exchange, self.xau_instrument, self._ws_stale_ms)
+            stale_b = self._feed_manager.is_stale(self.leg_b_exchange, self.paxg_instrument, self._ws_stale_ms)
+            if not stale_a and not stale_b:
+                book_a, book_b = self._feed_manager.get_books_atomic(
+                    self.leg_a_exchange, self.xau_instrument,
+                    self.leg_b_exchange, self.paxg_instrument,
+                )
+                # Check both are usable (non-None and synced)
+                if book_a is not None and book_b is not None:
+                    if book_a.get("_is_synced", True) and book_b.get("_is_synced", True):
+                        return book_a, book_b
+                    logger.debug("Atomic read: one or both books out-of-sync — falling back")
+        # Fall back to sequential reads (may hit REST)
+        book_a = self._get_orderbook(self.leg_a_exchange, self.xau_instrument)
+        book_b = self._get_orderbook(self.leg_b_exchange, self.paxg_instrument)
+        return book_a, book_b
+
+    def _compute_vwap_limit(
+        self, book: dict, side: str, quantity: Decimal, exchange: str, symbol: str,
+    ) -> float | None:
+        """Sweep the local orderbook to compute a dynamic limit price.
+
+        For BUY: walk asks until cumulative volume >= quantity.
+        For SELL: walk bids until cumulative volume >= quantity.
+        Returns the worst fill price + buffer_ticks as the limit price.
+        Returns None if the book doesn't have enough depth.
+        """
+        levels = book.get("asks" if side == "buy" else "bids", [])
+        if not levels:
+            return None
+
+        remaining = float(quantity)
+        worst_price = 0.0
+        total_cost = 0.0
+
+        for price_str, size_str in levels:
+            price = float(price_str)
+            size = float(size_str)
+            fill = min(remaining, size)
+            total_cost += fill * price
+            remaining -= fill
+            worst_price = price
+            if remaining <= 0:
+                break
+
+        if remaining > 0:
+            # Not enough depth in the book to fill our order
+            return None
+
+        vwap = total_cost / float(quantity)
+
+        # Add buffer ticks for latency protection
+        client = self._get_client(exchange)
+        tick = float(client.get_tick_size(symbol)) if hasattr(client, "get_tick_size") else 0.01
+        buffer = tick * self.vwap_buffer_ticks
+
+        if side == "buy":
+            limit_price = worst_price + buffer
+        else:
+            # For SELL IOC: limit must be AT or BELOW the bids to match.
+            # worst_price is already the deepest bid we'd fill against.
+            # Adding buffer *below* worst makes the IOC stricter (harder to fill).
+            # Instead, keep worst_price as-is — no buffer penalty for sells.
+            limit_price = worst_price
+
+        logger.info(
+            "VWAP limit: %s %s qty=%s vwap=%.4f worst=%.4f tick=%.4f buffer=%d ticks → limit=%.4f",
+            side.upper(), symbol, quantity, vwap, worst_price, tick, self.vwap_buffer_ticks, limit_price,
+        )
+        return limit_price
 
     # ------------------------------------------------------------------
     # Position state sync from exchange
@@ -234,9 +325,18 @@ class ArbitrageEngine:
             paxg_entry = entry_b if long_sym == self.paxg_instrument else entry_a
             xau_entry = entry_a if short_sym == self.xau_instrument else entry_b
             self._entry_spread_actual = (paxg_entry - xau_entry) if paxg_entry and xau_entry else None
+            # Only use exchange entry_price as fallback when no actual fill prices
+            # are known from order responses.  The exchange entry_price is a weighted
+            # average across ALL fills on the instrument — not the current trade —
+            # and would corrupt PnL calculations.
+            if self._entry_fill_long is None:
+                self._entry_fill_long = entry_a if long_sym == self.instrument_a else entry_b
+            if self._entry_fill_short is None:
+                self._entry_fill_short = entry_b if long_sym == self.instrument_a else entry_a
             logger.info(
-                "Synced position from exchange: LONG %s / SHORT %s (entry spread ~%.4f)",
+                "Synced position from exchange: LONG %s / SHORT %s (entry spread ~%.4f, fills: long=%.4f short=%.4f)",
                 long_sym, short_sym, self._entry_spread_actual or 0,
+                self._entry_fill_long or 0, self._entry_fill_short or 0,
             )
         elif long_sym or short_sym:
             # One side open — delta not neutral, log warning but keep has_position=True
@@ -256,6 +356,8 @@ class ArbitrageEngine:
             self._long_sym = None
             self._short_sym = None
             self._entry_spread_actual = None
+            self._entry_fill_long = None
+            self._entry_fill_short = None
             if was_open:
                 logger.warning(
                     "Sync: internal state claimed open position but exchange shows NONE — state reset to flat."
@@ -293,6 +395,8 @@ class ArbitrageEngine:
             self._long_sym = None
             self._short_sym = None
             self._entry_spread_actual = None
+            self._entry_fill_long = None
+            self._entry_fill_short = None
             logger.warning(
                 "Soft sync: exchange shows NO positions after entry — fills may not have landed. "
                 "State reset to flat."
@@ -322,8 +426,8 @@ class ArbitrageEngine:
         enters when spread_abs >= spread_entry_low (a meaningful price gap exists)
         and exits when spread_abs <= spread_exit_high is no longer met.
         """
-        book_a = self._get_orderbook(self.leg_a_exchange, self.xau_instrument)
-        book_b = self._get_orderbook(self.leg_b_exchange, self.paxg_instrument)
+        # Prefer atomic dual-book read to minimise price movement between reads
+        book_a, book_b = self._get_orderbooks_atomic()
 
         mid_a = _mid_price(book_a)
         mid_b = _mid_price(book_b)
@@ -355,6 +459,10 @@ class ArbitrageEngine:
         src_b = book_b.get("_source", "rest") if isinstance(book_b, dict) else "rest"
         data_source = "websocket" if (src_a == "websocket" or src_b == "websocket") else "rest"
 
+        # Spread as percentage of average mid-price
+        avg_mid = (mid_a + mid_b) / 2 if (mid_a + mid_b) > 0 else 1.0
+        spread_pct = round(spread_abs / avg_mid * 100, 6)
+
         snapshot = SpreadSnapshot(
             instrument_a=self.xau_instrument,
             instrument_b=self.paxg_instrument,
@@ -370,6 +478,7 @@ class ArbitrageEngine:
             exec_spread=round(exec_spread, 4),
             slippage_cost=slippage_cost,
             break_even_spread=break_even_spread,
+            spread_pct=spread_pct,
             data_source=data_source,
         )
         cheaper = self.xau_instrument if a_is_cheaper else self.paxg_instrument
@@ -397,53 +506,106 @@ class ArbitrageEngine:
                  (executable spread is large enough — Long cheap / Short expensive)
           EXIT:  abs(exec_spread) <= spread_exit_high when holding a position
                  (spread has converged — take profit)
+
+        Signal confirmation: the same signal must appear for ``signal_confirmations``
+        consecutive ticks before the action is actually returned.
         """
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
 
         exec_abs = abs(snapshot.exec_spread)
 
-        if not self._has_position:
-            if exec_abs >= self.spread_entry_low:
-                return ArbCheckResult(
-                    action="ENTRY",
-                    snapshot=snapshot,
-                    reason=(
+        # --- Determine raw signal ---
+        raw_signal = "NONE"
+        signal_reason = ""
+
+        if self.strategy == "delta_neutral":
+            # Delta-neutral: enter/exit when spread % is small enough
+            sp = snapshot.spread_pct
+            if not self._has_position:
+                if sp <= self.max_spread_pct:
+                    raw_signal = "ENTRY"
+                    signal_reason = (
+                        f"DN spread {sp:.4f}% <= max {self.max_spread_pct:.4f}% "
+                        f"({'A cheaper' if snapshot.a_is_cheaper else 'B cheaper'}: "
+                        f"Long {self.xau_instrument if snapshot.a_is_cheaper else self.paxg_instrument} / "
+                        f"Short {self.paxg_instrument if snapshot.a_is_cheaper else self.xau_instrument})"
+                    )
+                else:
+                    signal_reason = (
+                        f"DN spread {sp:.4f}% > max {self.max_spread_pct:.4f}% — spread too wide"
+                    )
+            elif self._has_position and sp <= self.max_spread_pct:
+                raw_signal = "EXIT"
+                signal_reason = (
+                    f"DN spread {sp:.4f}% <= max {self.max_spread_pct:.4f}% — closing position"
+                )
+            else:
+                signal_reason = (
+                    f"DN spread {sp:.4f}% — holding (exit when <= {self.max_spread_pct:.4f}%)"
+                )
+        else:
+            # Arbitrage: enter when spread large, exit when converged
+            if not self._has_position:
+                if exec_abs >= self.spread_entry_low:
+                    raw_signal = "ENTRY"
+                    signal_reason = (
                         f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) >= "
                         f"entry min ${self.spread_entry_low:.4f} "
                         f"({'A cheaper' if snapshot.a_is_cheaper else 'B cheaper'}: "
                         f"Long {self.xau_instrument if snapshot.a_is_cheaper else self.paxg_instrument} / "
                         f"Short {self.paxg_instrument if snapshot.a_is_cheaper else self.xau_instrument})"
-                    ),
+                    )
+                else:
+                    signal_reason = (
+                        f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) < "
+                        f"entry min ${self.spread_entry_low:.4f} — spread too small"
+                    )
+            elif self._has_position and exec_abs <= self.spread_exit_high:
+                raw_signal = "EXIT"
+                signal_reason = (
+                    f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) <= "
+                    f"exit threshold ${self.spread_exit_high:.4f} "
+                    f"(spread converged — taking profit)"
                 )
+            else:
+                signal_reason = (
+                    f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) — holding position "
+                    f"(exit if abs(exec) <= ${self.spread_exit_high:.4f})"
+                )
+
+        # --- Signal confirmation counter ---
+        if raw_signal != "NONE" and raw_signal == self._last_signal:
+            self._signal_count += 1
+        elif raw_signal != "NONE":
+            self._signal_count = 1
+        else:
+            self._signal_count = 0
+
+        self._last_signal = raw_signal
+
+        if raw_signal != "NONE" and self._signal_count < self.signal_confirmations:
+            logger.debug(
+                "Signal %s %d/%d — awaiting confirmation",
+                raw_signal, self._signal_count, self.signal_confirmations,
+            )
             return ArbCheckResult(
                 action="NONE",
                 snapshot=snapshot,
                 reason=(
-                    f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) < "
-                    f"entry min ${self.spread_entry_low:.4f} — spread too small"
+                    f"{raw_signal} signal {self._signal_count}/{self.signal_confirmations} — "
+                    f"awaiting confirmation ({signal_reason})"
                 ),
             )
 
-        # Has position: exit when spread has converged below exit threshold
-        if self._has_position and exec_abs <= self.spread_exit_high:
-            return ArbCheckResult(
-                action="EXIT",
-                snapshot=snapshot,
-                reason=(
-                    f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) <= "
-                    f"exit threshold ${self.spread_exit_high:.4f} "
-                    f"(spread converged — taking profit)"
-                ),
-            )
+        if raw_signal != "NONE":
+            # Confirmed — reset counter so next cycle starts fresh
+            self._signal_count = 0
 
         return ArbCheckResult(
-            action="NONE",
+            action=raw_signal,
             snapshot=snapshot,
-            reason=(
-                f"Exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) — holding position "
-                f"(exit if abs(exec) <= ${self.spread_exit_high:.4f})"
-            ),
+            reason=signal_reason,
         )
 
     # ------------------------------------------------------------------
@@ -469,19 +631,32 @@ class ArbitrageEngine:
         if snapshot is None:
             snapshot = self.get_spread_snapshot()
 
-        # --- SPREAD GUARD: entry only when exec spread is large enough ---
+        # --- SPREAD GUARD ---
         exec_abs = abs(snapshot.exec_spread)
-        if exec_abs < self.spread_entry_low:
-            return ArbExecutionResult(
-                success=False, leg_a=None, leg_b=None,
-                snapshot=snapshot,
-                error=(
-                    f"Entry blocked: exec spread ${snapshot.exec_spread:.4f} "
-                    f"(abs ${exec_abs:.4f}) < entry min ${self.spread_entry_low:.4f}"
-                ),
-            )
+        if self.strategy == "delta_neutral":
+            # Delta-neutral: block entry when spread % is too wide
+            if snapshot.spread_pct > self.max_spread_pct:
+                return ArbExecutionResult(
+                    success=False, leg_a=None, leg_b=None,
+                    snapshot=snapshot,
+                    error=(
+                        f"DN entry blocked: spread {snapshot.spread_pct:.4f}% "
+                        f"> max {self.max_spread_pct:.4f}%"
+                    ),
+                )
+        else:
+            # Arbitrage: entry only when exec spread is large enough
+            if exec_abs < self.spread_entry_low:
+                return ArbExecutionResult(
+                    success=False, leg_a=None, leg_b=None,
+                    snapshot=snapshot,
+                    error=(
+                        f"Entry blocked: exec spread ${snapshot.exec_spread:.4f} "
+                        f"(abs ${exec_abs:.4f}) < entry min ${self.spread_entry_low:.4f}"
+                    ),
+                )
 
-        # --- EXEC SPREAD SAFETY ---
+        # --- EXEC SPREAD SAFETY (both strategies) ---
         if abs(snapshot.exec_spread) > self.max_exec_spread:
             return ArbExecutionResult(
                 success=False, leg_a=None, leg_b=None,
@@ -533,6 +708,8 @@ class ArbitrageEngine:
             self._long_sym = long_sym
             self._short_sym = short_sym
             self._entry_spread_actual = snapshot.exec_spread
+            self._entry_fill_long = long_price
+            self._entry_fill_short = short_price
             logger.info(
                 "[SIM] ARB ENTRY complete — LONG %s@%s @ %.4f / SHORT %s@%s @ %.4f, exec_spread=$%.4f",
                 long_sym, long_exchange, long_price,
@@ -648,6 +825,53 @@ class ArbitrageEngine:
                     f"(fill ${slip_short.estimated_fill_price:.4f} vs expected ${short_price:.4f})"
                 )
 
+        # --- Liquidity multiplier guard (2x/3x rule) ---
+        # Only trigger when enough liquidity exists to absorb our order even
+        # after HFT front-running.  Uses the already-fetched order books.
+        if self.liquidity_multiplier > 1.0:
+            required_liq = float(self.quantity) * self.liquidity_multiplier
+            avail_long = sum(float(lv[1]) for lv in book_long.get("asks", []))
+            avail_short = sum(float(lv[1]) for lv in book_short.get("bids", []))
+            logger.info(
+                "Liquidity guard: LONG %s avail=%.4f SHORT %s avail=%.4f required=%.4f (qty=%.4f × %.1fx)",
+                long_sym, avail_long, short_sym, avail_short, required_liq,
+                float(self.quantity), self.liquidity_multiplier,
+            )
+            if avail_long < required_liq:
+                failures.append(
+                    f"LONG {long_sym} liquidity: {avail_long:.4f} available < "
+                    f"{required_liq:.4f} required ({self.liquidity_multiplier:.1f}x × {self.quantity})"
+                )
+            if avail_short < required_liq:
+                failures.append(
+                    f"SHORT {short_sym} liquidity: {avail_short:.4f} available < "
+                    f"{required_liq:.4f} required ({self.liquidity_multiplier:.1f}x × {self.quantity})"
+                )
+
+        # --- Top-of-book min-size guard ---
+        # The best bid/ask alone must hold enough size; thin top levels cause IOC cancels.
+        if self.min_top_book_mult > 0:
+            required_top = float(self.quantity) * self.min_top_book_mult
+            asks_long = book_long.get("asks", [])
+            bids_short = book_short.get("bids", [])
+            top_ask = float(asks_long[0][1]) if asks_long else 0.0
+            top_bid = float(bids_short[0][1]) if bids_short else 0.0
+            logger.info(
+                "Top-of-book guard: LONG %s best_ask_size=%.4f SHORT %s best_bid_size=%.4f required=%.4f (qty=%.4f × %.1fx)",
+                long_sym, top_ask, short_sym, top_bid, required_top,
+                float(self.quantity), self.min_top_book_mult,
+            )
+            if top_ask < required_top:
+                failures.append(
+                    f"LONG {long_sym} top-of-book: best ask size {top_ask:.4f} < "
+                    f"{required_top:.4f} required ({self.min_top_book_mult:.1f}x × {self.quantity})"
+                )
+            if top_bid < required_top:
+                failures.append(
+                    f"SHORT {short_sym} top-of-book: best bid size {top_bid:.4f} < "
+                    f"{required_top:.4f} required ({self.min_top_book_mult:.1f}x × {self.quantity})"
+                )
+
         if failures:
             logger.warning("=== ENTRY BLOCKED — %d check(s) failed: %s ===", len(failures), "; ".join(failures))
             return ArbExecutionResult(
@@ -664,39 +888,75 @@ class ArbitrageEngine:
             self.order_type,
         )
 
+        # --- VWAP dynamic limit price computation ---
+        # Sweep the pre-fetched orderbooks to find optimal limit prices.
+        # Falls back to offset_ticks if the book doesn't have enough depth.
+        long_limit = self._compute_vwap_limit(
+            book_long, "buy", self.quantity, long_exchange, long_sym,
+        )
+        short_limit = self._compute_vwap_limit(
+            book_short, "sell", self.quantity, short_exchange, short_sym,
+        )
+
         # --- PARALLEL LEG EXECUTION ---
         leg_a, leg_b = self._execute_legs_parallel(
             long_sym=long_sym, short_sym=short_sym,
             long_exchange=long_exchange, short_exchange=short_exchange,
             long_price=long_price, short_price=short_price,
             min_depth_usd=0.0, slippage_pct=999.0,
+            long_limit_price=long_limit, short_limit_price=short_limit,
         )
 
+        # --- UNWIND LOGIC: handle partial fills correctly ---
+        traded_a = Decimal(str(leg_a.traded_qty))
+        traded_b = Decimal(str(leg_b.traded_qty))
+
         if not leg_a.success and not leg_b.success:
+            # Both failed — but either or both may have partial fills
+            unwind_msgs = []
+            if traded_a > 0:
+                logger.error("Both legs failed — Leg A partially filled %.4f, unwinding (selling %s)", traded_a, long_sym)
+                self._unwind_leg(long_sym, "sell", traded_a, long_price, long_exchange)
+                unwind_msgs.append(f"Leg A partial {traded_a} unwound")
+            if traded_b > 0:
+                logger.error("Both legs failed — Leg B partially filled %.4f, unwinding (buying back %s)", traded_b, short_sym)
+                self._unwind_leg(short_sym, "buy", traded_b, short_price, short_exchange)
+                unwind_msgs.append(f"Leg B partial {traded_b} unwound")
+            unwind_info = ("; ".join(unwind_msgs)) if unwind_msgs else "no partial fills"
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Both legs failed: A={leg_a.error}; B={leg_b.error}",
+                error=f"Both legs failed: A={leg_a.error}; B={leg_b.error}. Unwind: {unwind_info}",
             )
 
         if not leg_a.success:
-            # Leg B filled but Leg A failed — unwind Leg B
-            logger.error("Leg A failed, unwinding Leg B (buying back %s)", short_sym)
-            self._unwind_leg(short_sym, "buy", self.quantity, short_price, short_exchange)
+            # Leg A failed — unwind Leg B's actual traded qty
+            unwind_qty_b = traded_b if traded_b > 0 else self.quantity
+            logger.error("Leg A failed, unwinding Leg B (buying back %s qty=%s)", short_sym, unwind_qty_b)
+            self._unwind_leg(short_sym, "buy", unwind_qty_b, short_price, short_exchange)
+            # Also unwind any partial fill on failed Leg A
+            if traded_a > 0:
+                logger.error("Leg A partially filled %.4f, also unwinding (selling %s)", traded_a, long_sym)
+                self._unwind_leg(long_sym, "sell", traded_a, long_price, long_exchange)
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Leg A (LONG {long_sym}) failed: {leg_a.error}. Leg B unwound.",
+                error=f"Leg A (LONG {long_sym}) failed: {leg_a.error}. Leg B unwound (qty={unwind_qty_b}).",
             )
 
         if not leg_b.success:
-            # Leg A filled but Leg B failed — unwind Leg A
-            logger.error("Leg B failed, unwinding Leg A (selling %s)", long_sym)
-            self._unwind_leg(long_sym, "sell", self.quantity, long_price, long_exchange)
+            # Leg B failed — unwind Leg A's actual traded qty
+            unwind_qty_a = traded_a if traded_a > 0 else self.quantity
+            logger.error("Leg B failed, unwinding Leg A (selling %s qty=%s)", long_sym, unwind_qty_a)
+            self._unwind_leg(long_sym, "sell", unwind_qty_a, long_price, long_exchange)
+            # Also unwind any partial fill on failed Leg B
+            if traded_b > 0:
+                logger.error("Leg B partially filled %.4f, also unwinding (buying back %s)", traded_b, short_sym)
+                self._unwind_leg(short_sym, "buy", traded_b, short_price, short_exchange)
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Leg B (SHORT {short_sym}) failed: {leg_b.error}. Leg A unwound.",
+                error=f"Leg B (SHORT {short_sym}) failed: {leg_b.error}. Leg A unwound (qty={unwind_qty_a}).",
             )
 
         # --- Success: set state from order responses (authoritative), then do a soft sync ---
@@ -708,9 +968,12 @@ class ArbitrageEngine:
         self._long_sym = long_sym
         self._short_sym = short_sym
         self._entry_spread_actual = snapshot.exec_spread
+        self._entry_fill_long = _extract_avg_price(leg_a) or long_price
+        self._entry_fill_short = _extract_avg_price(leg_b) or short_price
         logger.info(
-            "ARB ENTRY orders sent — LONG %s@%s / SHORT %s@%s, exec_spread=$%.4f — soft-syncing with exchange...",
-            long_sym, long_exchange, short_sym, short_exchange, snapshot.exec_spread,
+            "ARB ENTRY orders sent — LONG %s@%s @ %.4f / SHORT %s@%s @ %.4f, exec_spread=$%.4f — soft-syncing with exchange...",
+            long_sym, long_exchange, self._entry_fill_long,
+            short_sym, short_exchange, self._entry_fill_short, snapshot.exec_spread,
         )
         # Soft sync: only reset to flat if exchange shows absolutely no positions.
         # One-sided result is ignored here because position API lags after fills.
@@ -785,6 +1048,8 @@ class ArbitrageEngine:
             self._long_sym = None
             self._short_sym = None
             self._entry_spread_actual = None
+            self._entry_fill_long = None
+            self._entry_fill_short = None
             logger.info(
                 "[SIM] ARB EXIT complete — spread=$%.2f, est. PnL=$%.4f",
                 snapshot.spread, pnl,
@@ -900,6 +1165,50 @@ class ArbitrageEngine:
                     f"(fill ${slip_buy.estimated_fill_price:.4f} vs expected ${buy_price:.4f})"
                 )
 
+        # --- Liquidity multiplier guard (exit) ---
+        if self.liquidity_multiplier > 1.0:
+            required_liq = float(self.quantity) * self.liquidity_multiplier
+            avail_sell = sum(float(lv[1]) for lv in book_sell.get("bids", []))
+            avail_buy = sum(float(lv[1]) for lv in book_buy.get("asks", []))
+            logger.info(
+                "Liquidity guard (exit): SELL %s avail=%.4f BUY %s avail=%.4f required=%.4f (qty=%.4f × %.1fx)",
+                sell_sym, avail_sell, buy_sym, avail_buy, required_liq,
+                float(self.quantity), self.liquidity_multiplier,
+            )
+            if avail_sell < required_liq:
+                failures.append(
+                    f"SELL {sell_sym} liquidity: {avail_sell:.4f} available < "
+                    f"{required_liq:.4f} required ({self.liquidity_multiplier:.1f}x × {self.quantity})"
+                )
+            if avail_buy < required_liq:
+                failures.append(
+                    f"BUY {buy_sym} liquidity: {avail_buy:.4f} available < "
+                    f"{required_liq:.4f} required ({self.liquidity_multiplier:.1f}x × {self.quantity})"
+                )
+
+        # --- Top-of-book min-size guard (exit) ---
+        if self.min_top_book_mult > 0:
+            required_top = float(self.quantity) * self.min_top_book_mult
+            bids_sell = book_sell.get("bids", [])
+            asks_buy = book_buy.get("asks", [])
+            top_bid = float(bids_sell[0][1]) if bids_sell else 0.0
+            top_ask = float(asks_buy[0][1]) if asks_buy else 0.0
+            logger.info(
+                "Top-of-book guard (exit): SELL %s best_bid_size=%.4f BUY %s best_ask_size=%.4f required=%.4f (qty=%.4f × %.1fx)",
+                sell_sym, top_bid, buy_sym, top_ask, required_top,
+                float(self.quantity), self.min_top_book_mult,
+            )
+            if top_bid < required_top:
+                failures.append(
+                    f"SELL {sell_sym} top-of-book: best bid size {top_bid:.4f} < "
+                    f"{required_top:.4f} required ({self.min_top_book_mult:.1f}x × {self.quantity})"
+                )
+            if top_ask < required_top:
+                failures.append(
+                    f"BUY {buy_sym} top-of-book: best ask size {top_ask:.4f} < "
+                    f"{required_top:.4f} required ({self.min_top_book_mult:.1f}x × {self.quantity})"
+                )
+
         if failures:
             logger.warning("=== EXIT BLOCKED — %d check(s) failed: %s ===", len(failures), "; ".join(failures))
             return ArbExecutionResult(
@@ -917,6 +1226,14 @@ class ArbitrageEngine:
             snapshot.exec_spread, snapshot.slippage_cost,
         )
 
+        # --- VWAP dynamic limit price computation for exit ---
+        buy_limit = self._compute_vwap_limit(
+            book_buy, "buy", self.quantity, buy_exchange, buy_sym,
+        )
+        sell_limit = self._compute_vwap_limit(
+            book_sell, "sell", self.quantity, sell_exchange, sell_sym,
+        )
+
         # --- PARALLEL EXIT LEG EXECUTION ---
         # For exit, long_sym = sell (close long), short_sym = buy (close short)
         # We reuse _execute_legs_parallel with reversed sides
@@ -925,45 +1242,68 @@ class ArbitrageEngine:
             long_exchange=buy_exchange, short_exchange=sell_exchange,
             long_price=buy_price, short_price=sell_price,
             min_depth_usd=0.0, slippage_pct=999.0,
+            long_limit_price=buy_limit, short_limit_price=sell_limit,
         )
 
+        # --- EXIT UNWIND LOGIC: handle partial fills correctly ---
+        traded_a = Decimal(str(leg_a.traded_qty))
+        traded_b = Decimal(str(leg_b.traded_qty))
+
         if not leg_a.success and not leg_b.success:
-            # Both failed — position still fully open, keep state
-            logger.warning("Both exit legs failed — position kept open.")
+            # Both failed — position still mostly open, but unwind any partial fills
+            unwind_msgs = []
+            if traded_a > 0:
+                logger.error("Both exit legs failed — Leg A partially filled %.4f, unwinding (re-selling %s)", traded_a, buy_sym)
+                self._unwind_leg(buy_sym, "sell", traded_a, buy_price, buy_exchange)
+                unwind_msgs.append(f"Leg A partial {traded_a} unwound")
+            if traded_b > 0:
+                logger.error("Both exit legs failed — Leg B partially filled %.4f, unwinding (re-buying %s)", traded_b, sell_sym)
+                self._unwind_leg(sell_sym, "buy", traded_b, sell_price, sell_exchange)
+                unwind_msgs.append(f"Leg B partial {traded_b} unwound")
+            unwind_info = ("; ".join(unwind_msgs)) if unwind_msgs else "no partial fills"
+            logger.warning("Both exit legs failed — position kept open. Unwind: %s", unwind_info)
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Both exit legs failed: A={leg_a.error}; B={leg_b.error}. Position kept open.",
+                error=f"Both exit legs failed: A={leg_a.error}; B={leg_b.error}. Unwind: {unwind_info}. Position kept open.",
             )
 
         if not leg_a.success:
             # Leg A (BUY buy_sym) failed but Leg B (SELL sell_sym) filled.
-            # Re-open the sell leg to restore the position (re-buy sell_sym).
+            unwind_qty_b = traded_b if traded_b > 0 else self.quantity
             logger.error(
-                "Exit Leg A (BUY %s) failed — Leg B already sold %s. Re-opening SELL to restore position.",
-                buy_sym, sell_sym,
+                "Exit Leg A (BUY %s) failed — Leg B already sold %s qty=%s. Re-opening to restore position.",
+                buy_sym, sell_sym, unwind_qty_b,
             )
-            self._unwind_leg(sell_sym, "buy", self.quantity, sell_price, sell_exchange)
+            self._unwind_leg(sell_sym, "buy", unwind_qty_b, sell_price, sell_exchange)
+            # Also unwind any partial fill on failed Leg A
+            if traded_a > 0:
+                logger.error("Exit Leg A partially filled %.4f, also unwinding (re-selling %s)", traded_a, buy_sym)
+                self._unwind_leg(buy_sym, "sell", traded_a, buy_price, buy_exchange)
             # Position state unchanged — still has_position
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Exit Leg A (BUY {buy_sym}) failed — Leg B unwound back. Position restored.",
+                error=f"Exit Leg A (BUY {buy_sym}) failed — Leg B unwound back (qty={unwind_qty_b}). Position restored.",
             )
 
         if not leg_b.success:
             # Leg B (SELL sell_sym) failed but Leg A (BUY buy_sym) filled.
-            # Re-open the buy leg to restore the position (re-sell buy_sym).
+            unwind_qty_a = traded_a if traded_a > 0 else self.quantity
             logger.error(
-                "Exit Leg B (SELL %s) failed — Leg A already bought back %s. Re-opening BUY to restore position.",
-                sell_sym, buy_sym,
+                "Exit Leg B (SELL %s) failed — Leg A already bought back %s qty=%s. Re-opening to restore position.",
+                sell_sym, buy_sym, unwind_qty_a,
             )
-            self._unwind_leg(buy_sym, "sell", self.quantity, buy_price, buy_exchange)
+            self._unwind_leg(buy_sym, "sell", unwind_qty_a, buy_price, buy_exchange)
+            # Also unwind any partial fill on failed Leg B
+            if traded_b > 0:
+                logger.error("Exit Leg B partially filled %.4f, also unwinding (re-buying %s)", traded_b, sell_sym)
+                self._unwind_leg(sell_sym, "buy", traded_b, sell_price, sell_exchange)
             # Position state unchanged — still has_position
             return ArbExecutionResult(
                 success=False, leg_a=leg_a, leg_b=leg_b,
                 snapshot=snapshot,
-                error=f"Exit Leg B (SELL {sell_sym}) failed — Leg A unwound back. Position restored.",
+                error=f"Exit Leg B (SELL {sell_sym}) failed — Leg A unwound back (qty={unwind_qty_a}). Position restored.",
             )
 
         # --- Success: both legs filled — clear state immediately from order responses ---
@@ -974,6 +1314,8 @@ class ArbitrageEngine:
         self._long_sym = None
         self._short_sym = None
         self._entry_spread_actual = None
+        self._entry_fill_long = None
+        self._entry_fill_short = None
         logger.info("ARB EXIT complete — both legs filled (state cleared from order responses).")
         return ArbExecutionResult(
             success=True, leg_a=leg_a, leg_b=leg_b,
@@ -993,8 +1335,13 @@ class ArbitrageEngine:
         exchange_name: str,
         min_depth_usd: float,
         slippage_pct: float,
+        limit_price: float | None = None,
     ) -> TradeResult:
-        """Execute a single leg using the configured order type."""
+        """Execute a single leg using the configured order type.
+
+        If limit_price is provided (from VWAP computation), it is passed
+        directly to the aggressive limit order, bypassing offset_ticks.
+        """
         leg_client = self._get_client(exchange_name)
 
         if self.order_type == "aggressive_limit":
@@ -1004,6 +1351,7 @@ class ArbitrageEngine:
                 offset_ticks=self.limit_offset_ticks,
                 slippage_pct=slippage_pct, min_depth_usd=min_depth_usd,
                 client=leg_client,
+                limit_price=limit_price,
             )
         else:
             # Fallback: market order (chunked)
@@ -1023,9 +1371,13 @@ class ArbitrageEngine:
         short_price: float,
         min_depth_usd: float,
         slippage_pct: float,
+        long_limit_price: float | None = None,
+        short_limit_price: float | None = None,
     ) -> tuple[TradeResult, TradeResult]:
         """Execute both legs in parallel using ThreadPoolExecutor.
 
+        If long_limit_price / short_limit_price are provided (from VWAP),
+        they are passed through to the order placement, skipping offset_ticks.
         Returns (leg_a_result, leg_b_result). Caller handles unwind logic.
         """
         t_start = time.time()
@@ -1036,12 +1388,14 @@ class ArbitrageEngine:
                 symbol=long_sym, side="buy", quantity=self.quantity,
                 expected_price=long_price, exchange_name=long_exchange,
                 min_depth_usd=min_depth_usd, slippage_pct=slippage_pct,
+                limit_price=long_limit_price,
             )
             future_b = pool.submit(
                 self._execute_single_leg,
                 symbol=short_sym, side="sell", quantity=self.quantity,
                 expected_price=short_price, exchange_name=short_exchange,
                 min_depth_usd=min_depth_usd, slippage_pct=slippage_pct,
+                limit_price=short_limit_price,
             )
 
             # Wait for both to complete
@@ -1266,12 +1620,38 @@ class ArbitrageEngine:
             "long_sym": self._long_sym,
             "short_sym": self._short_sym,
             "entry_spread": self._entry_spread_actual,
+            "entry_fill_long": self._entry_fill_long,
+            "entry_fill_short": self._entry_fill_short,
         }
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _extract_avg_price(result: TradeResult | None) -> float | None:
+    """Extract average fill price from a TradeResult's order response."""
+    if result is None or result.order_response is None:
+        return None
+    resp = result.order_response
+    if resp.get("simulated"):
+        return resp.get("price")
+    # GRVT: state.traded_price
+    state = resp.get("state", {}) if isinstance(resp, dict) else {}
+    if state.get("traded_price"):
+        try:
+            return float(state["traded_price"])
+        except (ValueError, TypeError):
+            pass
+    # Extended / generic: averagePrice, price, avg_price
+    for key in ("averagePrice", "average_price", "avg_price", "price"):
+        if resp.get(key):
+            try:
+                return float(resp[key])
+            except (ValueError, TypeError):
+                pass
+    return None
+
 
 def _mid_price(order_book: dict) -> float:
     """Return the mid price from an order book dict."""

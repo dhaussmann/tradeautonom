@@ -136,6 +136,13 @@ class GrvtClient:
             self.fetch_markets()
         return self._min_size_cache.get(symbol, Decimal("0"))
 
+    def _round_qty(self, amount: Decimal, symbol: str) -> Decimal:
+        """Round quantity down to the instrument's min_size step."""
+        step = self.get_min_order_size(symbol)
+        if step and step > 0:
+            return (amount / step).to_integral_value(rounding="ROUND_DOWN") * step
+        return amount
+
     # ------------------------------------------------------------------
     # Order execution
     # ------------------------------------------------------------------
@@ -149,6 +156,7 @@ class GrvtClient:
         slippage_pct: float | None = None,  # accepted but unused — GRVT handles slippage natively
     ) -> dict:
         """Place a market order. Returns the API response dict."""
+        amount = self._round_qty(amount, symbol)
         cid = client_order_id or rand_uint32()
         resp = self._api.create_order(
             symbol=symbol,
@@ -170,42 +178,54 @@ class GrvtClient:
         offset_ticks: int = 2,
         best_price: float | None = None,
         client_order_id: int | None = None,
+        limit_price: float | None = None,
     ) -> dict:
-        """Place an aggressive limit order: best price + offset ticks for near-certain fill.
+        """Place an aggressive limit order.
 
-        BUY:  limit = best_ask + offset_ticks * tick_size  (cross the spread aggressively)
-        SELL: limit = best_bid - offset_ticks * tick_size
+        If limit_price is provided (e.g. from VWAP on local orderbook), it is
+        used directly — no orderbook fetch or offset calculation needed.
 
-        If best_price is provided it is used directly, avoiding an extra order book fetch.
+        Otherwise falls back to: best price + offset_ticks * tick_size.
         """
+        amount = self._round_qty(amount, symbol)
         cid = client_order_id or rand_uint32()
-        tick = self.get_tick_size(symbol)
 
-        if best_price is not None:
-            best = Decimal(str(best_price))
+        if limit_price is not None:
+            # VWAP-computed limit — use directly
+            final_price = limit_price
+            logger.info(
+                "GRVT VWAP limit: %s %s qty=%s limit=%.4f (VWAP-computed, no OB fetch)",
+                side.upper(), symbol, amount, final_price,
+            )
         else:
-            book = self.fetch_order_book(symbol, limit=1)
-            if side == "buy":
-                if not book.get("asks"):
-                    raise RuntimeError(f"No asks in {symbol} orderbook")
-                best = Decimal(str(book["asks"][0][0]))
+            tick = self.get_tick_size(symbol)
+
+            if best_price is not None:
+                best = Decimal(str(best_price))
             else:
-                if not book.get("bids"):
-                    raise RuntimeError(f"No bids in {symbol} orderbook")
-                best = Decimal(str(book["bids"][0][0]))
+                book = self.fetch_order_book(symbol, limit=1)
+                if side == "buy":
+                    if not book.get("asks"):
+                        raise RuntimeError(f"No asks in {symbol} orderbook")
+                    best = Decimal(str(book["asks"][0][0]))
+                else:
+                    if not book.get("bids"):
+                        raise RuntimeError(f"No bids in {symbol} orderbook")
+                    best = Decimal(str(book["bids"][0][0]))
 
-        if side == "buy":
-            limit_price = float(best + tick * offset_ticks)
-        else:
-            limit_price = float(best - tick * offset_ticks)
+            if side == "buy":
+                final_price = float(best + tick * offset_ticks)
+            else:
+                final_price = float(best - tick * offset_ticks)
 
-        logger.info(
-            "Aggressive limit: %s %s qty=%s best=%s limit=%s offset=%d ticks tick=%s",
-            side.upper(), symbol, amount, best, limit_price, offset_ticks, tick,
-        )
+            logger.info(
+                "Aggressive limit: %s %s qty=%s best=%s limit=%s offset=%d ticks tick=%s",
+                side.upper(), symbol, amount, best, final_price, offset_ticks, tick,
+            )
+
         return self.create_limit_order(
             symbol=symbol, side=side, amount=amount,
-            price=limit_price, client_order_id=cid,
+            price=final_price, client_order_id=cid,
         )
 
     def get_tick_size(self, symbol: str) -> Decimal:
@@ -293,10 +313,18 @@ class GrvtClient:
         return self._api.fetch_open_orders(symbol=symbol, params={"kind": "PERPETUAL"})
 
     def cancel_order(self, order_id: str) -> bool:
-        return self._api.cancel_order(id=order_id, params={"time_to_live_ms": "1000"})
+        # order_id here is actually our client_order_id (cid) —
+        # use client_order_id param so GRVT matches correctly.
+        return self._api.cancel_order(
+            params={"client_order_id": str(order_id), "time_to_live_ms": "1000"},
+        )
 
     def cancel_all_orders(self) -> bool:
         return self._api.cancel_all_orders()
+
+    async def async_cancel_all_orders(self) -> bool:
+        import asyncio
+        return await asyncio.to_thread(self.cancel_all_orders)
 
     def fetch_positions(self, symbols: list[str]) -> list[dict]:
         return self._api.fetch_positions(symbols=symbols)
@@ -322,17 +350,618 @@ class GrvtClient:
         return resp.get("results", [])
 
     def set_leverage(self, instrument: str, leverage: int) -> bool:
-        """Set initial leverage for a specific instrument."""
+        """Set initial leverage for a specific instrument.
+
+        Uses the (deprecated) set_initial_leverage endpoint, then verifies
+        via get_all_initial_leverage that the value was actually applied.
+        Retries once if verification fails.
+        """
         path = self._trade_base_url() + "/full/v1/set_initial_leverage"
         payload = {
             "sub_account_id": self.settings.grvt_trading_account_id,
             "instrument": instrument,
             "leverage": str(leverage),
         }
-        resp = self._api._auth_and_post(path, payload)
-        success = resp.get("success", False)
-        if success:
-            logger.info("Leverage set: %s -> %dx", instrument, leverage)
+
+        for attempt in range(2):
+            resp = self._api._auth_and_post(path, payload)
+            logger.info("GRVT set_leverage(%s, %dx) attempt %d response: %s", instrument, leverage, attempt + 1, resp)
+            success = resp.get("success", False)
+            if not success:
+                logger.warning("GRVT set_leverage API returned non-success: %s -> %dx, response: %s", instrument, leverage, resp)
+                continue
+
+            # Verify leverage was actually applied
+            actual = self._verify_leverage(instrument)
+            if actual is not None and str(actual) == str(leverage):
+                logger.info("GRVT leverage VERIFIED: %s -> %dx (actual=%s)", instrument, leverage, actual)
+                return True
+            elif actual is not None:
+                logger.warning("GRVT leverage MISMATCH: %s requested=%dx actual=%s (attempt %d)", instrument, leverage, actual, attempt + 1)
+            else:
+                logger.warning("GRVT leverage verification inconclusive for %s (attempt %d) — instrument not found in get_all_leverage", instrument, attempt + 1)
+                return bool(success)
+
+        logger.error("GRVT set_leverage FAILED after retries: %s requested=%dx", instrument, leverage)
+        return False
+
+    def _verify_leverage(self, instrument: str) -> str | None:
+        """Read back the current leverage for an instrument. Returns the leverage string or None."""
+        try:
+            all_lev = self.get_all_leverage()
+            for entry in all_lev:
+                if entry.get("instrument") == instrument:
+                    return entry.get("leverage")
+        except Exception as exc:
+            logger.warning("GRVT _verify_leverage error: %s", exc)
+        return None
+
+    async def async_set_leverage(self, instrument: str, leverage: int) -> bool:
+        """Async wrapper around set_leverage (SDK is synchronous)."""
+        import asyncio
+        return await asyncio.to_thread(self.set_leverage, instrument, leverage)
+
+    # ══════════════════════════════════════════════════════════════════
+    # Async methods for the new Funding-Arb Maker-Taker engine
+    # (AsyncExchangeClient protocol — Phase 2)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _market_data_base_url(self) -> str:
+        """Derive the market-data API base URL from environment."""
+        url = get_grvt_endpoint(self._env, "GET_ORDER_BOOK")
+        # e.g. https://market-data.testnet.grvt.io/full/v1/book -> https://market-data.testnet.grvt.io
+        return url.rsplit("/full/", 1)[0]
+
+    async def _get_async_session(self):
+        """Lazily create and return an httpx.AsyncClient for GRVT."""
+        if not hasattr(self, "_async_session") or self._async_session is None:
+            import httpx
+            self._async_session = httpx.AsyncClient(
+                verify=False,
+                timeout=15.0,
+            )
+        return self._async_session
+
+    def _get_auth_headers(self) -> dict[str, str]:
+        """Return auth headers (cookie + account-id) for private REST calls."""
+        sub_account_id = self.settings.grvt_trading_account_id
+        try:
+            self._api.refresh_cookie()
+        except Exception as exc:
+            logger.warning("GRVT cookie refresh failed: %s", exc)
+        cookie = getattr(self._api, "_cookie", None)
+        headers: dict[str, str] = {}
+        if isinstance(cookie, dict):
+            grav = cookie.get("gravity", "")
+            if grav:
+                headers["Cookie"] = f"gravity={grav}"
+            acct = cookie.get("X-Grvt-Account-Id", sub_account_id)
+            headers["X-Grvt-Account-Id"] = str(acct)
+        elif cookie:
+            headers["Cookie"] = str(cookie)
+            headers["X-Grvt-Account-Id"] = sub_account_id
         else:
-            logger.warning("Failed to set leverage: %s -> %dx, response: %s", instrument, leverage, resp)
-        return success
+            headers["X-Grvt-Account-Id"] = sub_account_id
+        return headers
+
+    async def async_fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
+        """Async version of fetch_order_book using direct REST.
+
+        GRVT API only accepts specific depth values. The SDK defaults to 10.
+        """
+        safe_limit = max(limit, 10)
+        client = await self._get_async_session()
+        url = get_grvt_endpoint(self._env, "GET_ORDER_BOOK")
+        payload = {"instrument": symbol, "aggregate": 1, "depth": 10}
+        resp = await client.post(url, json=payload)
+        if resp.status_code != 200:
+            body = resp.text[:500]
+            raise RuntimeError(f"GRVT OB {resp.status_code} for {symbol}: {body}")
+        data = resp.json()
+        raw = data.get("result", {})
+        return {
+            "symbol": raw.get("instrument", symbol),
+            "bids": [[b["price"], b["size"]] for b in raw.get("bids", [])],
+            "asks": [[a["price"], a["size"]] for a in raw.get("asks", [])],
+        }
+
+    async def async_fetch_markets(self) -> list[dict]:
+        """Async version of fetch_markets."""
+        # Delegate to sync version (GRVT SDK is sync-only)
+        import asyncio
+        return await asyncio.to_thread(self.fetch_markets)
+
+    async def async_get_min_order_size(self, symbol: str) -> Decimal:
+        if symbol not in self._min_size_cache:
+            await self.async_fetch_markets()
+        return self._min_size_cache.get(symbol, Decimal("0"))
+
+    async def async_get_tick_size(self, symbol: str) -> Decimal:
+        if symbol not in self._tick_size_cache:
+            await self.async_fetch_markets()
+        return self._tick_size_cache.get(symbol, Decimal("0.01"))
+
+    async def async_create_post_only_order(
+        self, symbol: str, side: str, amount: Decimal, price: Decimal,
+        reduce_only: bool = False,
+    ) -> dict:
+        """Place a GTT post-only limit order on GRVT (maker only).
+
+        Uses GRVT SDK's create_order with time_in_force=GOOD_TILL_TIME
+        and post_only=True. Runs in a thread since the SDK is sync.
+        """
+        import asyncio
+        amount = self._round_qty(amount, symbol)
+        cid = rand_uint32()
+
+        logger.info(
+            "GRVT POST-ONLY %s %s qty=%s @ %s cid=%s (reduce_only=%s)",
+            side.upper(), symbol, amount, price, cid, reduce_only,
+        )
+
+        params = {
+            "client_order_id": cid,
+            "time_in_force": "GOOD_TILL_TIME",
+            "post_only": True,
+        }
+        if reduce_only:
+            params["reduce_only"] = True
+
+        def _place():
+            return self._api.create_order(
+                symbol=symbol,
+                order_type="limit",
+                side=side,
+                amount=amount,
+                price=float(price),
+                params=params,
+            )
+
+        resp = await asyncio.to_thread(_place)
+        if not resp:
+            raise RuntimeError("GRVT post-only order rejected (empty response)")
+
+        state = resp.get("state", {})
+        status = state.get("status", "UNKNOWN")
+        order_id = resp.get("order_id", resp.get("metadata", {}).get("client_order_id", str(cid)))
+
+        logger.info("GRVT post-only placed: cid=%s status=%s", cid, status)
+
+        if status == "REJECTED" and state.get("reject_reason") == "FAIL_POST_ONLY":
+            raise RuntimeError(f"GRVT post-only rejected: would cross book (FAIL_POST_ONLY)")
+
+        return {
+            "id": str(cid),
+            "order_id": str(order_id),
+            "status": status,
+            "limit_price": float(price),
+        }
+
+    async def async_create_ioc_order(
+        self, symbol: str, side: str, amount: Decimal, price: Decimal,
+        reduce_only: bool = False,
+    ) -> dict:
+        """Place an IOC limit order on GRVT (taker)."""
+        import asyncio
+        amount = self._round_qty(amount, symbol)
+        cid = rand_uint32()
+
+        logger.info("GRVT IOC %s %s qty=%s @ %s cid=%s (reduce_only=%s)", side.upper(), symbol, amount, price, cid, reduce_only)
+
+        params = {"client_order_id": cid, "time_in_force": "IMMEDIATE_OR_CANCEL"}
+        if reduce_only:
+            params["reduce_only"] = True
+
+        def _place():
+            return self._api.create_order(
+                symbol=symbol,
+                order_type="limit",
+                side=side,
+                amount=amount,
+                price=float(price),
+                params=params,
+            )
+
+        resp = await asyncio.to_thread(_place)
+        if not resp:
+            raise RuntimeError("GRVT IOC order rejected (empty response)")
+
+        state = resp.get("state", {})
+        status = state.get("status", "UNKNOWN")
+        traded = state.get("traded_size", ["0"])
+        traded_qty = float(traded[0]) if traded else 0.0
+
+        logger.info("GRVT IOC placed: cid=%s status=%s traded=%s", cid, status, traded_qty)
+        return {
+            "id": str(cid),
+            "status": status,
+            "traded_qty": traded_qty,
+            "limit_price": float(price),
+        }
+
+    async def async_cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order on GRVT."""
+        import asyncio
+        try:
+            result = await asyncio.to_thread(self.cancel_order, order_id)
+            logger.info("GRVT cancel_order(%s): %s", order_id, result)
+            return bool(result)
+        except Exception as exc:
+            logger.warning("GRVT cancel_order(%s) error: %s", order_id, exc)
+            return False
+
+    async def async_check_order_fill(self, order_id: str) -> dict:
+        """Async version of check_order_fill."""
+        import asyncio
+        return await asyncio.to_thread(self.check_order_fill, int(order_id))
+
+    async def async_fetch_positions(self, symbols: list[str] | None = None) -> list[dict]:
+        """Async version of fetch_positions."""
+        import asyncio
+        return await asyncio.to_thread(self.fetch_positions, symbols or [])
+
+    async def async_fetch_funding_rate(self, symbol: str) -> dict:
+        """Fetch the latest funding rate for a GRVT perpetual.
+
+        Endpoint: POST full/v1/funding
+        """
+        client = await self._get_async_session()
+        url = self._market_data_base_url() + "/full/v1/funding"
+        payload = {
+            "instrument": symbol,
+            "limit": 1,
+            "agg_type": "FUNDING_INTERVAL",
+        }
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("result", [])
+        if not results:
+            return {"symbol": symbol, "funding_rate": 0.0, "next_funding_time": None}
+        r = results[0]
+        return {
+            "symbol": symbol,
+            "funding_rate": float(r.get("funding_rate", 0)),
+            "funding_rate_8h_avg": float(r.get("funding_rate_8_h_avg", 0)),
+            "mark_price": r.get("mark_price"),
+            "funding_time": r.get("funding_time"),
+            "funding_interval_hours": r.get("funding_interval_hours"),
+            "next_funding_time": None,
+        }
+
+    async def async_subscribe_fills(self, symbol: str, callback) -> None:
+        """Subscribe to GRVT fill WS stream (v1.fill).
+
+        Requires authenticated WS connection with cookie + account ID.
+        """
+        import ssl as _ssl
+        import websockets
+        import json
+
+        # Derive WS URL from trade endpoint
+        trade_base = self._trade_base_url()
+        ws_url = trade_base.replace("https://", "wss://") + "/ws/full"
+
+        sub_account_id = self.settings.grvt_trading_account_id
+        selector = f"{sub_account_id}-{symbol}" if symbol else str(sub_account_id)
+
+        logger.info("GRVT fill WS connecting: %s selector=%s", ws_url, selector)
+
+        ssl_ctx = _ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = _ssl.CERT_NONE
+
+        while True:
+            # Refresh cookie before each connect attempt
+            try:
+                self._api.refresh_cookie()
+            except Exception as exc:
+                logger.warning("GRVT fill WS: cookie refresh failed: %s", exc)
+            cookie = getattr(self._api, "_cookie", None)
+            headers = {}
+            if isinstance(cookie, dict):
+                grav = cookie.get("gravity", "")
+                if grav:
+                    headers["Cookie"] = f"gravity={grav}"
+                acct = cookie.get("X-Grvt-Account-Id", sub_account_id)
+                headers["X-Grvt-Account-Id"] = str(acct)
+            elif cookie:
+                headers["Cookie"] = str(cookie)
+                headers["X-Grvt-Account-Id"] = sub_account_id
+            else:
+                headers["X-Grvt-Account-Id"] = sub_account_id
+
+            try:
+                async for ws in websockets.connect(ws_url, ssl=ssl_ctx, extra_headers=headers):
+                    try:
+                        # Subscribe to fill stream
+                        sub_msg = json.dumps({
+                            "jsonrpc": "2.0",
+                            "method": "subscribe",
+                            "params": {"stream": "v1.fill", "selectors": [selector]},
+                            "id": 1,
+                        })
+                        await ws.send(sub_msg)
+                        logger.info("GRVT fill WS subscribed: %s", selector)
+
+                        async for raw in ws:
+                            msg = json.loads(raw)
+                            # v1.fill: feed is a single Fill object with fields:
+                            # order_id (hex), client_order_id, size, price, is_taker, instrument, ...
+                            f = msg.get("feed")
+                            if not isinstance(f, dict):
+                                continue
+                            oid = f.get("order_id", "")
+                            client_oid = f.get("client_order_id", "")
+                            fill = {
+                                "order_id": client_oid or oid,
+                                "order_id_hex": oid,
+                                "filled_qty": float(f.get("size", 0)),
+                                "remaining_qty": 0.0,
+                                "price": float(f.get("price", 0)),
+                                "is_taker": f.get("is_taker", False),
+                                "symbol": f.get("instrument", symbol),
+                            }
+                            logger.info("GRVT fill WS parsed: order=%s client=%s qty=%.6f price=%.4f taker=%s",
+                                        oid, client_oid, fill["filled_qty"], fill["price"], fill["is_taker"])
+                            await callback(fill)
+                    except websockets.ConnectionClosed:
+                        logger.warning("GRVT fill WS disconnected, reconnecting…")
+                        continue
+            except Exception as exc:
+                logger.warning("GRVT fill WS connect error: %s — retrying in 5s", exc)
+                import asyncio
+                await asyncio.sleep(5)
+
+    # ══════════════════════════════════════════════════════════════════
+    # Journal — history fetching for Trading Journal / PnL tracking
+    # ══════════════════════════════════════════════════════════════════
+
+    async def async_fetch_order_history(
+        self, instrument: str | None = None, since_ms: int | None = None, limit: int = 500,
+    ) -> list[dict]:
+        """Fetch completed orders from GRVT.
+
+        Uses direct REST: POST /full/v1/order_history
+        """
+        client = await self._get_async_session()
+        url = self._trade_base_url() + "/full/v1/order_history"
+        sub_account_id = self.settings.grvt_trading_account_id
+        all_orders: list[dict] = []
+        cursor: str = ""
+
+        import time as _time
+        now_ns = str(int(_time.time() * 1_000_000_000))
+        start_ns = str(since_ms * 1_000_000) if since_ms else "0"
+
+        while True:
+            payload: dict = {
+                "sub_account_id": sub_account_id,
+                "kind": ["PERPETUAL"],
+                "start_time": start_ns,
+                "end_time": now_ns,
+                "limit": min(limit, 500),
+                "cursor": cursor,
+            }
+            if instrument:
+                payload["base"] = [instrument.split("_")[0]]
+
+            try:
+                logger.info("GRVT order history request: %s", payload)
+                resp = await client.post(url, json=payload, headers=self._get_auth_headers())
+                resp.raise_for_status()
+                data = resp.json()
+                logger.info("GRVT order history response: count=%d next=%r", len(data.get("result", [])), data.get("next", ""))
+            except Exception as exc:
+                logger.warning("GRVT order history error: %s", exc)
+                break
+
+            results = data.get("result", [])
+            if not results:
+                break
+
+            for o in results:
+                metadata = o.get("metadata", {})
+                state = o.get("state", {})
+                legs = o.get("legs", [{}])
+                leg = legs[0] if legs else {}
+
+                created_ns = int(metadata.get("create_time", 0))
+                created_ms = created_ns // 1_000_000 if created_ns > 1e15 else created_ns
+
+                instr = leg.get("instrument", instrument or "")
+                status = state.get("status", "").upper()
+                # GRVT returns these as arrays (one per leg)
+                avg_prices = state.get("avg_fill_price", [0])
+                traded_sizes = state.get("traded_size", [0])
+                book_sizes = state.get("book_size", [0])
+                avg_price = float(avg_prices[0]) if isinstance(avg_prices, list) and avg_prices else float(avg_prices or 0)
+                filled_qty = float(traded_sizes[0]) if isinstance(traded_sizes, list) and traded_sizes else float(traded_sizes or 0)
+                book_qty = float(book_sizes[0]) if isinstance(book_sizes, list) and book_sizes else float(book_sizes or 0)
+
+                all_orders.append({
+                    "exchange_order_id": str(o.get("order_id", metadata.get("client_order_id", ""))),
+                    "exchange": "grvt",
+                    "instrument": instr,
+                    "token": self._extract_token(instr),
+                    "side": (leg.get("side", "")).upper() if leg.get("side") else ("BUY" if leg.get("is_buying_asset") else "SELL"),
+                    "order_type": o.get("time_in_force", "LIMIT").upper(),
+                    "status": status,
+                    "price": float(leg.get("limit_price", 0)),
+                    "average_price": avg_price,
+                    "qty": filled_qty + book_qty,
+                    "filled_qty": filled_qty,
+                    "fee": 0.0,
+                    "reduce_only": 1 if o.get("reduce_only") else 0,
+                    "post_only": 1 if o.get("post_only") else 0,
+                    "created_at": created_ms,
+                    "updated_at": created_ms,
+                })
+
+            next_cursor = data.get("next", "")
+            if not next_cursor or len(results) < min(limit, 500):
+                break
+            cursor = next_cursor
+
+        logger.info("GRVT order history: fetched %d orders", len(all_orders))
+        return all_orders
+
+    async def async_fetch_fill_history(
+        self, instrument: str | None = None, since_ms: int | None = None, limit: int = 500,
+    ) -> list[dict]:
+        """Fetch fill/trade history from GRVT.
+
+        Uses direct REST: POST /full/v1/fill_history
+        """
+        client = await self._get_async_session()
+        url = self._trade_base_url() + "/full/v1/fill_history"
+        sub_account_id = self.settings.grvt_trading_account_id
+        all_fills: list[dict] = []
+        cursor: str = ""
+        since_ns = since_ms * 1_000_000 if since_ms else 0
+
+        while True:
+            payload: dict = {
+                "sub_account_id": sub_account_id,
+                "limit": min(limit, 500),
+            }
+            if instrument:
+                payload["base"] = [instrument.split("_")[0]]
+            if cursor:
+                payload["cursor"] = cursor
+
+            try:
+                resp = await client.post(url, json=payload, headers=self._get_auth_headers())
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                logger.warning("GRVT fill history error: %s", exc)
+                break
+
+            results = data.get("result", [])
+            if not results:
+                break
+
+            hit_cutoff = False
+            for f in results:
+                created_ns = int(f.get("fill_time", f.get("event_time", 0)))
+                if since_ns and created_ns < since_ns:
+                    hit_cutoff = True
+                    break
+                created_ms = created_ns // 1_000_000 if created_ns > 1e15 else created_ns
+
+                instr = f.get("instrument", instrument or "")
+                qty = float(f.get("size", f.get("fill_size", 0)))
+                price = float(f.get("price", f.get("fill_price", 0)))
+                fee = float(f.get("fee", 0))
+                is_taker = f.get("is_taker", False)
+
+                all_fills.append({
+                    "exchange_fill_id": str(f.get("fill_id", f.get("event_id", ""))),
+                    "exchange_order_id": str(f.get("order_id", "")),
+                    "exchange": "grvt",
+                    "instrument": instr,
+                    "token": self._extract_token(instr),
+                    "side": (f.get("side", "")).upper() if f.get("side") else ("BUY" if f.get("is_buying_asset") else "SELL"),
+                    "price": price,
+                    "qty": qty,
+                    "value": qty * price,
+                    "fee": fee,
+                    "is_taker": 1 if is_taker else 0,
+                    "trade_type": "TRADE",
+                    "created_at": created_ms,
+                })
+
+            next_cursor = data.get("next", "")
+            if hit_cutoff or not next_cursor or len(results) < min(limit, 500):
+                break
+            cursor = next_cursor
+
+        logger.info("GRVT fill history: fetched %d fills", len(all_fills))
+        return all_fills
+
+    async def async_fetch_funding_payments(
+        self, instrument: str | None = None, since_ms: int | None = None, limit: int = 500,
+    ) -> list[dict]:
+        """Fetch funding payment history from GRVT.
+
+        Uses direct REST: POST /full/v1/funding_payment_history (private, requires auth).
+        """
+        client = await self._get_async_session()
+        url = self._trade_base_url() + "/full/v1/funding_payment_history"
+        sub_account_id = self.settings.grvt_trading_account_id
+        all_payments: list[dict] = []
+        cursor: str = ""
+
+        while True:
+            payload: dict = {
+                "sub_account_id": sub_account_id,
+                "limit": min(limit, 500),
+            }
+            if instrument:
+                payload["base"] = [instrument.split("_")[0]]
+            if since_ms:
+                payload["start_time"] = str(since_ms * 1_000_000)
+            if cursor:
+                payload["cursor"] = cursor
+
+            try:
+                resp = await client.post(url, json=payload, headers=self._get_auth_headers())
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                logger.warning("GRVT funding payments error: %s", exc)
+                break
+
+            results = data.get("result", [])
+            if not results:
+                break
+
+            for r in results:
+                event_ns = int(r.get("event_time", 0))
+                event_ms = event_ns // 1_000_000 if event_ns > 1e15 else event_ns
+
+                instr = r.get("instrument", instrument or "")
+                all_payments.append({
+                    "exchange_payment_id": r.get("tx_id", f"grvt-{instr}-{event_ms}"),
+                    "exchange": "grvt",
+                    "instrument": instr,
+                    "token": self._extract_token(instr),
+                    "side": "",
+                    "size": 0.0,
+                    "funding_fee": float(r.get("amount", 0)),
+                    "funding_rate": 0.0,
+                    "mark_price": 0.0,
+                    "paid_at": event_ms,
+                })
+
+            next_cursor = data.get("next", "")
+            if not next_cursor or len(results) < min(limit, 500):
+                break
+            cursor = next_cursor
+
+        logger.info("GRVT funding payments: fetched %d records", len(all_payments))
+        return all_payments
+
+    @staticmethod
+    def _extract_token(instrument: str) -> str:
+        """Extract token from GRVT instrument (e.g. 'BTC_USDT_Perp' -> 'BTC')."""
+        parts = instrument.replace("_", "-").split("-")
+        return parts[0] if parts else instrument
+
+    async def async_subscribe_funding_rate(self, symbol: str, callback) -> None:
+        """Subscribe to GRVT funding rate via WS JSONRPC polling.
+
+        GRVT doesn't have a dedicated funding rate WS stream — we use
+        periodic REST polling wrapped in an async loop.
+        """
+        import asyncio
+
+        logger.info("GRVT funding rate poller started for %s", symbol)
+        while True:
+            try:
+                rate_data = await self.async_fetch_funding_rate(symbol)
+                await callback(rate_data)
+            except Exception as exc:
+                logger.warning("GRVT funding rate poll error: %s", exc)
+            await asyncio.sleep(60)  # poll every 60s

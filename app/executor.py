@@ -18,6 +18,7 @@ class TradeResult:
     depth: DepthResult | None
     slippage: SlippageResult | None
     error: str | None
+    traded_qty: float = 0.0
 
 
 class TradeExecutor:
@@ -127,6 +128,7 @@ class TradeExecutor:
             depth=depth,
             slippage=slippage,
             error=None,
+            traded_qty=float(quantity),
         )
 
     def execute_aggressive_limit_order(
@@ -139,11 +141,16 @@ class TradeExecutor:
         slippage_pct: float | None = None,
         min_depth_usd: float | None = None,
         client: ExchangeClient | None = None,
+        limit_price: float | None = None,
     ) -> TradeResult:
         """Run safety checks and place an aggressive limit order.
 
         Same pre-trade validation as market orders, but uses
         create_aggressive_limit_order for tighter price control.
+
+        If limit_price is provided (e.g. from VWAP computation on the local
+        orderbook), it is passed directly to the client, which can skip its
+        own orderbook fetch — saving 200-500ms of latency.
         """
         active_client = client or self.client
 
@@ -193,6 +200,7 @@ class TradeExecutor:
                 resp = active_client.create_aggressive_limit_order(
                     symbol=symbol, side=side, amount=quantity,
                     offset_ticks=offset_ticks, best_price=best_price,
+                    limit_price=limit_price,
                 )
                 last_exc = None
                 break
@@ -250,14 +258,17 @@ class TradeExecutor:
                     attempt, fill_check.get("status"), fill_check.get("traded_qty"),
                 )
             if not filled:
+                partial_qty = float(fill_check.get('traded_qty', 0) or 0)
                 msg = (
                     f"Order {side.upper()} {symbol} placed but not filled "
-                    f"(status={fill_check.get('status')} traded={fill_check.get('traded_qty', 0)}) — "
+                    f"(status={fill_check.get('status')} traded={partial_qty}) — "
                     f"IOC order expired or rejected"
                 )
                 logger.error(msg)
-                return TradeResult(success=False, order_response=resp, depth=depth, slippage=slippage, error=msg)
+                return TradeResult(success=False, order_response=resp, depth=depth, slippage=slippage, error=msg, traded_qty=partial_qty)
 
+        # If we skipped fill-check (already FILLED), get traded_qty from state
+        final_traded = traded_qty if traded_qty > 0 else float(quantity)
         logger.info("Aggressive limit order executed: symbol=%s side=%s status=%s traded=%s",
-                    symbol, side, status or "unknown", traded_qty)
-        return TradeResult(success=True, order_response=resp, depth=depth, slippage=slippage, error=None)
+                    symbol, side, status or "unknown", final_traded)
+        return TradeResult(success=True, order_response=resp, depth=depth, slippage=slippage, error=None, traded_qty=final_traded)

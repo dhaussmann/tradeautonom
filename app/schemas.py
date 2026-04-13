@@ -49,6 +49,7 @@ class TradeResponse(BaseModel):
 class ArbTriggerRequest(BaseModel):
     """Trigger an arb entry or exit."""
     action: str = Field(..., description="'ENTRY' or 'EXIT'")
+    force: bool = Field(False, description="Force execution: bypass spread guards using current spread")
     spread_entry_low: float | None = Field(None, description="Override: enter when spread <= this")
     spread_exit_high: float | None = Field(None, description="Override: exit when spread >= this")
     quantity: float | None = Field(None, gt=0, description="Override quantity for both legs")
@@ -74,6 +75,7 @@ class ArbConfigRequest(BaseModel):
     min_depth_usd: float | None = Field(None, ge=0, description="Min book depth in USD")
     slippage_pct: float | None = Field(None, ge=0, description="Max slippage %")
     liquidity_multiplier: float | None = Field(None, ge=1.0, description="Min liquidity as multiple of qty")
+    min_top_book_mult: float | None = Field(None, ge=0, description="Best bid/ask must hold qty × mult (0=disabled)")
     chunk_size: float | None = Field(None, gt=0, description="Order chunk size for splitting large orders")
     chunk_delay_ms: int | None = Field(None, ge=0, description="Delay between chunks in ms")
     instrument_a: str | None = Field(None, description="Instrument for leg A")
@@ -82,11 +84,13 @@ class ArbConfigRequest(BaseModel):
     leg_b_exchange: str | None = Field(None, description="Exchange for leg B (grvt or extended)")
     simulation_mode: bool | None = Field(None, description="Paper-trade mode (no real orders)")
     order_type: str | None = Field(None, description="Order type: 'aggressive_limit' or 'market'")
-    limit_offset_ticks: int | None = Field(None, ge=0, description="Ticks beyond best price for aggressive limit")
+    limit_offset_ticks: int | None = Field(None, ge=0, description="Ticks beyond best price for aggressive limit (fallback)")
+    vwap_buffer_ticks: int | None = Field(None, ge=0, description="Extra ticks beyond VWAP worst-fill for latency protection")
     min_profit: float | None = Field(None, ge=0, description="Min profit margin in USD above break-even")
     fill_timeout_ms: int | None = Field(None, ge=0, description="Max ms to wait for fill confirmation")
     ws_enabled: bool | None = Field(None, description="Use WebSocket feeds for orderbook data")
     ws_stale_ms: int | None = Field(None, ge=0, description="Max age (ms) before WS data is stale")
+    signal_confirmations: int | None = Field(None, ge=1, description="Consecutive ticks required before executing")
 
 
 class ArbStatusResponse(BaseModel):
@@ -102,16 +106,22 @@ class ArbStatusResponse(BaseModel):
     instrument_a: str
     instrument_b: str
     liquidity_multiplier: float
+    min_top_book_mult: float = 2.0
     chunk_size: float
     chunk_delay_ms: int
     leg_a_exchange: str
     leg_b_exchange: str
     order_type: str
     limit_offset_ticks: int
+    vwap_buffer_ticks: int = 2
     min_profit: float
     fill_timeout_ms: int
     ws_enabled: bool
     ws_stale_ms: int
+    signal_confirmations: int = 3
+    strategy: str = "arbitrage"
+    max_spread_pct: float = 0.01
+    funding_rate_bias: str | None = None
     long_sym: str | None = None
     short_sym: str | None = None
     entry_spread_actual: float | None = None
@@ -122,12 +132,17 @@ class SpreadInfo(BaseModel):
     instrument_b: str
     mid_price_a: float
     mid_price_b: float
+    best_bid_a: float = 0.0
+    best_ask_a: float = 0.0
+    best_bid_b: float = 0.0
+    best_ask_b: float = 0.0
     spread: float
     spread_abs: float
     a_is_cheaper: bool
     exec_spread: float = 0.0
     slippage_cost: float = 0.0
     break_even_spread: float = 0.0
+    spread_pct: float = 0.0
     data_source: str = "rest"
 
 
@@ -196,6 +211,11 @@ class JobCreateRequest(BaseModel):
     chunk_size: float = Field(1.0, gt=0)
     chunk_delay_ms: int = Field(500, ge=0)
     liquidity_multiplier: float = Field(2.0, ge=1.0)
+    min_top_book_mult: float = Field(2.0, ge=0, description="Best bid/ask must hold qty × mult (0=disabled)")
+    signal_confirmations: int = Field(3, ge=1, description="Consecutive ticks confirming signal before executing")
+    strategy: str = Field("arbitrage", description="Strategy: 'arbitrage' or 'delta_neutral'")
+    max_spread_pct: float = Field(0.01, ge=0, description="Delta-neutral: max spread in % of mid-price")
+    funding_rate_bias: str | None = Field(None, description="Stub for future funding-rate API")
     auto_trade: bool = Field(False, description="Enable auto-trading for this job")
     # Schedule
     hold_duration_h: float | None = Field(None, ge=0, description="Max hours before scheduled exit")
@@ -221,6 +241,11 @@ class JobConfigUpdateRequest(BaseModel):
     chunk_size: float | None = Field(None, gt=0)
     chunk_delay_ms: int | None = Field(None, ge=0)
     liquidity_multiplier: float | None = Field(None, ge=1.0)
+    min_top_book_mult: float | None = Field(None, ge=0)
+    signal_confirmations: int | None = Field(None, ge=1)
+    strategy: str | None = Field(None, description="Strategy: 'arbitrage' or 'delta_neutral'")
+    max_spread_pct: float | None = Field(None, ge=0)
+    funding_rate_bias: str | None = None
     auto_trade: bool | None = None
     hold_duration_h: float | None = Field(None, ge=0)
     min_exit_spread: float | None = Field(None, ge=0)
@@ -243,6 +268,9 @@ class TradeLogEntryResponse(BaseModel):
     quantity: float
     success: bool
     error: str | None = None
+    pnl: float | None = None
+    entry_fill_a: float | None = None
+    entry_fill_b: float | None = None
 
 
 class JobStatusResponse(BaseModel):
@@ -265,11 +293,17 @@ class JobStatusResponse(BaseModel):
     simulation_mode: bool
     order_type: str
     limit_offset_ticks: int
+    vwap_buffer_ticks: int = 2
     min_profit: float
     fill_timeout_ms: int
     chunk_size: float
     chunk_delay_ms: int
     liquidity_multiplier: float
+    min_top_book_mult: float = 2.0
+    signal_confirmations: int = 3
+    strategy: str = "arbitrage"
+    max_spread_pct: float = 0.01
+    funding_rate_bias: str | None = None
     # Schedule
     hold_duration_h: float | None = None
     min_exit_spread: float
@@ -278,6 +312,8 @@ class JobStatusResponse(BaseModel):
     long_sym: str | None = None
     short_sym: str | None = None
     entry_spread_actual: float | None = None
+    entry_fill_long: float | None = None
+    entry_fill_short: float | None = None
     # WS
     ws_enabled: bool
     ws_stale_ms: int

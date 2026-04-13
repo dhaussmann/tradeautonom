@@ -1,142 +1,92 @@
-#!/usr/bin/env bash
-# ──────────────────────────────────────────────────────────────
-# deploy.sh — Deploy TradeAutonom to Synology NAS
+#!/bin/bash
+# ── Hot-Deploy to NAS ──────────────────────────────────────────
+# Usage: ./deploy.sh [file1.py file2.py ...]
+#   No args = deploy ALL .py files from app/
+#   With args = deploy only specified files
 #
-# Usage:
-#   ./deploy.sh              # sync code + rebuild + restart
-#   ./deploy.sh --restart    # restart container only (no rebuild)
-#   ./deploy.sh --logs       # tail live container logs
-#   ./deploy.sh --stop       # stop the container
-#   ./deploy.sh --status     # show container + health status
-# ──────────────────────────────────────────────────────────────
+# Copies files to the shared code directory on the NAS.
+# Uvicorn auto-reload detects changes and restarts the Python process.
+# Vault auto-unlocks from persisted session — no manual unlock needed.
+#
+# Safety: checks all containers for active bots before deploying.
+
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NAS="dhaussmann@192.168.133.253"
+NAS_IP="192.168.133.253"
+REMOTE_APP="/volume1/docker/tradeautonom/app"
+PORTS=(8005 9001 9002 9003)
 
-# Load NAS connection from .env
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-    NAS_HOST=$(grep -E '^NAS_HOST=' "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '"' | tr -d "'")
-    NAS_USER=$(grep -E '^NAS_USER=' "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '"' | tr -d "'")
-    NAS_DEPLOY_PATH=$(grep -E '^NAS_DEPLOY_PATH=' "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '"' | tr -d "'")
+# ── Idle-Guard: abort if any bot is active ─────────────────────
+
+echo "Checking containers for active bots..."
+
+for port in "${PORTS[@]}"; do
+    result=$(curl -sf "http://${NAS_IP}:${port}/health" 2>/dev/null || echo "OFFLINE")
+    if [ "$result" = "OFFLINE" ]; then
+        echo "  Port ${port}: offline (skipping)"
+        continue
+    fi
+
+    # Check bot states via /fn/bots endpoint
+    active=$(curl -sf "http://${NAS_IP}:${port}/fn/bots" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    bots = json.load(sys.stdin)
+    if isinstance(bots, dict):
+        bots = bots.get('bots', [])
+    active = [b for b in bots if isinstance(b, dict) and b.get('state', 'IDLE').upper() not in ('IDLE', 'OFF', 'HOLDING')]
+    if active:
+        names = ', '.join(b.get('bot_id', '?') for b in active)
+        print(f'BLOCKED: port {port} has active bot(s): {names}')
+        sys.exit(1)
+    else:
+        print('idle')
+except Exception as e:
+    print('idle')  # If endpoint fails, assume idle (vault locked)
+" 2>/dev/null || echo "idle")
+
+    if [[ "$active" == BLOCKED* ]]; then
+        echo "  $active"
+        echo ""
+        echo "ABORTED. Wait for bots to finish or stop them first."
+        exit 1
+    fi
+    echo "  Port ${port}: ${active}"
+done
+
+echo ""
+
+# ── Determine files to deploy ──────────────────────────────────
+
+if [ $# -eq 0 ]; then
+    echo "No files specified — deploying ALL app/*.py files"
+    FILES=(app/*.py)
+else
+    FILES=()
+    for f in "$@"; do
+        if [ -f "app/$f" ]; then
+            FILES+=("app/$f")
+        elif [ -f "$f" ]; then
+            FILES+=("$f")
+        else
+            echo "ERROR: File not found: $f"
+            exit 1
+        fi
+    done
 fi
 
-NAS_HOST="${NAS_HOST:?Set NAS_HOST in .env (e.g. 192.168.1.100)}"
-NAS_USER="${NAS_USER:-admin}"
-NAS_DEPLOY_PATH="${NAS_DEPLOY_PATH:-/volume1/docker/tradeautonom}"
+# ── Deploy ─────────────────────────────────────────────────────
 
-SSH_TARGET="${NAS_USER}@${NAS_HOST}"
-SSH_KEY="${HOME}/.ssh/id_ed25519"
-SSH_OPTS="-o ConnectTimeout=5 -o IdentitiesOnly=yes -i ${SSH_KEY}"
-IMAGE_NAME="tradeautonom"
-CONTAINER_NAME="tradeautonom"
-APP_PORT=$(grep -E '^APP_PORT=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "8002")
+echo "Deploying ${#FILES[@]} file(s) to ${NAS}:${REMOTE_APP}/"
+echo ""
 
-info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
-ok()    { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
-err()   { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; }
+for f in "${FILES[@]}"; do
+    basename=$(basename "$f")
+    cat "$f" | ssh "$NAS" "cat > ${REMOTE_APP}/${basename}" 2>/dev/null
+    echo "  ✓ ${basename}"
+done
 
-P="/usr/local/bin"  # docker lives here on Synology
-ssh_nas() { ssh ${SSH_OPTS} "$SSH_TARGET" "$@"; }
-
-# ── Commands ──────────────────────────────────────────────────
-
-cmd_sync() {
-    info "Syncing code to ${SSH_TARGET}:${NAS_DEPLOY_PATH}"
-    tar -C "$SCRIPT_DIR" \
-        --exclude='.venv' \
-        --exclude='venv' \
-        --exclude='.git' \
-        --exclude='__pycache__' \
-        --exclude='*.pyc' \
-        --exclude='.env' \
-        --exclude='data' \
-        --exclude='server.log' \
-        --exclude='.mypy_cache' \
-        --exclude='.ruff_cache' \
-        --exclude='.windsurf' \
-        -czf - . \
-    | ssh_nas "mkdir -p '${NAS_DEPLOY_PATH}' && tar -C '${NAS_DEPLOY_PATH}' -xzf -"
-    ok "Code synced"
-}
-
-cmd_build() {
-    info "Building Docker image on NAS"
-    ssh_nas "cd '${NAS_DEPLOY_PATH}' && ${P}/docker build -f docker/Dockerfile.nas -t ${IMAGE_NAME}:latest ."
-    ok "Image built"
-}
-
-cmd_up() {
-    info "Starting container on NAS"
-    # Stop and remove existing container if present
-    ssh_nas "${P}/docker rm -f ${CONTAINER_NAME} 2>/dev/null || true"
-    ssh_nas "${P}/docker run -d \
-        --name ${CONTAINER_NAME} \
-        --restart unless-stopped \
-        -p ${APP_PORT}:${APP_PORT} \
-        -e APP_HOST=0.0.0.0 \
-        --env-file '${NAS_DEPLOY_PATH}/.env' \
-        -v '${NAS_DEPLOY_PATH}/data:/app/data' \
-        ${IMAGE_NAME}:latest"
-    ok "Container started"
-}
-
-cmd_restart() {
-    info "Restarting container on NAS"
-    ssh_nas "${P}/docker restart ${CONTAINER_NAME}"
-    ok "Container restarted"
-}
-
-cmd_stop() {
-    info "Stopping container on NAS"
-    ssh_nas "${P}/docker stop ${CONTAINER_NAME} && ${P}/docker rm ${CONTAINER_NAME}"
-    ok "Container stopped"
-}
-
-cmd_logs() {
-    info "Tailing container logs (Ctrl+C to stop)"
-    ssh_nas "${P}/docker logs ${CONTAINER_NAME} --tail 100 -f"
-}
-
-cmd_status() {
-    info "Container status:"
-    ssh_nas "${P}/docker ps --filter name=${CONTAINER_NAME} --format 'table {{.Status}}	{{.Ports}}'"
-    echo ""
-    APP_PORT=$(grep -E '^APP_PORT=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "8002")
-    info "Health check:"
-    curl -s --connect-timeout 3 "http://${NAS_HOST}:${APP_PORT}/health" | python3 -m json.tool 2>/dev/null || err "Cannot reach http://${NAS_HOST}:${APP_PORT}/health"
-    echo ""
-    info "Job status:"
-    curl -s --connect-timeout 3 "http://${NAS_HOST}:${APP_PORT}/jobs" | python3 -m json.tool 2>/dev/null || err "Cannot reach API"
-}
-
-cmd_deploy() {
-    cmd_sync
-    cmd_build
-    cmd_up
-    echo ""
-    APP_PORT=$(grep -E '^APP_PORT=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "8002")
-    ok "Deployed! UI: http://${NAS_HOST}:${APP_PORT}/ui"
-}
-
-# ── Main ──────────────────────────────────────────────────────
-
-case "${1:-deploy}" in
-    --restart|-r)   cmd_restart ;;
-    --logs|-l)      cmd_logs ;;
-    --stop|-s)      cmd_stop ;;
-    --status|-t)    cmd_status ;;
-    --sync)         cmd_sync ;;
-    --build)        cmd_sync; cmd_build ;;
-    deploy|"")      cmd_deploy ;;
-    *)
-        echo "Usage: $0 [--restart|--logs|--stop|--status|--sync|--build]"
-        echo "  (no args)    Full deploy: sync + build + start"
-        echo "  --restart    Restart container only"
-        echo "  --logs       Tail live container logs"
-        echo "  --stop       Stop the container"
-        echo "  --status     Show container & health status"
-        echo "  --sync       Sync code only (no rebuild)"
-        echo "  --build      Sync + rebuild (no restart)"
-        exit 1
-        ;;
-esac
+echo ""
+echo "Done. Uvicorn will auto-reload all containers within ~3 seconds."
+echo "Vault sessions persist — no manual unlock needed."

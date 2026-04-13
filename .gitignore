@@ -10,3 +10,8 @@ dist/
 build/
 .mypy_cache/
 .ruff_cache/
+*.log
+data/
+node_modules/
+frontend/node_modules/
+deploy/cloudflare/node_modules/

@@ -19,6 +19,7 @@ if __name__ == "__main__":
         "app.server:app",
         host=settings.app_host,
         port=settings.app_port,
-        reload=False,
+        reload=True,
+        reload_dirs=["/app/app"],
         log_level="info",
     )

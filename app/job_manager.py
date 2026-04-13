@@ -53,6 +53,9 @@ class TradeLogEntry:
     quantity: float
     success: bool
     error: str | None = None
+    pnl: float | None = None              # realized PnL (only on successful EXIT)
+    entry_fill_a: float | None = None     # entry fill price for leg A (on EXIT logs)
+    entry_fill_b: float | None = None     # entry fill price for leg B (on EXIT logs)
 
 
 def _extract_fill_price(result: TradeResult | None) -> float | None:
@@ -110,6 +113,7 @@ class ArbJob:
             "instrument_b": self.engine.instrument_b,
             "leg_a_exchange": self.engine.leg_a_exchange,
             "leg_b_exchange": self.engine.leg_b_exchange,
+            "strategy": self.engine.strategy,
             "has_position": pi["has_position"],
             "entry_time": self.entry_time,
             "created_at": self.created_at,
@@ -265,6 +269,8 @@ class JobManager:
             engine.order_type = config["order_type"]
         if config.get("limit_offset_ticks") is not None:
             engine.limit_offset_ticks = config["limit_offset_ticks"]
+        if config.get("vwap_buffer_ticks") is not None:
+            engine.vwap_buffer_ticks = config["vwap_buffer_ticks"]
         if config.get("min_profit") is not None:
             engine.min_profit = config["min_profit"]
         if config.get("fill_timeout_ms") is not None:
@@ -275,6 +281,16 @@ class JobManager:
             engine.chunk_delay_ms = config["chunk_delay_ms"]
         if config.get("liquidity_multiplier") is not None:
             engine.liquidity_multiplier = config["liquidity_multiplier"]
+        if config.get("min_top_book_mult") is not None:
+            engine.min_top_book_mult = config["min_top_book_mult"]
+        if config.get("signal_confirmations") is not None:
+            engine.signal_confirmations = config["signal_confirmations"]
+        if config.get("strategy") is not None:
+            engine.strategy = config["strategy"]
+        if config.get("max_spread_pct") is not None:
+            engine.max_spread_pct = config["max_spread_pct"]
+        if config.get("funding_rate_bias") is not None:
+            engine.funding_rate_bias = config["funding_rate_bias"]
 
         # Update schedule
         if config.get("hold_duration_h") is not None:
@@ -330,14 +346,25 @@ class JobManager:
             "simulation_mode": eng.simulation_mode,
             "order_type": eng.order_type,
             "limit_offset_ticks": eng.limit_offset_ticks,
+            "vwap_buffer_ticks": eng.vwap_buffer_ticks,
             "min_profit": eng.min_profit,
             "fill_timeout_ms": eng.fill_timeout_ms,
             "chunk_size": float(eng.chunk_size),
             "chunk_delay_ms": eng.chunk_delay_ms,
             "liquidity_multiplier": eng.liquidity_multiplier,
+            "signal_confirmations": eng.signal_confirmations,
+            "strategy": eng.strategy,
+            "max_spread_pct": eng.max_spread_pct,
+            "funding_rate_bias": eng.funding_rate_bias,
             "auto_trade": job.auto_trade,
             "hold_duration_h": job.schedule.hold_duration_h,
             "min_exit_spread": job.schedule.min_exit_spread,
+            # Position state (persisted for restart recovery)
+            "has_position": eng._has_position,
+            "long_sym": eng._long_sym,
+            "short_sym": eng._short_sym,
+            "entry_spread_actual": eng._entry_spread_actual,
+            "entry_time": job.entry_time,
         }
 
     def _save_jobs(self) -> None:
@@ -369,6 +396,17 @@ class JobManager:
                 continue
             try:
                 self.create_job(cfg)
+                # Restore position state if it was persisted
+                job = self._jobs.get(job_id)
+                if job and cfg.get("has_position"):
+                    job.engine._has_position = True
+                    job.engine._long_sym = cfg.get("long_sym")
+                    job.engine._short_sym = cfg.get("short_sym")
+                    job.engine._entry_spread_actual = cfg.get("entry_spread_actual")
+                    job.entry_time = cfg.get("entry_time")
+                    job.status = "holding"
+                    logger.info("Restored position state for job %s: long=%s short=%s",
+                                job_id, job.engine._long_sym, job.engine._short_sym)
                 count += 1
             except Exception as exc:
                 logger.warning("Failed to restore job %s: %s", job_id, exc)
@@ -439,38 +477,82 @@ class JobManager:
             should_exit = False
             reason = ""
 
-            # 1. Scheduled exit: after hold_duration, if exec spread <= min_exit_spread
-            if job.entry_time and job.schedule.hold_duration_h is not None:
-                elapsed_h = (datetime.now(timezone.utc) - datetime.fromisoformat(job.entry_time)).total_seconds() / 3600
-                if elapsed_h >= job.schedule.hold_duration_h and exec_abs <= job.schedule.min_exit_spread:
+            if engine.strategy == "delta_neutral":
+                # Delta-neutral: exit when spread % is small enough (from evaluate)
+                if check.action == "EXIT":
                     should_exit = True
-                    reason = (
-                        f"Scheduled exit: {elapsed_h:.1f}h >= {job.schedule.hold_duration_h}h "
-                        f"and exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) <= min_exit ${job.schedule.min_exit_spread:.4f}"
-                    )
+                    reason = check.reason
+                # Also support scheduled exit for DN
+                elif job.entry_time and job.schedule.hold_duration_h is not None:
+                    elapsed_h = (datetime.now(timezone.utc) - datetime.fromisoformat(job.entry_time)).total_seconds() / 3600
+                    if elapsed_h >= job.schedule.hold_duration_h and snapshot.spread_pct <= engine.max_spread_pct:
+                        should_exit = True
+                        reason = (
+                            f"DN scheduled exit: {elapsed_h:.1f}h >= {job.schedule.hold_duration_h}h "
+                            f"and spread {snapshot.spread_pct:.4f}% <= max {engine.max_spread_pct:.4f}%"
+                        )
+            else:
+                # 1. Scheduled exit: after hold_duration, if exec spread <= min_exit_spread
+                if job.entry_time and job.schedule.hold_duration_h is not None:
+                    elapsed_h = (datetime.now(timezone.utc) - datetime.fromisoformat(job.entry_time)).total_seconds() / 3600
+                    if elapsed_h >= job.schedule.hold_duration_h and exec_abs <= job.schedule.min_exit_spread:
+                        should_exit = True
+                        reason = (
+                            f"Scheduled exit: {elapsed_h:.1f}h >= {job.schedule.hold_duration_h}h "
+                            f"and exec spread ${snapshot.exec_spread:.4f} (abs ${exec_abs:.4f}) <= min_exit ${job.schedule.min_exit_spread:.4f}"
+                        )
 
-            # 2. Original threshold exit (spread_exit_high from engine config)
-            elif check.action == "EXIT":
-                should_exit = True
-                reason = check.reason
+                # 2. Original threshold exit (spread_exit_high from engine config)
+                elif check.action == "EXIT":
+                    should_exit = True
+                    reason = check.reason
 
             if should_exit:
+                # Cooldown: skip if last exit failed recently (avoid rapid retry loop)
+                _cooldown_s = 60
+                _now = time.time()
+                _last_fail = getattr(engine, "_last_exit_fail_ts", 0.0)
+                if _now - _last_fail < _cooldown_s:
+                    logger.debug("Job %s: EXIT skipped — cooldown %.0fs remaining",
+                                 job.job_id, _cooldown_s - (_now - _last_fail))
+                    return None
+
                 logger.info("Job %s: EXIT triggered — %s", job.job_id, reason)
+                # Capture entry fill prices BEFORE execute_exit clears them
+                _entry_fill_long = engine._entry_fill_long
+                _entry_fill_short = engine._entry_fill_short
                 result = engine.execute_exit(snapshot)
-                self._log_trade(job, "EXIT", result, snapshot)
+                self._log_trade(job, "EXIT", result, snapshot,
+                                entry_fill_long=_entry_fill_long, entry_fill_short=_entry_fill_short)
                 if result.success:
                     job.entry_time = None
                     job.status = "monitoring" if job.auto_trade else "idle"
+                    engine._last_exit_success_ts = time.time()
+                    logger.info("Job %s: EXIT succeeded — 120s entry cooldown started", job.job_id)
+                else:
+                    engine._last_exit_fail_ts = time.time()
+                    logger.warning("Job %s: EXIT failed — cooldown %ds before retry", job.job_id, _cooldown_s)
+                self._save_jobs()
                 return {"action": "EXIT", "success": result.success, "reason": reason, "error": result.error}
 
         # --- ENTRY LOGIC ---
         elif check.action == "ENTRY":
+            # Cooldown: skip entry if last exit succeeded recently (avoid rapid re-entry)
+            _entry_cooldown_s = 120
+            _now_e = time.time()
+            _last_exit_ok = getattr(engine, "_last_exit_success_ts", 0.0)
+            if _now_e - _last_exit_ok < _entry_cooldown_s:
+                logger.debug("Job %s: ENTRY skipped — post-exit cooldown %.0fs remaining",
+                             job.job_id, _entry_cooldown_s - (_now_e - _last_exit_ok))
+                return None
+
             logger.info("Job %s: ENTRY triggered — %s", job.job_id, check.reason)
             result = engine.execute_entry(snapshot)
             self._log_trade(job, "ENTRY", result, snapshot)
             if result.success:
                 job.entry_time = datetime.now(timezone.utc).isoformat()
                 job.status = "holding"
+            self._save_jobs()
             return {"action": "ENTRY", "success": result.success, "reason": check.reason, "error": result.error}
 
         return None
@@ -479,17 +561,65 @@ class JobManager:
     # Trade logging
     # ------------------------------------------------------------------
 
-    def _log_trade(self, job: ArbJob, action: str, result: ArbExecutionResult, snapshot: SpreadSnapshot) -> None:
-        """Record an entry/exit with real fill prices."""
+    def _log_trade(
+        self, job: ArbJob, action: str, result: ArbExecutionResult, snapshot: SpreadSnapshot,
+        entry_fill_long: float | None = None, entry_fill_short: float | None = None,
+    ) -> None:
+        """Record an entry/exit with real fill prices and PnL."""
         engine = job.engine
 
         if action == "ENTRY":
             leg_a_side = "buy" if snapshot.a_is_cheaper else "sell"
             leg_b_side = "sell" if snapshot.a_is_cheaper else "buy"
         else:
-            # EXIT: reverse of entry direction
-            leg_a_side = "sell" if engine._long_sym == engine.instrument_a else "buy"
-            leg_b_side = "sell" if engine._long_sym == engine.instrument_b else "buy"
+            # EXIT: reverse of entry direction — use long_sym captured before exit cleared it
+            # After successful exit, engine state is cleared, so we infer from entry fills
+            leg_a_side = "sell" if entry_fill_long and engine.instrument_a else "buy"
+            leg_b_side = "sell" if entry_fill_long and engine.instrument_b else "buy"
+            # More robust: check which side was long from the entry log
+            last_entry = None
+            for tl in reversed(job.trade_log):
+                if tl.action == "ENTRY" and tl.success:
+                    last_entry = tl
+                    break
+            if last_entry:
+                # Reverse the entry sides for exit
+                leg_a_side = "sell" if last_entry.leg_a_side == "buy" else "buy"
+                leg_b_side = "sell" if last_entry.leg_b_side == "buy" else "buy"
+
+        leg_a_fill = _extract_fill_price(result.leg_a)
+        leg_b_fill = _extract_fill_price(result.leg_b)
+
+        # --- PnL calculation on successful EXIT ---
+        pnl = None
+        log_entry_fill_a = None
+        log_entry_fill_b = None
+        if action == "EXIT" and result.success and entry_fill_long is not None and entry_fill_short is not None:
+            # Map entry fills to leg A / leg B based on last entry sides
+            if last_entry and last_entry.leg_a_side == "buy":
+                log_entry_fill_a = entry_fill_long
+                log_entry_fill_b = entry_fill_short
+            elif last_entry and last_entry.leg_a_side == "sell":
+                log_entry_fill_a = entry_fill_short
+                log_entry_fill_b = entry_fill_long
+            # Long leg PnL = exit_sell_price - entry_buy_price
+            # Short leg PnL = entry_sell_price - exit_buy_price
+            qty = float(engine.quantity)
+            if leg_a_fill and leg_b_fill:
+                if leg_a_side == "sell":  # leg A closing long (selling), leg B closing short (buying)
+                    pnl_long = (leg_a_fill - entry_fill_long) * qty
+                    pnl_short = (entry_fill_short - leg_b_fill) * qty
+                else:  # leg A closing short (buying), leg B closing long (selling)
+                    pnl_short = (entry_fill_short - leg_a_fill) * qty
+                    pnl_long = (leg_b_fill - entry_fill_long) * qty
+                pnl = pnl_long + pnl_short
+                logger.info(
+                    "PnL calc [%s]: long_pnl=$%.4f short_pnl=$%.4f total=$%.4f "
+                    "(entry: long=%.4f short=%.4f | exit: a=%.4f b=%.4f)",
+                    job.job_id, pnl_long, pnl_short, pnl,
+                    entry_fill_long, entry_fill_short,
+                    leg_a_fill, leg_b_fill,
+                )
 
         entry = TradeLogEntry(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -501,12 +631,15 @@ class JobManager:
             leg_b_exchange=engine.leg_b_exchange,
             leg_a_side=leg_a_side,
             leg_b_side=leg_b_side,
-            leg_a_fill_price=_extract_fill_price(result.leg_a),
-            leg_b_fill_price=_extract_fill_price(result.leg_b),
+            leg_a_fill_price=leg_a_fill,
+            leg_b_fill_price=leg_b_fill,
             spread_at_execution=snapshot.exec_spread,
             quantity=float(engine.quantity),
             success=result.success,
             error=result.error,
+            pnl=pnl,
+            entry_fill_a=log_entry_fill_a,
+            entry_fill_b=log_entry_fill_b,
         )
         job.trade_log.append(entry)
         if len(job.trade_log) > 500:
@@ -515,15 +648,17 @@ class JobManager:
         # Persist to disk
         self._persist_trade_log_entry(entry)
 
+        pnl_str = f" PnL=${pnl:.4f}" if pnl is not None else ""
         logger.info(
             "TRADE LOG [%s] %s %s: success=%s spread=$%.4f "
-            "leg_a=%s@%s fill=$%s | leg_b=%s@%s fill=$%s",
+            "leg_a=%s@%s fill=$%s | leg_b=%s@%s fill=$%s%s",
             job.job_id, action, "OK" if result.success else "FAIL",
             result.success, snapshot.spread_abs,
             engine.instrument_a, engine.leg_a_exchange,
-            entry.leg_a_fill_price or "?",
+            leg_a_fill or "?",
             engine.instrument_b, engine.leg_b_exchange,
-            entry.leg_b_fill_price or "?",
+            leg_b_fill or "?",
+            pnl_str,
         )
 
     # ------------------------------------------------------------------
@@ -559,6 +694,15 @@ class JobManager:
         # Keep only last 500
         return entries[-500:]
 
+    def clear_trade_log(self, job_id: str) -> None:
+        """Clear trade log for a job (in-memory and on disk)."""
+        job = self.get_job(job_id)
+        job.trade_log.clear()
+        path = self._TRADE_LOG_DIR / f"{job_id}.jsonl"
+        if path.exists():
+            path.unlink()
+        logger.info("Trade log cleared for job %s", job_id)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -583,13 +727,19 @@ class JobManager:
             "simulation_mode": "arb_simulation_mode",
             "order_type": "arb_order_type",
             "limit_offset_ticks": "arb_limit_offset_ticks",
+            "vwap_buffer_ticks": "arb_vwap_buffer_ticks",
             "min_profit": "arb_min_profit",
             "fill_timeout_ms": "arb_fill_timeout_ms",
             "chunk_size": "arb_chunk_size",
             "chunk_delay_ms": "arb_chunk_delay_ms",
             "liquidity_multiplier": "arb_liquidity_multiplier",
+            "min_top_book_mult": "arb_min_top_book_mult",
             "ws_enabled": "arb_ws_enabled",
             "ws_stale_ms": "arb_ws_stale_ms",
+            "signal_confirmations": "arb_signal_confirmations",
+            "strategy": "arb_strategy",
+            "max_spread_pct": "arb_max_spread_pct",
+            "funding_rate_bias": "arb_funding_rate_bias",
         }
         for cfg_key, settings_key in mapping.items():
             if cfg_key in config and config[cfg_key] is not None:
