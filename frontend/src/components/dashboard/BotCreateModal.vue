@@ -232,7 +232,13 @@ watch(() => props.open, async (v) => {
         selectedExchanges.value.forEach((ex, i) => {
           const m = new Map<string, string>()
           for (const mkt of marketResults[i]) {
-            if (mkt.asset) m.set(mkt.asset.toUpperCase(), mkt.symbol)
+            if (mkt.asset) {
+              const key = mkt.asset.toUpperCase()
+              m.set(key, mkt.symbol)
+              // Also map base token without version suffix (e.g. HOOD_24_5 → HOOD)
+              const base = key.replace(/_\d+_\d+$/, '')
+              if (base !== key && !m.has(base)) m.set(base, mkt.symbol)
+            }
           }
           maps[ex] = m
         })
@@ -265,7 +271,13 @@ async function loadCommonTokens() {
     selectedExchanges.value.forEach((ex, i) => {
       const m = new Map<string, string>()
       for (const mkt of marketResults[i]) {
-        if (mkt.asset) m.set(mkt.asset.toUpperCase(), mkt.symbol)
+        if (mkt.asset) {
+          const key = mkt.asset.toUpperCase()
+          m.set(key, mkt.symbol)
+          // Also map base token without version suffix (e.g. HOOD_24_5 → HOOD)
+          const base = key.replace(/_\d+_\d+$/, '')
+          if (base !== key && !m.has(base)) m.set(base, mkt.symbol)
+        }
       }
       maps[ex] = m
     })
