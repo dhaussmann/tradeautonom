@@ -908,14 +908,14 @@ class StateMachine:
                         chunk.end_ts = time.time()
                         return chunk
                     # Re-fetch book and re-anchor to current best price
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.5)
                     try:
                         book = await self._get_book(config.maker_exchange, config.maker_symbol, maker_client)
                         if config.maker_side == "buy" and book.get("bids"):
-                            maker_price = Decimal(str(book["bids"][0][0]))
+                            maker_price = Decimal(str(book["bids"][0][0])) - tick
                         elif config.maker_side == "sell" and book.get("asks"):
-                            maker_price = Decimal(str(book["asks"][0][0]))
-                        self._log("ORDER", f"Chunk {chunk_index}: re-anchored to {maker_price}")
+                            maker_price = Decimal(str(book["asks"][0][0])) + tick
+                        self._log("ORDER", f"Chunk {chunk_index}: re-anchored to {maker_price} (1 tick conservative)")
                     except Exception as book_exc:
                         self._log("ORDER", f"Chunk {chunk_index}: book re-fetch failed ({book_exc}), shifting by {config.maker_reprice_ticks} ticks")
                         if config.maker_side == "buy":
@@ -1039,6 +1039,11 @@ class StateMachine:
 
                         if remaining_qty < Decimal("0.001"):
                             break  # chunk fully filled by late fills
+                        # If remaining is small (< 10% of chunk), treat as done
+                        # to avoid post-only rejection loops for tiny leftover qty
+                        if remaining_qty < chunk_qty * Decimal("0.1"):
+                            self._log("FILL", f"Chunk {chunk_index}: remaining {remaining_qty} < 10% of chunk — treating as filled")
+                            break
                 except Exception as exc:
                     self._log("ORDER", f"Chunk {chunk_index}: pre-reprice position check failed: {exc}", level="warn")
 
