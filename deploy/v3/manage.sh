@@ -40,7 +40,11 @@ REGISTRY_FILE="${BASE_DEPLOY}/users.json"
 
 SSH_TARGET="${NAS_USER}@${NAS_HOST}"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
-SSH_OPTS="-o ConnectTimeout=5 -o IdentitiesOnly=yes -i ${SSH_KEY}"
+if [[ -f "$SSH_KEY" ]]; then
+    SSH_OPTS="-o ConnectTimeout=5 -o IdentitiesOnly=yes -i ${SSH_KEY}"
+else
+    SSH_OPTS="-o ConnectTimeout=5"
+fi
 
 info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
@@ -164,6 +168,7 @@ ENVEOF"
         -p ${port}:${port} \
         --env-file '${data_dir}/.env' \
         -v '${data_dir}/app-data:/app/data' \
+        -v '${NAS_DEPLOY_PATH}/app:/app/app' \
         ${IMAGE_NAME}:${IMAGE_TAG}"
 
     # Register user
@@ -307,6 +312,7 @@ for uid in sorted(d): print(uid)
             -p ${port}:${port} \
             --env-file '${data_dir}/.env' \
             -v '${data_dir}/app-data:/app/data' \
+            -v '${NAS_DEPLOY_PATH}/app:/app/app' \
             ${IMAGE_NAME}:${IMAGE_TAG}"
         ok "  ${container_name} restarted on port ${port}"
     done
