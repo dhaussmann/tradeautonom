@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
-# deploy-v3.sh — Deploy TradeAutonom V3 (multi-user) to Synology NAS
-#
-# Runs alongside v1/v2 on a separate port + data volume.
+# deploy-oms.sh — Deploy OMS (Orderbook Monitor Service) to Synology NAS
 #
 # Usage:
-#   ./deploy-v3.sh              # sync code + rebuild + restart
-#   ./deploy-v3.sh --restart    # restart container only (no rebuild)
-#   ./deploy-v3.sh --logs       # tail live container logs
-#   ./deploy-v3.sh --stop       # stop the container
-#   ./deploy-v3.sh --status     # show container + health status
+#   ./deploy.sh              # sync + build + start
+#   ./deploy.sh --restart    # restart container only
+#   ./deploy.sh --logs       # tail live container logs
+#   ./deploy.sh --stop       # stop the container
+#   ./deploy.sh --status     # show container + health status
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -27,16 +25,19 @@ NAS_HOST="${NAS_HOST:?Set NAS_HOST in .env (e.g. 192.168.1.100)}"
 NAS_USER="${NAS_USER:-admin}"
 NAS_DEPLOY_PATH="${NAS_DEPLOY_PATH:-/volume1/docker/tradeautonom}"
 
-# V3-specific overrides
-V3_DEPLOY_PATH="${NAS_DEPLOY_PATH}-v3"
-IMAGE_NAME="tradeautonom"
-IMAGE_TAG="v3"
-CONTAINER_NAME="tradeautonom-v3"
-APP_PORT="8005"
+OMS_DEPLOY_PATH="${NAS_DEPLOY_PATH}/oms"
+IMAGE_NAME="oms"
+IMAGE_TAG="latest"
+CONTAINER_NAME="oms"
+OMS_PORT="8099"
 
 SSH_TARGET="${NAS_USER}@${NAS_HOST}"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
-SSH_OPTS="-o ConnectTimeout=5 -o IdentitiesOnly=yes -i ${SSH_KEY}"
+if [[ -f "$SSH_KEY" ]]; then
+    SSH_OPTS="-o ConnectTimeout=5 -o IdentitiesOnly=yes -i ${SSH_KEY}"
+else
+    SSH_OPTS="-o ConnectTimeout=5"
+fi
 
 info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
@@ -48,81 +49,73 @@ ssh_nas() { ssh ${SSH_OPTS} "$SSH_TARGET" "$@"; }
 # ── Commands ──────────────────────────────────────────────────
 
 cmd_sync() {
-    info "Syncing code to ${SSH_TARGET}:${V3_DEPLOY_PATH}"
-    tar -C "$PROJECT_ROOT" \
-        --exclude='.venv' \
-        --exclude='venv' \
-        --exclude='.git' \
-        --exclude='__pycache__' \
-        --exclude='*.pyc' \
-        --exclude='.env' \
-        --exclude='data' \
-        --exclude='data-v2' \
-        --exclude='data-v3' \
-        --exclude='server.log' \
-        --exclude='.mypy_cache' \
-        --exclude='.ruff_cache' \
-        --exclude='.windsurf' \
-        -czf - . \
-    | ssh_nas "mkdir -p '${V3_DEPLOY_PATH}' && tar -C '${V3_DEPLOY_PATH}' -xzf -"
-    ok "Code synced"
+    info "Syncing OMS to ${SSH_TARGET}:${OMS_DEPLOY_PATH}"
+    ssh_nas "mkdir -p '${OMS_DEPLOY_PATH}'"
+    # Only sync the monitor directory (Dockerfile, requirements.txt, monitor_service.py)
+    tar -C "$SCRIPT_DIR" -czf - Dockerfile requirements.txt monitor_service.py \
+    | ssh_nas "tar -C '${OMS_DEPLOY_PATH}' -xzf -"
+    ok "OMS code synced"
 }
 
 cmd_build() {
-    info "Building Docker image on NAS (${IMAGE_NAME}:${IMAGE_TAG})"
-    ssh_nas "cd '${V3_DEPLOY_PATH}' && ${P}/docker build -f deploy/prod/Dockerfile -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+    info "Building OMS Docker image on NAS (${IMAGE_NAME}:${IMAGE_TAG})"
+    ssh_nas "cd '${OMS_DEPLOY_PATH}' && ${P}/docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
     ok "Image built"
 }
 
 cmd_up() {
-    info "Starting v3 container on NAS (port ${APP_PORT})"
-    # Stop and remove existing v3 container if present
+    info "Starting OMS container on NAS (port ${OMS_PORT})"
     ssh_nas "${P}/docker rm -f ${CONTAINER_NAME} 2>/dev/null || true"
-    ssh_nas "mkdir -p '${V3_DEPLOY_PATH}/data'"
-    # Create minimal .env — NO exchange API keys (user sets them via UI)
-    ssh_nas "cat > '${V3_DEPLOY_PATH}/.env.container' << 'ENVEOF'
-APP_HOST=0.0.0.0
-APP_PORT=${APP_PORT}
-GRVT_ENV=prod
-HISTORY_INGEST_URL=https://bot.defitool.de/api/history/ingest
-HISTORY_INGEST_TOKEN=qW3b6n2uDwZg6krrEbdqcpgihIgLzRc6mkF9dnjnTcw
-HISTORY_INGEST_INTERVAL_S=300
-FN_OPT_SHARED_MONITOR_URL=http://192.168.133.253:8099
-ENVEOF"
     ssh_nas "${P}/docker run -d \
         --name ${CONTAINER_NAME} \
-        --hostname ${CONTAINER_NAME} \
         --restart unless-stopped \
-        -p ${APP_PORT}:${APP_PORT} \
-        --env-file '${V3_DEPLOY_PATH}/.env.container' \
-        -v '${V3_DEPLOY_PATH}/data:/app/data' \
+        -p ${OMS_PORT}:${OMS_PORT} \
+        -e OMS_TRACKED_PAIRS=auto \
+        -e OMS_GRVT_ENV=prod \
+        -e OMS_NADO_ENV=mainnet \
+        -e OMS_MIN_EXCHANGES=2 \
         ${IMAGE_NAME}:${IMAGE_TAG}"
-    ok "Container started"
+    ok "OMS container started"
 }
 
 cmd_restart() {
-    info "Restarting v3 container on NAS"
+    info "Restarting OMS container on NAS"
     ssh_nas "${P}/docker restart ${CONTAINER_NAME}"
     ok "Container restarted"
 }
 
 cmd_stop() {
-    info "Stopping v3 container on NAS"
+    info "Stopping OMS container on NAS"
     ssh_nas "${P}/docker stop ${CONTAINER_NAME} && ${P}/docker rm ${CONTAINER_NAME}"
     ok "Container stopped"
 }
 
 cmd_logs() {
-    info "Tailing v3 container logs (Ctrl+C to stop)"
+    info "Tailing OMS container logs (Ctrl+C to stop)"
     ssh_nas "${P}/docker logs ${CONTAINER_NAME} --tail 100 -f"
 }
 
 cmd_status() {
-    info "V3 Container status:"
-    ssh_nas "${P}/docker ps --filter name=${CONTAINER_NAME} --format 'table {{.Status}}	{{.Ports}}'"
+    info "OMS container status:"
+    ssh_nas "${P}/docker ps --filter name=${CONTAINER_NAME} --format 'table {{.Status}}\t{{.Ports}}'"
     echo ""
     info "Health check:"
-    curl -s --connect-timeout 3 "http://${NAS_HOST}:${APP_PORT}/health" | python3 -m json.tool 2>/dev/null || err "Cannot reach http://${NAS_HOST}:${APP_PORT}/health"
+    curl -s --connect-timeout 3 "http://${NAS_HOST}:${OMS_PORT}/health" | python3 -m json.tool 2>/dev/null || err "Cannot reach http://${NAS_HOST}:${OMS_PORT}/health"
+    echo ""
+    info "Feed summary:"
+    curl -s --connect-timeout 3 "http://${NAS_HOST}:${OMS_PORT}/status" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+total=len(d)
+connected=sum(1 for v in d.values() if v['connected'])
+has_data=sum(1 for v in d.values() if v['has_data'])
+print(f'  Feeds: {total} | Connected: {connected} | Has data: {has_data}')
+from collections import Counter
+c=Counter(k.split(':')[0] for k in d)
+for ex,cnt in c.most_common():
+    conn=sum(1 for k,v in d.items() if k.startswith(ex+':') and v['connected'])
+    print(f'  {ex}: {cnt} feeds, {conn} connected')
+" 2>/dev/null || err "Cannot reach status endpoint"
 }
 
 cmd_deploy() {
@@ -130,7 +123,10 @@ cmd_deploy() {
     cmd_build
     cmd_up
     echo ""
-    ok "V3 Deployed! UI: http://${NAS_HOST}:${APP_PORT}/ui"
+    sleep 15
+    cmd_status
+    echo ""
+    ok "OMS deployed! API: http://${NAS_HOST}:${OMS_PORT}/health"
 }
 
 # ── Main ──────────────────────────────────────────────────────

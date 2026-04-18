@@ -25,9 +25,10 @@ _BOTS_DIR = Path("data/bots")
 class BotRegistry:
     """CRUD + lifecycle manager for parallel FundingArbEngine bots."""
 
-    def __init__(self, clients: dict[str, Any], settings: Any = None) -> None:
+    def __init__(self, clients: dict[str, Any], settings: Any = None, activity_forwarder: Any = None) -> None:
         self._clients = clients
         self._settings = settings
+        self._activity_forwarder = activity_forwarder
         self._bots: dict[str, FundingArbEngine] = {}
 
     # ── CRUD ───────────────────────────────────────────────────────────
@@ -42,7 +43,7 @@ class BotRegistry:
         config.job_id = bot_id
         self._save_config(bot_id, config)
 
-        engine = FundingArbEngine(config=config, clients=self._clients)
+        engine = FundingArbEngine(config=config, clients=self._clients, activity_forwarder=self._activity_forwarder)
         await engine.start()
         self._bots[bot_id] = engine
 
@@ -109,7 +110,7 @@ class BotRegistry:
             try:
                 config = self._load_config(bot_id)
                 config.job_id = bot_id
-                engine = FundingArbEngine(config=config, clients=self._clients)
+                engine = FundingArbEngine(config=config, clients=self._clients, activity_forwarder=self._activity_forwarder)
                 await engine.start()
                 self._bots[bot_id] = engine
                 restored += 1

@@ -22,7 +22,9 @@ from typing import Any
 
 from app.config import Settings
 from app.data_layer import DataLayer
+from app.execution_logger import ExecutionLogger
 from app.funding_monitor import FundingMonitor, FundingSuggestion
+from app.position_sizer import compute_position_size
 from app.risk_manager import RiskManager
 from app.state_machine import (
     ChunkResult,
@@ -78,6 +80,26 @@ class EngineConfig:
     # Simulation
     simulation: bool = False
 
+    # Opt-in optimizations
+    fn_opt_depth_spread: bool = False
+    fn_opt_max_slippage_bps: float = 10.0
+    fn_opt_ohi_monitoring: bool = False
+    fn_opt_min_ohi: float = 0.4
+    fn_opt_funding_history: bool = False
+    fn_opt_funding_api_url: str = "https://api.fundingrate.de"
+    fn_opt_min_funding_consistency: float = 0.3
+    fn_opt_dynamic_sizing: bool = False
+    fn_opt_max_utilization: float = 0.80
+    fn_opt_max_per_pair_ratio: float = 0.25
+    fn_opt_shared_monitor_url: str = ""
+    fn_opt_taker_drift_guard: bool = False
+    fn_opt_max_taker_drift_bps: float = 3.0
+
+    # Execution log (AI training data)
+    history_ingest_url: str = ""
+    history_ingest_token: str = ""
+    execution_log_enabled: bool = True
+
     @property
     def duration_total_s(self) -> float:
         """Total run duration in seconds. 0 = run indefinitely."""
@@ -112,6 +134,22 @@ class EngineConfig:
             leverage_long=settings.fn_leverage_long,
             leverage_short=settings.fn_leverage_short,
             simulation=settings.fn_simulation_mode,
+            fn_opt_depth_spread=settings.fn_opt_depth_spread,
+            fn_opt_max_slippage_bps=settings.fn_opt_max_slippage_bps,
+            fn_opt_ohi_monitoring=settings.fn_opt_ohi_monitoring,
+            fn_opt_min_ohi=settings.fn_opt_min_ohi,
+            fn_opt_funding_history=settings.fn_opt_funding_history,
+            fn_opt_funding_api_url=settings.fn_opt_funding_api_url,
+            fn_opt_min_funding_consistency=settings.fn_opt_min_funding_consistency,
+            fn_opt_dynamic_sizing=settings.fn_opt_dynamic_sizing,
+            fn_opt_max_utilization=settings.fn_opt_max_utilization,
+            fn_opt_max_per_pair_ratio=settings.fn_opt_max_per_pair_ratio,
+            fn_opt_shared_monitor_url=settings.fn_opt_shared_monitor_url,
+            fn_opt_taker_drift_guard=settings.fn_opt_taker_drift_guard,
+            fn_opt_max_taker_drift_bps=settings.fn_opt_max_taker_drift_bps,
+            history_ingest_url=settings.history_ingest_url,
+            history_ingest_token=settings.history_ingest_token,
+            execution_log_enabled=settings.execution_log_enabled,
         )
 
 
@@ -129,9 +167,11 @@ class FundingArbEngine:
         self,
         config: EngineConfig,
         clients: dict[str, Any],
+        activity_forwarder: Any | None = None,
     ) -> None:
         self.config = config
         self._clients = clients
+        self._activity_forwarder = activity_forwarder
 
         # Determine which symbol maps to which exchange
         self._symbols_map = {
@@ -147,6 +187,7 @@ class FundingArbEngine:
         self._funding_monitor: FundingMonitor | None = None
         self._state_machine: StateMachine | None = None
         self._risk_manager: RiskManager | None = None
+        self._execution_logger: ExecutionLogger | None = None
 
         self._started = False
         self._trade_log: list[dict] = []
@@ -291,7 +332,7 @@ class FundingArbEngine:
         if data_layer:
             self._data_layer = data_layer
         else:
-            self._data_layer = DataLayer()
+            self._data_layer = DataLayer(shared_monitor_url=self.config.fn_opt_shared_monitor_url)
             await self._data_layer.start(self._clients, self._symbols_map)
 
         # FundingMonitor
@@ -302,11 +343,32 @@ class FundingArbEngine:
             exchange_b=self.config.short_exchange,
             symbol_b=self.config.instrument_b,
             poll_interval_s=self.config.funding_poll_interval_s,
+            v4_enabled=self.config.fn_opt_funding_history,
+            v4_api_url=self.config.fn_opt_funding_api_url,
+            v4_min_consistency=self.config.fn_opt_min_funding_consistency,
         )
         await self._funding_monitor.start()
 
+        # ExecutionLogger (AI training data)
+        if self.config.execution_log_enabled and self.config.history_ingest_url and self.config.history_ingest_token:
+            self._execution_logger = ExecutionLogger(
+                ingest_url=self.config.history_ingest_url,
+                ingest_token=self.config.history_ingest_token,
+                bot_id=self.config.job_id,
+                enabled=True,
+            )
+            self._execution_logger.start()
+            self.log_activity("INFO", "Execution logger active (AI training data)")
+
         # StateMachine
-        self._state_machine = StateMachine(clients=self._clients, data_layer=self._data_layer, activity_log_fn=self.log_activity, bot_id=self.config.job_id)
+        self._state_machine = StateMachine(
+            clients=self._clients,
+            data_layer=self._data_layer,
+            activity_log_fn=self.log_activity,
+            bot_id=self.config.job_id,
+            execution_logger=self._execution_logger,
+            funding_monitor=self._funding_monitor,
+        )
         # Restore persisted position state (survives container restarts)
         if self._state_machine.load_state():
             self.log_activity("ENGINE", f"Restored position from disk: long={self._state_machine.position_info['long_qty']:.6f} short={self._state_machine.position_info['short_qty']:.6f}")
@@ -329,6 +391,31 @@ class FundingArbEngine:
         await self._risk_manager.start()
 
         self._started = True
+
+        # ── Activity Log: OMS status ──
+        if self.config.fn_opt_shared_monitor_url:
+            oms_mode = "WS real-time" if getattr(self._data_layer, "_oms_ws_active", False) or getattr(self._data_layer, "_oms_ws_task", None) else "HTTP poll"
+            self.log_activity("INFO", f"Data feeds active — OMS: {self.config.fn_opt_shared_monitor_url} ({oms_mode}) | Feeds: {len(self._symbols_map)} symbols")
+        else:
+            self.log_activity("INFO", f"Data feeds active — Direct WS (no OMS) | Feeds: {len(self._symbols_map)} symbols")
+
+        # ── Activity Log: active features summary ──
+        features = []
+        if self.config.fn_opt_depth_spread:
+            features.append(f"Depth Spread (max {self.config.fn_opt_max_slippage_bps}bps)")
+        if self.config.fn_opt_taker_drift_guard:
+            features.append(f"Taker Drift Guard (max {self.config.fn_opt_max_taker_drift_bps}bps)")
+        if self.config.fn_opt_ohi_monitoring:
+            features.append(f"OHI Monitoring (min {self.config.fn_opt_min_ohi})")
+        if self.config.fn_opt_funding_history:
+            features.append(f"V4 Funding History (min consistency {self.config.fn_opt_min_funding_consistency})")
+        if self.config.fn_opt_dynamic_sizing:
+            features.append(f"Dynamic Sizing ({self.config.fn_opt_max_utilization*100:.0f}%/{self.config.fn_opt_max_per_pair_ratio*100:.0f}%)")
+        if features:
+            self.log_activity("INFO", f"Active features: {' | '.join(features)}")
+        else:
+            self.log_activity("INFO", "Active features: none (all opt-in features disabled)")
+
         logger.info(
             "FundingArbEngine started: job=%s long=%s:%s short=%s:%s maker=%s",
             self.config.job_id,
@@ -349,6 +436,8 @@ class FundingArbEngine:
             self._countdown_task = None
         self._is_running = False
 
+        if self._execution_logger:
+            await self._execution_logger.stop()
         if self._state_machine:
             await self._state_machine.stop_fill_subscriptions()
         if self._risk_manager:
@@ -407,18 +496,20 @@ class FundingArbEngine:
         for exch_name in (long_exch, short_exch):
             client = self._clients.get(exch_name)
             if client and hasattr(client, "async_check_auth"):
-                self.log_activity("ENGINE", f"Pre-check: verifying {exch_name} credentials")
+                self.log_activity("INFO", f"Credential check: {exch_name} ...")
                 try:
                     await client.async_check_auth()
+                    self.log_activity("INFO", f"Credential check: {exch_name} OK")
                 except Exception as exc:
                     raise RuntimeError(f"{exch_name} credential check failed — token may be expired: {exc}")
 
         # Step 0b: Check no existing positions on either exchange
-        self.log_activity("ENGINE", f"Pre-check: verifying no existing positions on {long_exch} / {short_exch}")
+        self.log_activity("INFO", f"Position check: verifying no existing positions on {long_exch} / {short_exch}")
         await self._check_no_existing_positions([
             (long_exch, self._get_symbol(long_exch)),
             (short_exch, self._get_symbol(short_exch)),
         ])
+        self.log_activity("INFO", f"Position check: no existing positions found — OK")
 
         # Step 1: Set leverage on both exchanges
         self.log_activity("ENGINE", f"Setting leverage: {long_exch} {lev_long}x, {short_exch} {lev_short}x")
@@ -731,11 +822,12 @@ class FundingArbEngine:
             taker_symbol = self._get_symbol(long_exch)
 
         # Pre-check: no existing positions on either exchange
-        self.log_activity("ENGINE", f"Pre-check: verifying no existing positions on {long_exch} / {short_exch}")
+        self.log_activity("INFO", f"Position check: verifying no existing positions on {long_exch} / {short_exch}")
         await self._check_no_existing_positions([
             (long_exch, self._get_symbol(long_exch)),
             (short_exch, self._get_symbol(short_exch)),
         ])
+        self.log_activity("INFO", f"Position check: no existing positions — OK")
 
         # Pre-trade checks (use chunk_qty — TWAP only needs one chunk of liquidity at a time)
         # Auto-reduce num_chunks so each chunk meets the min order size on both exchanges
@@ -747,16 +839,31 @@ class FundingArbEngine:
                 if min_sz and min_sz > 0:
                     max_chunks = int(qty / min_sz)
                     if max_chunks < num_chunks:
+                        self.log_activity("INFO", f"Auto-reducing chunks {num_chunks} -> {max(max_chunks, 1)} (min_order_size={min_sz:.4f} on {exch})")
                         logger.info("Auto-reducing num_chunks %d → %d (min_order_size=%.4f on %s)", num_chunks, max(max_chunks, 1), min_sz, exch)
                         num_chunks = max(max_chunks, 1)
         if num_chunks != self.config.twap_num_chunks:
             self.config.twap_num_chunks = num_chunks
         chunk_qty = qty / Decimal(str(num_chunks))
+
+        # Pre-trade risk check: maker
         ok, reason = await self._risk_manager.pre_trade_check(maker_exch, maker_symbol, maker_side, chunk_qty)
-        if not ok:
+        if ok:
+            ob_m = self._data_layer.get_orderbook(maker_exch, maker_symbol)
+            m_levels = ob_m.asks if maker_side == "buy" else ob_m.bids
+            m_liq = sum(float(lv[1]) for lv in m_levels[:10]) if m_levels else 0
+            self.log_activity("INFO", f"Pre-trade check {maker_exch}:{maker_symbol} {maker_side.upper()} {chunk_qty} — OK (liquidity={m_liq:.2f}, updates={ob_m.update_count})")
+        else:
             raise RuntimeError(f"Pre-trade check failed: {reason}")
+
+        # Pre-trade risk check: taker
         ok, reason = await self._risk_manager.pre_trade_check(taker_exch, taker_symbol, taker_side, chunk_qty)
-        if not ok:
+        if ok:
+            ob_t = self._data_layer.get_orderbook(taker_exch, taker_symbol)
+            t_levels = ob_t.asks if taker_side == "buy" else ob_t.bids
+            t_liq = sum(float(lv[1]) for lv in t_levels[:10]) if t_levels else 0
+            self.log_activity("INFO", f"Pre-trade check {taker_exch}:{taker_symbol} {taker_side.upper()} {chunk_qty} — OK (liquidity={t_liq:.2f}, updates={ob_t.update_count})")
+        else:
             raise RuntimeError(f"Pre-trade check failed: {reason}")
 
         # Spread check (log only, do not block entry)
@@ -764,9 +871,89 @@ class FundingArbEngine:
             long_exch, self._get_symbol(long_exch),
             short_exch, self._get_symbol(short_exch),
         )
-        self.log_activity("RISK", f"Spread check: {spread_pct:.4f}% — {'OK' if ok else reason}")
+        self.log_activity("INFO", f"Spread check: {spread_pct:.4f}% — {'OK' if ok else reason}")
         if not ok:
             logger.warning("Spread check warning (not blocking): %s", reason)
+
+        # OHI check (if enabled)
+        if self.config.fn_opt_ohi_monitoring:
+            for ohi_exch, ohi_sym in [(long_exch, self._get_symbol(long_exch)), (short_exch, self._get_symbol(short_exch))]:
+                try:
+                    ohi_data = self._data_layer.get_orderbook_health(ohi_exch, ohi_sym)
+                    ohi_val = ohi_data.get("ohi", 0) if ohi_data else 0
+                    ohi_detail = ""
+                    if ohi_data:
+                        parts = []
+                        for k in ("spread_score", "depth_score", "symmetry_score"):
+                            if k in ohi_data:
+                                parts.append(f"{k.replace('_score','')}={ohi_data[k]:.2f}")
+                        if parts:
+                            ohi_detail = f" ({', '.join(parts)})"
+                    passed = ohi_val >= self.config.fn_opt_min_ohi
+                    self.log_activity("INFO", f"OHI {ohi_exch}:{ohi_sym} = {ohi_val:.2f}{ohi_detail} — {'OK' if passed else 'BELOW threshold'} (min {self.config.fn_opt_min_ohi})")
+                except Exception as ohi_exc:
+                    self.log_activity("INFO", f"OHI {ohi_exch}:{ohi_sym} — unavailable ({ohi_exc})", level="warn")
+
+        # V4 Funding History check (if enabled)
+        if self.config.fn_opt_funding_history and self._funding_monitor:
+            try:
+                v4 = self._funding_monitor.get_v4_data()
+                v4_consistent = self._funding_monitor.is_v4_consistent()
+                if v4:
+                    self.log_activity("INFO",
+                        f"V4 Funding: consistency={v4.get('spread_consistency', 0):.2f}, "
+                        f"confidence={v4.get('confidence_score', 0)}, "
+                        f"spread_apr={v4.get('spread_apr', 0):.4f}, "
+                        f"pair_found={v4.get('pair_found', False)} — "
+                        f"{'OK' if v4_consistent else 'BELOW threshold'} (min {self.config.fn_opt_min_funding_consistency})")
+                else:
+                    self.log_activity("INFO", "V4 Funding: no data available yet (poll pending)", level="warn")
+            except Exception as v4_exc:
+                self.log_activity("INFO", f"V4 Funding: error fetching data ({v4_exc})", level="warn")
+
+        # Dynamic position sizing (opt-in)
+        if self.config.fn_opt_dynamic_sizing and not quantity:
+            try:
+                long_snap = self._data_layer.get_orderbook(long_exch, self._get_symbol(long_exch))
+                short_snap = self._data_layer.get_orderbook(short_exch, self._get_symbol(short_exch))
+                long_book = {"asks": long_snap.asks, "bids": long_snap.bids}
+                short_book = {"asks": short_snap.asks, "bids": short_snap.bids}
+                # Get mark price from mid of long book
+                mark_price = 0.0
+                if long_snap.asks and long_snap.bids:
+                    mark_price = (float(long_snap.asks[0][0]) + float(long_snap.bids[0][0])) / 2.0
+                if mark_price > 0:
+                    # Estimate collateral from both exchanges
+                    collateral = 0.0
+                    for exch in (long_exch, short_exch):
+                        client = self._clients.get(exch)
+                        if client and hasattr(client, "async_fetch_balance"):
+                            try:
+                                bal = await client.async_fetch_balance()
+                                collateral += float(bal.get("total", bal.get("equity", 0)))
+                            except Exception:
+                                pass
+                    if collateral > 0:
+                        leverage = max(self.config.leverage_long, self.config.leverage_short)
+                        sizing = compute_position_size(
+                            collateral_usd=collateral,
+                            leverage=leverage,
+                            max_utilization=self.config.fn_opt_max_utilization,
+                            max_per_pair_ratio=self.config.fn_opt_max_per_pair_ratio,
+                            mark_price=mark_price,
+                            long_book=long_book,
+                            short_book=short_book,
+                            max_slippage_bps=self.config.fn_opt_max_slippage_bps,
+                        )
+                        old_qty = qty
+                        qty = min(qty, sizing.recommended_qty)
+                        self.log_activity("SIZING", f"Dynamic sizing: {sizing.reason} (was {old_qty}, now {qty})")
+                    else:
+                        self.log_activity("SIZING", "Dynamic sizing skipped: could not fetch collateral", level="warn")
+                else:
+                    self.log_activity("SIZING", "Dynamic sizing skipped: no mark price", level="warn")
+            except Exception as sizing_exc:
+                self.log_activity("SIZING", f"Dynamic sizing error: {sizing_exc}", level="warn")
 
         config = MakerTakerConfig(
             maker_exchange=maker_exch,
@@ -786,6 +973,10 @@ class FundingArbEngine:
             max_chunk_spread_usd=self.config.max_chunk_spread_usd,
             min_spread_pct=self.config.min_spread_pct,
             max_spread_pct=self.config.max_spread_pct,
+            use_depth_spread=self.config.fn_opt_depth_spread,
+            max_slippage_bps=self.config.fn_opt_max_slippage_bps,
+            taker_drift_guard=self.config.fn_opt_taker_drift_guard,
+            max_taker_drift_bps=self.config.fn_opt_max_taker_drift_bps,
         )
 
         self.log_activity("ENTRY", f"Maker={maker_exch} {maker_side} {maker_symbol}, Taker={taker_exch} {taker_side} {taker_symbol}, qty={qty}, chunks={config.num_chunks}")
@@ -855,6 +1046,10 @@ class FundingArbEngine:
             max_chunk_spread_usd=self.config.max_chunk_spread_usd,
             min_spread_pct=self.config.min_spread_pct,
             max_spread_pct=self.config.max_spread_pct,
+            use_depth_spread=self.config.fn_opt_depth_spread,
+            max_slippage_bps=self.config.fn_opt_max_slippage_bps,
+            taker_drift_guard=self.config.fn_opt_taker_drift_guard,
+            max_taker_drift_bps=self.config.fn_opt_max_taker_drift_bps,
         )
 
         self.log_activity("EXIT", f"Maker={maker_exch} {maker_side} {maker_symbol}, Taker={taker_exch} {taker_side} {taker_symbol}, qty={qty} (reduce_only)")
@@ -952,6 +1147,7 @@ class FundingArbEngine:
             "position": self._state_machine.position_info if self._state_machine else {},
             "execution": self._state_machine.execution_status if self._state_machine else {},
             "funding": self._funding_monitor.get_rates() if self._funding_monitor else {},
+            "funding_v4": self._funding_monitor.get_v4_data() if self._funding_monitor and self.config.fn_opt_funding_history else {},
             "risk": self._risk_manager.get_status() if self._risk_manager else {},
             "feeds_ready": self._data_layer.is_ready() if self._data_layer else False,
             "data": self._data_layer.status() if self._data_layer else {},
@@ -959,6 +1155,10 @@ class FundingArbEngine:
                 "long": self._data_layer.get_orderbook_depth(self.config.long_exchange, self.config.instrument_a, depth=10),
                 "short": self._data_layer.get_orderbook_depth(self.config.short_exchange, self.config.instrument_b, depth=10),
             } if self._data_layer and self.config.instrument_a and self.config.instrument_b else {},
+            "ohi": {
+                "long": self._data_layer.get_orderbook_health(self.config.long_exchange, self.config.instrument_a),
+                "short": self._data_layer.get_orderbook_health(self.config.short_exchange, self.config.instrument_b),
+            } if self._data_layer and self.config.fn_opt_ohi_monitoring and self.config.instrument_a and self.config.instrument_b else {},
             "config": {
                 "long_exchange": self.config.long_exchange,
                 "short_exchange": self.config.short_exchange,
@@ -972,6 +1172,16 @@ class FundingArbEngine:
                 "max_chunk_spread_usd": self.config.max_chunk_spread_usd,
                 "min_spread_pct": self.config.min_spread_pct,
                 "max_spread_pct": self.config.max_spread_pct,
+                "fn_opt_depth_spread": self.config.fn_opt_depth_spread,
+                "fn_opt_max_slippage_bps": self.config.fn_opt_max_slippage_bps,
+                "fn_opt_ohi_monitoring": self.config.fn_opt_ohi_monitoring,
+                "fn_opt_min_ohi": self.config.fn_opt_min_ohi,
+                "fn_opt_funding_history": self.config.fn_opt_funding_history,
+                "fn_opt_min_funding_consistency": self.config.fn_opt_min_funding_consistency,
+                "fn_opt_dynamic_sizing": self.config.fn_opt_dynamic_sizing,
+                "fn_opt_max_utilization": self.config.fn_opt_max_utilization,
+                "fn_opt_max_per_pair_ratio": self.config.fn_opt_max_per_pair_ratio,
+                "fn_opt_shared_monitor_url": self.config.fn_opt_shared_monitor_url,
             },
             "trade_count": len(self._trade_log),
             "activity_log": self.get_activity_log(limit=50),
@@ -1007,6 +1217,9 @@ class FundingArbEngine:
         if extra:
             entry["extra"] = extra
         self._activity_log.append(entry)
+        # Forward to Cloudflare Analytics Engine
+        if self._activity_forwarder:
+            self._activity_forwarder.forward(category, message, "funding_arb", self.config.job_id)
 
     def get_activity_log(self, since_seq: int = 0, limit: int = 100) -> list[dict]:
         """Return activity log entries with seq > since_seq (for incremental fetch)."""
@@ -1027,6 +1240,11 @@ class FundingArbEngine:
         "quantity", "twap_num_chunks", "twap_interval_s",
         "maker_timeout_ms", "maker_reprice_ticks", "maker_max_chase_rounds",
         "maker_offset_ticks", "simulation", "duration_h", "duration_m",
+        "fn_opt_depth_spread", "fn_opt_max_slippage_bps",
+        "fn_opt_ohi_monitoring", "fn_opt_min_ohi",
+        "fn_opt_funding_history", "fn_opt_min_funding_consistency",
+        "fn_opt_dynamic_sizing", "fn_opt_max_utilization", "fn_opt_max_per_pair_ratio",
+        "fn_opt_shared_monitor_url",
     }
 
     def update_config(self, **kwargs) -> None:
@@ -1071,7 +1289,7 @@ class FundingArbEngine:
             if self._funding_monitor:
                 await self._funding_monitor.stop()
             # Restart with new symbols
-            self._data_layer = DataLayer()
+            self._data_layer = DataLayer(shared_monitor_url=self.config.fn_opt_shared_monitor_url)
             await self._data_layer.start(self._clients, self._symbols_map)
             self._funding_monitor = FundingMonitor(
                 data_layer=self._data_layer,
@@ -1080,6 +1298,9 @@ class FundingArbEngine:
                 exchange_b=self.config.short_exchange,
                 symbol_b=self.config.instrument_b,
                 poll_interval_s=self.config.funding_poll_interval_s,
+                v4_enabled=self.config.fn_opt_funding_history,
+                v4_api_url=self.config.fn_opt_funding_api_url,
+                v4_min_consistency=self.config.fn_opt_min_funding_consistency,
             )
             await self._funding_monitor.start()
             # Re-wire risk manager with new data layer

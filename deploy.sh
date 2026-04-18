@@ -15,7 +15,7 @@ set -euo pipefail
 NAS="dhaussmann@192.168.133.253"
 NAS_IP="192.168.133.253"
 REMOTE_APP="/volume1/docker/tradeautonom/app"
-PORTS=(8005 9001 9002 9003)
+PORTS=(8005 9001 9002 9003 9004 9005 9006)
 
 # ── Idle-Guard: abort if any bot is active ─────────────────────
 

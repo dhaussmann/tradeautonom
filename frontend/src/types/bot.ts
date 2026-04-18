@@ -24,6 +24,19 @@ export interface BotConfig {
   max_chunk_spread_usd: number
   min_spread_pct: number
   max_spread_pct: number
+  fn_opt_depth_spread?: boolean
+  fn_opt_max_slippage_bps?: number
+  fn_opt_ohi_monitoring?: boolean
+  fn_opt_min_ohi?: number
+  fn_opt_funding_history?: boolean
+  fn_opt_min_funding_consistency?: number
+  fn_opt_dynamic_sizing?: boolean
+  fn_opt_max_utilization?: number
+  fn_opt_max_per_pair_ratio?: number
+  fn_opt_shared_monitor_url?: string
+  fn_opt_taker_drift_guard?: boolean
+  fn_opt_max_taker_drift_bps?: number
+  [key: string]: unknown
 }
 
 export interface BotPosition {
@@ -100,6 +113,24 @@ export interface ActivityEntry {
   extra?: { level?: string }
 }
 
+export interface OhiInfo {
+  long?: { exchange: string; ohi: number; volume_24h: number; spread_bps?: number; depth_usd?: number } | null
+  short?: { exchange: string; ohi: number; volume_24h: number; spread_bps?: number; depth_usd?: number } | null
+}
+
+export interface FundingV4Info {
+  long?: { exchange: string; rate: number; annualised: number } | null
+  short?: { exchange: string; rate: number; annualised: number } | null
+  net_annualised?: number
+  consistency?: number
+  confidence_score?: number | null
+  spread_consistency?: number | null
+  pair_found?: boolean
+  spread_apr?: number
+  volume_depth?: number
+  rate_stability?: number
+}
+
 export interface BotStatus {
   state: BotState
   is_running: boolean
@@ -111,9 +142,11 @@ export interface BotStatus {
   position: BotPosition
   execution: BotExecution
   funding: FundingInfo
+  funding_v4?: FundingV4Info | null
+  ohi?: OhiInfo | null
   risk: RiskInfo
   feeds_ready: boolean
-  data: Record<string, unknown>
+  data: Record<string, unknown> & { oms_active?: boolean; oms_url?: string | null }
   config: BotConfig
   trade_count: number
   activity_log: ActivityEntry[]

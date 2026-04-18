@@ -70,6 +70,14 @@ def _build_ioc_appendix() -> int:
     return version | (isolated << 8) | (order_type << 9)
 
 
+def _build_fok_appendix() -> int:
+    """Build appendix for FOK (Fill or Kill) order: version=1, order_type=FOK(2)."""
+    version = 1           # bits 0-7
+    isolated = 0          # bit 8
+    order_type = 2        # bits 9-10 (FOK=2)
+    return version | (isolated << 8) | (order_type << 9)
+
+
 def _build_reduce_only_ioc_appendix() -> int:
     """Build appendix for reduce-only IOC order."""
     version = 1
@@ -198,11 +206,17 @@ class NadoClient:
     def _init_signer(self) -> None:
         """Derive signer address from private key and build sender bytes32.
 
-        If a linked signer key is set, that is used for signing trades.
+        If a linked signer key is set, that is used for signing trades
+        (typical in the MetaMask/browser-wallet flow where the main private key
+        is not available to the bot).  If only the main wallet private_key is
+        available, it is used instead — it always works on Nado regardless of
+        linked signer state.
         The sender bytes32 always uses the main wallet address (or explicit wallet_address).
         """
-        # Determine the signing key (linked signer preferred for trading)
-        self._trading_key = self._linked_signer_key or self._private_key
+        # Determine the signing key
+        # Prefer private_key (main wallet — always valid on Nado) when available;
+        # fall back to linked_signer_key (typical when wallet is MetaMask-only).
+        self._trading_key = self._private_key or self._linked_signer_key
 
         # Determine the wallet address for sender bytes32
         if self._wallet_address:
@@ -216,11 +230,9 @@ class NadoClient:
 
         self._signer_address = wallet_addr
         self._sender_hex = _build_sender_bytes32(wallet_addr, self._subaccount_name)
-        if self._linked_signer_key:
-            trading_addr = Account.from_key(self._linked_signer_key).address
-            logger.info("NADO wallet: %s linked-signer: %s sender: %s...", wallet_addr, trading_addr, self._sender_hex[:20])
-        else:
-            logger.info("NADO signer: %s sender: %s...", wallet_addr, self._sender_hex[:20])
+        trading_addr = Account.from_key(self._trading_key).address
+        signing_mode = "wallet-key" if self._trading_key == self._private_key else "linked-signer"
+        logger.info("NADO wallet: %s signing: %s (%s) sender: %s...", wallet_addr, trading_addr, signing_mode, self._sender_hex[:20])
 
     def _load_contracts(self) -> None:
         """Fetch chain_id and endpoint_addr from NADO contracts query."""
@@ -392,6 +404,129 @@ class NadoClient:
 
     # -- Trading ----------------------------------------------------------
 
+    def create_market_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: Decimal,
+        **kwargs,
+    ) -> dict:
+        """Market-order via FOK with aggressive pricing for guaranteed full fill."""
+        self._require_trading()
+        amount = self._round_qty(amount, symbol)
+        product_id = self._get_product_id(symbol)
+        tick = self.get_tick_size(symbol)
+
+        # Fetch best price and apply generous offset for fill certainty
+        book = self.fetch_order_book(symbol, limit=1)
+        if side == "buy":
+            if not book["asks"]:
+                raise RuntimeError(f"No asks in {symbol} orderbook")
+            best = Decimal(str(book["asks"][0][0]))
+            raw = best + tick * 10
+            final_limit = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
+        else:
+            if not book["bids"]:
+                raise RuntimeError(f"No bids in {symbol} orderbook")
+            best = Decimal(str(book["bids"][0][0]))
+            raw = best - tick * 10
+            final_limit = (raw / tick).to_integral_value(rounding="ROUND_DOWN") * tick
+
+        logger.info(
+            "NADO market (FOK): %s %s qty=%s best=%s limit=%s",
+            side.upper(), symbol, amount, best, final_limit,
+        )
+
+        order_amount = amount if side == "buy" else -amount
+        price_x18 = _to_x18(final_limit)
+        amount_x18 = _to_x18(order_amount)
+        expiration = str(int(time.time()) + 60)
+        nonce = _gen_order_nonce()
+        appendix = _build_fok_appendix()
+
+        verifying_contract = _gen_order_verifying_contract(product_id)
+        signature = _sign_order(
+            private_key=self._trading_key,
+            chain_id=self._chain_id,
+            verifying_contract=verifying_contract,
+            sender=self._sender_hex,
+            price_x18=price_x18,
+            amount_x18=amount_x18,
+            expiration=expiration,
+            nonce=nonce,
+            appendix=appendix,
+        )
+
+        ptype = self._product_type_cache.get(symbol, "")
+        payload = {
+            "place_order": {
+                "product_id": product_id,
+                "order": {
+                    "sender": self._sender_hex,
+                    "priceX18": price_x18,
+                    "amount": amount_x18,
+                    "expiration": expiration,
+                    "nonce": str(nonce),
+                    "appendix": str(appendix),
+                },
+                "signature": "0x" + signature,
+            }
+        }
+        if ptype == "spot":
+            payload["place_order"]["spot_leverage"] = True
+
+        url = f"{self._gateway_rest}/execute"
+        resp = self._session.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        resp_data = resp.json()
+
+        status = resp_data.get("status", "unknown")
+        digest = None
+        if isinstance(resp_data.get("data"), dict):
+            digest = resp_data["data"].get("digest")
+
+        logger.info(
+            "NADO FOK order placed: %s %s qty=%s limit=%s -> status=%s digest=%s",
+            side.upper(), symbol, amount, final_limit, status, digest,
+        )
+
+        if status == "failure":
+            error_msg = resp_data.get("error", "Unknown error")
+            error_code = resp_data.get("error_code", "")
+            raise RuntimeError(f"NADO order failed: {error_msg} (code={error_code})")
+
+        # Verify actual fill by querying the order digest
+        actual_traded_qty = float(amount)  # default: assume full fill
+        if digest:
+            self._order_product_cache[digest] = product_id
+            time.sleep(0.5)
+            try:
+                query_url = f"{self._gateway_rest}/query"
+                q_payload = {"type": "order", "digest": digest, "subaccount": self._sender_hex, "product_id": product_id}
+                q_resp = self._session.post(query_url, json=q_payload, timeout=5)
+                q_data = q_resp.json()
+                if q_data.get("status") == "success":
+                    order_info = q_data.get("data", {})
+                    filled_x18 = order_info.get("filled_amount", "0")
+                    filled_qty = abs(float(_from_x18(filled_x18)))
+                    if filled_qty > 0:
+                        actual_traded_qty = filled_qty
+                        logger.info("NADO FOK fill verified: %s %s requested=%s filled=%s",
+                                    side.upper(), symbol, amount, filled_qty)
+                    else:
+                        logger.warning("NADO FOK fill query returned 0 — using requested qty %s", amount)
+            except Exception as exc:
+                logger.warning("NADO FOK fill verification failed: %s — using requested qty %s", exc, amount)
+
+        return {
+            "id": digest,
+            "status": status,
+            "fill_price": float(best),
+            "limit_price": float(final_limit),
+            "digest": digest,
+            "traded_qty": actual_traded_qty,
+        }
+
     def create_aggressive_limit_order(
         self,
         symbol: str,
@@ -560,12 +695,27 @@ class NadoClient:
             side = "LONG" if size > 0 else "SHORT"
             entry_price = abs(v_quote / size) if size != 0 else 0.0
 
+            # Fetch mark price from market_price query
+            mark_price = 0.0
+            try:
+                mp_resp = self._session.post(url, json={"type": "market_price", "product_id": product_id}, timeout=5)
+                mp_data = mp_resp.json()
+                if mp_data.get("status") == "success":
+                    bid = float(_from_x18(mp_data["data"].get("bid_x18", "0")))
+                    ask = float(_from_x18(mp_data["data"].get("ask_x18", "0")))
+                    mark_price = (bid + ask) / 2 if bid and ask else bid or ask
+            except Exception:
+                pass
+
+            # PnL = size * mark_price + v_quote (v_quote is negative for longs)
+            unrealized_pnl = size * mark_price + v_quote if mark_price else 0.0
+
             result.append({
                 "instrument": symbol,
                 "size": size,
                 "entry_price": entry_price,
-                "mark_price": 0.0,
-                "unrealized_pnl": 0.0,
+                "mark_price": mark_price,
+                "unrealized_pnl": unrealized_pnl,
                 "leverage": 0.0,
                 "side": side,
             })
@@ -854,9 +1004,24 @@ class NadoClient:
         self._require_trading()
         product_id = self._order_product_cache.get(order_id)
         if product_id is None:
-            logger.warning("NADO cancel: unknown product_id for digest %s — trying all perp products", order_id[:16])
+            # Fallback: try cancel with every known perp product_id
+            logger.warning("NADO cancel: unknown product_id for digest %s — trying all known products", order_id[:16])
+            if not self._symbol_to_product_id:
+                self._load_symbols()
+            for sym, pid in self._symbol_to_product_id.items():
+                if self._product_type_cache.get(sym) == "spot":
+                    continue
+                ok = await self._cancel_with_product_id(order_id, pid)
+                if ok:
+                    logger.info("NADO cancel fallback succeeded with product_id=%d (%s)", pid, sym)
+                    return True
+            logger.warning("NADO cancel fallback: none of %d products worked for %s", len(self._symbol_to_product_id), order_id[:16])
             return False
 
+        return await self._cancel_with_product_id(order_id, product_id)
+
+    async def _cancel_with_product_id(self, order_id: str, product_id: int) -> bool:
+        """Send a signed cancel_orders request for a single digest + product_id."""
         nonce = _gen_order_nonce()
         digest_hex = order_id if order_id.startswith("0x") else "0x" + order_id
 
@@ -884,11 +1049,45 @@ class NadoClient:
             resp.raise_for_status()
             data = resp.json()
             ok = data.get("status") == "success"
-            logger.info("NADO cancel_orders(%s): %s", order_id[:16], "OK" if ok else data)
+            logger.info("NADO cancel_orders(%s, pid=%d): %s", order_id[:16], product_id, "OK" if ok else data)
             return ok
         except Exception as exc:
-            logger.warning("NADO cancel_orders(%s) error: %s", order_id[:16], exc)
+            logger.warning("NADO cancel_orders(%s, pid=%d) error: %s", order_id[:16], product_id, exc)
             return False
+
+    async def async_cancel_all_orders(self) -> bool:
+        """Cancel all open orders across all known perp products on NADO."""
+        self._require_trading()
+        if not self._symbol_to_product_id:
+            self._load_symbols()
+        cancelled_any = False
+        for sym, pid in self._symbol_to_product_id.items():
+            if self._product_type_cache.get(sym) == "spot":
+                continue
+            nonce = _gen_order_nonce()
+            # cancel_product_orders: cancel all orders for a given product
+            try:
+                signature = self._sign_cancellation([pid], [], nonce)
+                payload = {
+                    "cancel_product_orders": {
+                        "tx": {
+                            "sender": self._sender_hex,
+                            "productIds": [pid],
+                            "nonce": str(nonce),
+                        },
+                        "signature": "0x" + signature,
+                    }
+                }
+                client = await self._get_async_session()
+                resp = await client.post("/execute", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("status") == "success":
+                    cancelled_any = True
+                    logger.info("NADO cancel_all: cancelled orders for product %d (%s)", pid, sym)
+            except Exception as exc:
+                logger.debug("NADO cancel_all product %d (%s) error: %s", pid, sym, exc)
+        return cancelled_any
 
     async def async_check_order_fill(self, order_id: str) -> dict:
         """Check order fill status on NADO.
@@ -899,6 +1098,9 @@ class NadoClient:
         client = await self._get_async_session()
         try:
             payload = {"type": "order", "digest": order_id, "subaccount": self._sender_hex}
+            product_id = self._order_product_cache.get(order_id)
+            if product_id is not None:
+                payload["product_id"] = product_id
             resp = await client.post("/query", json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -946,9 +1148,23 @@ class NadoClient:
                 continue
             side = "LONG" if size > 0 else "SHORT"
             entry_price = abs(v_quote / size) if size != 0 else 0.0
+
+            # Fetch mark price from market_price query
+            mark_price = 0.0
+            try:
+                mp_resp = await client.post("/query", json={"type": "market_price", "product_id": product_id})
+                mp_data = mp_resp.json()
+                if mp_data.get("status") == "success":
+                    bid = float(_from_x18(mp_data["data"].get("bid_x18", "0")))
+                    ask = float(_from_x18(mp_data["data"].get("ask_x18", "0")))
+                    mark_price = (bid + ask) / 2 if bid and ask else bid or ask
+            except Exception:
+                pass
+
+            unrealized_pnl = size * mark_price + v_quote if mark_price else 0.0
             result.append({
                 "instrument": symbol, "size": size, "entry_price": entry_price,
-                "mark_price": 0.0, "unrealized_pnl": 0.0, "leverage": 0.0, "side": side,
+                "mark_price": mark_price, "unrealized_pnl": unrealized_pnl, "leverage": 0.0, "side": side,
             })
         return result
 
@@ -1193,6 +1409,48 @@ class NadoClient:
         }
         self._pending_link = None
         return result
+
+    def get_trading_address(self) -> str | None:
+        """Return the address derived from the active trading key, or None."""
+        if not self._trading_key:
+            return None
+        return Account.from_key(self._trading_key).address
+
+    def verify_signer(self) -> dict:
+        """Verify that the trading key is valid for signing on Nado.
+
+        When signing with the main wallet private_key, the check always passes
+        because the main wallet key is always accepted by Nado regardless of
+        the linked signer state.  When signing with a linked_signer_key, the
+        key's address must match the remote linked signer.
+
+        Returns: {"ok": bool, "local": str, "remote": str, "signing_mode": str, "error": str|None}
+        """
+        local = self.get_trading_address()
+        if not local:
+            return {"ok": False, "local": "", "remote": "", "signing_mode": "none", "error": "No trading key configured"}
+
+        signing_mode = "wallet-key" if self._trading_key == self._private_key else "linked-signer"
+
+        # When using the main wallet key, signing always works
+        if signing_mode == "wallet-key":
+            return {"ok": True, "local": local, "remote": "(wallet-key — always valid)", "signing_mode": signing_mode, "error": None}
+
+        # When using linked signer key, verify it matches the remote
+        try:
+            info = self.get_linked_signer()
+        except Exception as exc:
+            return {"ok": False, "local": local, "remote": "", "signing_mode": signing_mode, "error": str(exc)}
+        remote = info.get("linked_signer") or ""
+        if not remote:
+            return {"ok": False, "local": local, "remote": "", "signing_mode": signing_mode, "error": info.get("error", "No remote signer found")}
+        match = local.lower() == remote.lower()
+        if not match:
+            logger.warning("NADO signer mismatch: local=%s remote=%s — linked signer was changed externally (e.g. via nado.xyz 1-Click Trading). Re-link via bot frontend.", local, remote)
+        return {
+            "ok": match, "local": local, "remote": remote, "signing_mode": signing_mode,
+            "error": None if match else "Signer changed externally — please re-link via Settings",
+        }
 
     def get_linked_signer(self, wallet_address: str | None = None, subaccount_name: str | None = None) -> dict:
         """Query NADO for the current linked signer of a subaccount."""

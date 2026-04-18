@@ -36,3 +36,40 @@ export async function fetchAdminUsers(): Promise<AdminUser[]> {
 export async function deleteAdminUser(userId: string): Promise<{ status: string }> {
   return request(`/admin/users/${userId}`, { method: 'DELETE' })
 }
+
+// ── Activity Log ─────────────────────────────────────────────
+
+export interface ActivityLogEntry {
+  container: string
+  port: string
+  bot_type: string
+  bot_id: string
+  event: string
+  message: string
+  user_id: string
+  timestamp: number
+  datetime: string
+}
+
+export interface ActivityLogFilters {
+  container?: string
+  bot_type?: string
+  event?: string
+  search?: string
+  from?: string
+  to?: string
+  limit?: number
+}
+
+export async function fetchActivityLogs(filters: ActivityLogFilters = {}): Promise<{ rows: ActivityLogEntry[]; count: number }> {
+  const params = new URLSearchParams()
+  if (filters.container) params.set('container', filters.container)
+  if (filters.bot_type) params.set('bot_type', filters.bot_type)
+  if (filters.event) params.set('event', filters.event)
+  if (filters.search) params.set('search', filters.search)
+  if (filters.from) params.set('from', filters.from)
+  if (filters.to) params.set('to', filters.to)
+  if (filters.limit) params.set('limit', String(filters.limit))
+  const qs = params.toString()
+  return request(`/admin/activity${qs ? '?' + qs : ''}`)
+}

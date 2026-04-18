@@ -45,6 +45,16 @@ const routes = [
     component: () => import('@/views/StrategiesView.vue'),
   },
   {
+    path: '/arbitrage',
+    name: 'arbitrage',
+    component: () => import('@/views/ArbitrageView.vue'),
+  },
+  {
+    path: '/dna',
+    name: 'dna',
+    component: () => import('@/views/DnaView.vue'),
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('@/views/SettingsView.vue'),
@@ -53,6 +63,12 @@ const routes = [
     path: '/admin',
     name: 'admin',
     component: () => import('@/views/AdminView.vue'),
+    meta: { admin: true },
+  },
+  {
+    path: '/admin/activity',
+    name: 'admin-activity',
+    component: () => import('@/views/AdminActivityView.vue'),
     meta: { admin: true },
   },
   {

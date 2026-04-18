@@ -206,17 +206,21 @@ class VariationalClient:
         return url.replace(self._base_url, self._proxy_url, 1)
 
     def _sync_get(self, url: str, params: dict | None = None, max_retries: int = 0) -> Any:
-        """Synchronous GET — CF Worker proxy first, curl_cffi fallback.
+        """Synchronous GET.
+
+        Public endpoints (stats API) → direct via curl_cffi (no auth needed).
+        Authenticated endpoints (positions, portfolio, etc.) → proxy first, curl_cffi fallback.
 
         max_retries=0 (default): no retry, fail fast (dashboard/portfolio reads).
         max_retries=N: retry N times on 403 (position checks in order flow).
         """
+        # Public stats API — always direct, no auth
         if url.startswith(self._stats_url):
-            resp = _requests.get(url, params=params, timeout=15)
+            resp = self._cffi_session.get(url, params=params, timeout=15)
             resp.raise_for_status()
             return resp.json()
 
-        # Try CF Worker proxy first
+        # Authenticated endpoints — proxy first (handles auth server-side), curl_cffi fallback
         if self._proxy_session and url.startswith(self._base_url):
             try:
                 proxy_url = self._proxy_rewrite_url(url)

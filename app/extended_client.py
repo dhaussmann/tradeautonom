@@ -194,6 +194,12 @@ class ExtendedClient:
         step = self.get_qty_step(symbol)
         return (amount / step).to_integral_value(rounding="ROUND_DOWN") * step
 
+    def _round_price(self, price: Decimal, symbol: str, up: bool = False) -> Decimal:
+        """Round price to tick size. up=True rounds up (for buys), False rounds down (for sells)."""
+        tick = self._get_tick_size(symbol)
+        rounding = "ROUND_UP" if up else "ROUND_DOWN"
+        return (price / tick).to_integral_value(rounding=rounding) * tick
+
     def _round_to_tick(self, price: Decimal, symbol: str) -> Decimal:
         """Round price down (sell) or up (buy) to the instrument's tick size."""
         tick = self._get_tick_size(symbol)
@@ -234,61 +240,110 @@ class ExtendedClient:
         expected_price: float | None = None,
         slippage_pct: float | None = None,
     ) -> dict:
-        """Place a market order (emulated as IOC limit with slippage buffer).
+        """Place a native MARKET order on Extended.
 
-        Extended does not support native market orders. The limit price is set
-        to best_price * (1 ± slippage_pct/100). Falls back to _MARKET_ORDER_SLIPPAGE
-        (0.75%) if no slippage_pct is given.
+        The x10 SDK doesn't support OrderType.MARKET yet, so we:
+        1. Build the order object as LIMIT (to get the Stark signature),
+        2. Patch type to MARKET in the serialised JSON,
+        3. POST directly to /user/order.
+
+        Price requirement: Long ≤ Mark*(1+5%), Short ≥ Mark*(1−5%).
+        We use BBO ± 5% as the price to guarantee fill.
         """
         self._require_trading()
-        from x10.perpetual.orders import OrderSide, TimeInForce
+        from x10.perpetual.order_object import create_order_object
+        from x10.perpetual.orders import OrderSide, OrderType, TimeInForce
 
         amount = self._round_qty(amount, symbol)
+        order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
-        # Use best ask/bid as reference — more accurate than mid price
+        # Price for market orders: BBO ± 5% (Extended allows up to 5%)
         book = self.fetch_order_book(symbol, limit=1)
         if side == "buy":
             if not book["asks"]:
                 raise RuntimeError(f"No asks in {symbol} orderbook")
             ref_price = Decimal(str(book["asks"][0][0]))
+            limit_price = self._round_price(ref_price * Decimal("1.05"), symbol, up=True)
         else:
             if not book["bids"]:
                 raise RuntimeError(f"No bids in {symbol} orderbook")
             ref_price = Decimal(str(book["bids"][0][0]))
+            limit_price = self._round_price(ref_price * Decimal("0.95"), symbol, up=False)
 
-        slip = Decimal(str(slippage_pct / 100)) if slippage_pct is not None else _MARKET_ORDER_SLIPPAGE
+        logger.info("Extended MARKET %s %s qty=%s price=%s (ref=%s)", side.upper(), symbol, amount, limit_price, ref_price)
 
-        tick = self._get_tick_size(symbol)
-        if side == "buy":
-            raw = ref_price * (1 + slip)
-            limit_price = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
-        else:
-            raw = ref_price * (1 - slip)
-            limit_price = (raw / tick).to_integral_value(rounding="ROUND_DOWN") * tick
+        # Build order as LIMIT (SDK refuses MARKET), then patch type
+        order = _run_async(self._build_market_order(symbol, amount, limit_price, order_side))
+        body = order.to_api_request_json(exclude_none=True)
+        body["type"] = "MARKET"  # patch to native market
 
-        order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+        # Send directly via REST
+        url = f"{self._base_url}/user/order"
+        resp = self._session.post(url, json=body, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
 
-        logger.info(
-            "Extended MARKET %s %s qty=%s limit_price=%s (best=%s slip=%.4f%% tick=%s)",
-            side.upper(), symbol, amount, limit_price, ref_price,
-            float(slip) * 100, tick,
-        )
+        if data.get("status", "").upper() != "OK":
+            raise RuntimeError(f"Extended MARKET order error: {data}")
 
-        result = _run_async(
-            self._trading_client.place_order(
-                market_name=symbol,
-                amount_of_synthetic=amount,
-                price=limit_price,
-                side=order_side,
-                time_in_force=TimeInForce.IOC,
+        order_data = data.get("data", {})
+        order_id = order_data.get("id")
+        external_id = order_data.get("externalId")
+        logger.info("Extended MARKET placed: id=%s external_id=%s", order_id, external_id)
+
+        # Wait briefly and check fill
+        import time as _time
+        _time.sleep(0.8)
+        fill = self.check_order_fill(str(order_id)) if order_id else {}
+        filled_qty = float(fill.get("order", {}).get("filledQty", 0)) if fill.get("filled") else 0.0
+        avg_price = float(fill.get("order", {}).get("averagePrice", 0)) if fill.get("filled") else 0.0
+        logger.info("Extended MARKET fill: id=%s filled=%s qty=%s avg_price=%s",
+                     order_id, fill.get("filled"), filled_qty, avg_price)
+
+        return {
+            "id": str(order_id) if order_id is not None else None,
+            "external_id": str(external_id) if external_id is not None else None,
+            "traded_qty": filled_qty,
+            "avg_price": avg_price,
+            "status": "FILLED" if filled_qty > 0 else "PENDING",
+        }
+
+    async def _build_market_order(self, symbol: str, amount: Decimal, price: Decimal, side):
+        """Build a NewOrderModel for a MARKET order.
+
+        The installed SDK (v1.0.0) blocks OrderType.MARKET in create_order_object.
+        The latest GitHub version supports it.  We build as LIMIT+IOC (identical
+        Stark signature) and patch 'type' to MARKET before serialisation.
+        """
+        from x10.perpetual.order_object import create_order_object
+        from x10.perpetual.orders import OrderType, TimeInForce
+
+        if not self._trading_client._PerpetualTradingClient__markets:
+            self._trading_client._PerpetualTradingClient__markets = (
+                await self._trading_client._PerpetualTradingClient__markets_info_module.get_markets_dict()
             )
-        )
+        market = self._trading_client._PerpetualTradingClient__markets.get(symbol)
+        if not market:
+            raise ValueError(f"Market {symbol} not found on Extended")
 
-        data = getattr(result, "data", result)
-        order_id = getattr(data, "id", None)
-        external_id = getattr(data, "external_id", None)
-        logger.info("Extended order placed: id=%s external_id=%s", order_id, external_id)
-        return {"id": str(order_id) if order_id is not None else None, "external_id": str(external_id) if external_id is not None else None}
+        account = self._trading_client._PerpetualTradingClient__stark_account
+        config = self._trading_client._PerpetualTradingClient__config
+
+        from datetime import datetime, timedelta, timezone
+        expire = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        order = create_order_object(
+            account=account,
+            market=market,
+            amount_of_synthetic=amount,
+            price=price,
+            side=side,
+            expire_time=expire,
+            time_in_force=TimeInForce.IOC,
+            starknet_domain=config.starknet_domain,
+        )
+        # Patch type LIMIT → MARKET (model is frozen, so use model_copy)
+        return order.model_copy(update={"type": OrderType.MARKET})
 
     def create_aggressive_limit_order(
         self,
@@ -667,8 +722,9 @@ class ExtendedClient:
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
         logger.info(
-            "Extended POST-ONLY %s %s qty=%s @ %s (tick=%s reduce_only=%s)",
+            "Extended POST-ONLY %s %s qty=%s @ %s (tick=%s reduce_only=%s) [types: amount=%s price=%s]",
             side.upper(), symbol, amount, price, tick, reduce_only,
+            type(amount).__name__, type(price).__name__,
         )
 
         result = await self._trading_client.place_order(

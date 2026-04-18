@@ -150,6 +150,16 @@ async function authorizeNadoBot() {
     // Step 3: submit signature to backend
     const result = await nadoSubmitLink(signature)
     if (result.status === 'success') {
+      // Persist Nado keys to D1 so they survive container restarts
+      try {
+        await updateSecretsKeys({
+          nado_linked_signer_key: result.trading_key,
+          nado_wallet_address: result.wallet_address,
+          nado_subaccount_name: result.subaccount_name,
+        })
+      } catch (e) {
+        console.warn('Failed to persist Nado keys to D1:', e)
+      }
       nadoSuccess.value = `Bot authorized! Trading address: ${result.trading_address}`
       await refreshNadoStatus()
     } else {

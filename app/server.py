@@ -28,7 +28,19 @@ from app.nado_client import NadoClient
 from app.variational_client import VariationalClient
 from app.job_manager import JobManager, ArbJob
 from app.ws_feeds import OrderbookFeedManager
+_dna_import_error = ""
+try:
+    from app.dna_bot import DNABot, DNAConfig
+    _dna_import_ok = True
+except Exception as _exc:
+    _dna_import_ok = False
+    _dna_import_error = str(_exc)
+    DNABot = None  # type: ignore
+    DNAConfig = None  # type: ignore
+    import logging as _log
+    _log.getLogger("tradeautonom").error("DNA bot import failed: %s", _exc)
 from app.journal_collector import JournalCollector
+from app.activity_forwarder import ActivityLogForwarder
 from app.schemas import (
     ArbAutoRequest,
     ArbCheckResponse,
@@ -86,6 +98,8 @@ _job_manager: JobManager | None = None
 _fn_engine: FundingArbEngine | None = None
 _bot_registry: BotRegistry | None = None
 _journal_collector: JournalCollector | None = None
+_activity_forwarder: ActivityLogForwarder | None = None
+_dna_bot: DNABot | None = None
 _vault_unlocked: bool = False  # True after user enters correct password
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -99,7 +113,7 @@ async def _init_exchange_clients():
     """Initialize exchange clients and engines after vault unlock."""
     global _settings, _client, _extended_client, _executor, _arb_engine
     global _exchange_clients, _feed_manager, _job_manager, _fn_engine, _bot_registry
-    global _vault_unlocked, _auto_trade_task
+    global _vault_unlocked, _auto_trade_task, _dna_bot
 
     _client = GrvtClient(_settings)
     _extended_client = ExtendedClient(
@@ -164,10 +178,20 @@ async def _init_exchange_clients():
 
     _auto_trade_task = asyncio.create_task(_auto_trade_loop())
 
+    # ── Activity Log Forwarder (Cloudflare Analytics Engine) ────────
+    global _activity_forwarder
+    if _settings.history_ingest_url and _settings.history_ingest_token:
+        activity_ingest_url = _settings.history_ingest_url.replace("/api/history/ingest", "/api/activity/ingest")
+        _activity_forwarder = ActivityLogForwarder(
+            ingest_url=activity_ingest_url,
+            ingest_token=_settings.history_ingest_token,
+        )
+        _activity_forwarder.start()
+
     # ── Funding-Arb engine (legacy single-bot — kept for backward compat) ──
     try:
         fn_config = EngineConfig.from_settings(_settings, job_id="default")
-        _fn_engine = FundingArbEngine(config=fn_config, clients=_exchange_clients)
+        _fn_engine = FundingArbEngine(config=fn_config, clients=_exchange_clients, activity_forwarder=_activity_forwarder)
         await _fn_engine.start()
         logger.info("FundingArbEngine started: long=%s short=%s maker=%s",
                     fn_config.long_exchange, fn_config.short_exchange, fn_config.maker_exchange)
@@ -177,12 +201,36 @@ async def _init_exchange_clients():
 
     # ── Bot Registry (multi-bot v2) ────────────────────────────────
     try:
-        _bot_registry = BotRegistry(clients=_exchange_clients, settings=_settings)
+        _bot_registry = BotRegistry(clients=_exchange_clients, settings=_settings, activity_forwarder=_activity_forwarder)
         await _bot_registry.start_all()
         logger.info("BotRegistry started: %s", _bot_registry.bot_ids)
     except Exception as exc:
         logger.warning("BotRegistry failed to start (non-fatal): %s", exc)
         _bot_registry = None
+
+    # ── DNA Bot (Delta-Neutral Arbitrage) ────────────────────────
+    if not _dna_import_ok:
+        logger.warning("DNA bot skipped — import failed")
+    else:
+        try:
+            dna_config = DNAConfig(
+                bot_id="dna-default",
+                oms_url=_settings.dna_oms_url,
+                position_size_usd=_settings.dna_position_size_usd,
+                max_positions=_settings.dna_max_positions,
+                min_profit_bps=_settings.dna_min_profit_bps,
+                exchanges=_settings.dna_exchanges.split(","),
+                slippage_tolerance_pct=_settings.dna_slippage_tolerance_pct,
+                size_tolerance_pct=_settings.dna_size_tolerance_pct,
+                simulation=_settings.dna_simulation,
+                excluded_tokens=[t.strip() for t in _settings.dna_excluded_tokens.split(",") if t.strip()],
+                auto_exclude_open_positions=_settings.dna_auto_exclude_open_positions,
+            )
+            _dna_bot = DNABot(config=dna_config, clients=_exchange_clients, activity_forwarder=_activity_forwarder)
+            logger.info("DNA bot initialized: %s (simulation=%s)", dna_config.bot_id, dna_config.simulation)
+        except Exception as exc:
+            logger.warning("DNA bot init failed (non-fatal): %s", exc)
+            _dna_bot = None
 
     # ── Journal Collector (order/fill/funding/points history) ──────
     global _journal_collector
@@ -206,12 +254,18 @@ async def _shutdown_exchange_clients():
     """Shut down exchange clients and engines (for lock or app shutdown)."""
     global _client, _extended_client, _executor, _arb_engine
     global _exchange_clients, _feed_manager, _job_manager, _fn_engine, _bot_registry
-    global _vault_unlocked, _auto_trade_task, _journal_collector
+    global _vault_unlocked, _auto_trade_task, _journal_collector, _dna_bot, _activity_forwarder
 
     _vault_unlocked = False
+    if _dna_bot is not None:
+        await _dna_bot.stop()
+        _dna_bot = None
     if _journal_collector is not None:
         await _journal_collector.stop()
         _journal_collector = None
+    if _activity_forwarder is not None:
+        _activity_forwarder.stop()
+        _activity_forwarder = None
     if _auto_trade_task is not None:
         _auto_trade_task.cancel()
         _auto_trade_task = None
@@ -235,7 +289,7 @@ async def _shutdown_exchange_clients():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings
+    global _settings, _current_password
     _settings = Settings()
     # Check if auth is set up AND we have plaintext secrets (legacy migration)
     auth_file = _DATA_DIR / "auth.json"
@@ -2128,11 +2182,12 @@ _current_password: str | None = None  # held in RAM while vault is unlocked
 # ── Vault session persistence (auto-unlock after uvicorn reload) ──────
 
 def _session_key() -> bytes:
-    """Derive an AES-256 key from hostname + fixed pepper for session encryption."""
+    """Derive an AES-256 key from a stable container identifier + fixed pepper."""
     import hashlib
-    hostname = os.environ.get("HOSTNAME", "tradeautonom-default")
+    # APP_PORT is stable across restarts; HOSTNAME changes with every docker run
+    identity = os.environ.get("APP_PORT") or os.environ.get("HOSTNAME", "tradeautonom-default")
     pepper = "vault-session-pepper-2026"
-    return hashlib.pbkdf2_hmac("sha256", f"{hostname}:{pepper}".encode(), b"session-salt", 100_000, dklen=32)
+    return hashlib.pbkdf2_hmac("sha256", f"{identity}:{pepper}".encode(), b"session-salt", 100_000, dklen=32)
 
 
 def _save_vault_session(password: str) -> None:
@@ -2342,9 +2397,10 @@ async def nado_submit_link(body: dict):
         else:
             logger.warning("NADO linked signer key NOT saved — vault is locked (_current_password is None)")
 
-    # Don't return the trading key to the frontend
+    # Return trading_key so the frontend can persist it to D1
     return {
         "status": result.get("status"),
+        "trading_key": result.get("trading_key"),
         "trading_address": result.get("trading_address"),
         "wallet_address": result.get("wallet_address"),
         "subaccount_name": result.get("subaccount_name"),
@@ -2354,7 +2410,7 @@ async def nado_submit_link(body: dict):
 @app.get("/nado/link-status")
 async def nado_link_status():
     """Return current NADO linked signer status."""
-    has_key = bool(_settings and _settings.nado_linked_signer_key)
+    has_key = bool(_settings and (_settings.nado_linked_signer_key or _settings.nado_private_key))
     wallet = _settings.nado_wallet_address if _settings else ""
     subaccount = _settings.nado_subaccount_name if _settings else "default"
 
@@ -2368,11 +2424,30 @@ async def nado_link_status():
         except Exception:
             pass
 
+    local_trading_address = None
+    signing_mode = None
+    if client and hasattr(client, "verify_signer"):
+        try:
+            vinfo = client.verify_signer()
+            local_trading_address = vinfo.get("local")
+            signing_mode = vinfo.get("signing_mode")
+        except Exception:
+            pass
+
+    match = None
+    if signing_mode == "wallet-key":
+        match = True  # wallet key always valid on Nado
+    elif local_trading_address and remote_signer:
+        match = local_trading_address.lower() == remote_signer.lower()
+
     return {
         "has_trading_key": has_key,
         "wallet_address": wallet,
         "subaccount_name": subaccount,
         "remote_linked_signer": remote_signer,
+        "local_trading_address": local_trading_address,
+        "signing_mode": signing_mode,
+        "match": match,
     }
 
 
@@ -2473,7 +2548,17 @@ async def internal_apply_keys(body: dict):
         # Vault already open — re-apply keys and reinit clients (handles new keys added after unlock)
         _apply_secrets_to_settings(keys)
         _reinit_exchange_clients()
-        logger.info("Keys re-injected (vault was unlocked) — exchanges=%s", list(_exchange_clients.keys()))
+        # Also persist to local secrets.enc so updated keys survive restarts
+        if _current_password:
+            try:
+                secrets = _load_secrets_encrypted(_current_password)
+            except Exception:
+                secrets = {}
+            secrets.update({k: v for k, v in keys.items() if k in _MANAGED_KEYS and v})
+            _save_secrets_encrypted(secrets, _current_password)
+            logger.info("Keys re-injected + saved to secrets.enc — exchanges=%s", list(_exchange_clients.keys()))
+        else:
+            logger.info("Keys re-injected (vault was unlocked, no password for secrets.enc) — exchanges=%s", list(_exchange_clients.keys()))
         return {"status": "ok", "already_unlocked": True, "reinjected": True, "exchanges": list(_exchange_clients.keys())}
     # Apply keys to in-memory settings
     _apply_secrets_to_settings(keys)
@@ -2632,6 +2717,126 @@ async def debug_variational_positions(
         yield f"DONE: {success} OK, {errors_403} x 403, {errors - errors_403} other errors / {iterations} total\n"
 
     return StreamingResponse(_stream(), media_type="text/plain")
+
+
+# ------------------------------------------------------------------
+# DNA Bot (Delta-Neutral Arbitrage) endpoints
+# ------------------------------------------------------------------
+
+
+def _require_dna_bot():
+    if not _dna_import_ok:
+        raise HTTPException(status_code=503, detail=f"DNA bot module failed to import: {_dna_import_error}")
+    if _dna_bot is None:
+        raise HTTPException(status_code=503, detail="DNA bot not initialized (vault locked?)")
+    return _dna_bot
+
+
+@app.get("/dna/status")
+async def dna_status():
+    """DNA bot status: config, positions, activity."""
+    bot = _require_dna_bot()
+    return bot.get_status()
+
+
+@app.get("/dna/preflight")
+async def dna_preflight():
+    """Run connectivity pre-flight checks for exchanges and OMS."""
+    bot = _require_dna_bot()
+    return await bot.preflight_check()
+
+
+@app.post("/dna/start")
+async def dna_start():
+    """Start the DNA bot (connects to OMS, begins watching for arb signals)."""
+    bot = _require_dna_bot()
+    if bot._running:
+        return {"status": "already_running"}
+    preflight = await bot.preflight_check()
+    if not preflight["can_start"]:
+        failed = []
+        for name, check in preflight["checks"].items():
+            if name == "oms":
+                if not check.get("health"):
+                    failed.append(f"OMS health check failed")
+                for exch, ok in check.get("books", {}).items():
+                    if not ok:
+                        failed.append(f"OMS book unavailable for {exch}")
+            else:
+                if not check.get("positions"):
+                    failed.append(f"{name}: positions check failed")
+                if check.get("balance") is False:
+                    failed.append(f"{name}: balance check failed")
+            if check.get("error"):
+                failed.append(f"{name}: {check['error']}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pre-flight checks failed: {'; '.join(failed)}",
+        )
+    await bot.start()
+    return {"status": "started", "preflight": preflight}
+
+
+@app.post("/dna/stop")
+async def dna_stop():
+    """Stop the DNA bot (does NOT close positions)."""
+    bot = _require_dna_bot()
+    if not bot._running:
+        return {"status": "already_stopped"}
+    await bot.stop()
+    return {"status": "stopped"}
+
+
+@app.post("/dna/reset")
+async def dna_reset():
+    """Reset the DNA bot: stop, clear positions and activity log."""
+    bot = _require_dna_bot()
+    await bot.reset()
+    return {"status": "reset"}
+
+
+@app.post("/dna/config")
+async def dna_config_update(updates: dict):
+    """Update DNA bot config. Bot must be stopped first."""
+    bot = _require_dna_bot()
+    if bot._running:
+        raise HTTPException(status_code=400, detail="Stop the DNA bot before updating config")
+    for key, val in updates.items():
+        if hasattr(bot.config, key):
+            setattr(bot.config, key, val)
+    bot._save_config()
+    return {"status": "ok", "config": bot.get_status()["config"]}
+
+
+@app.post("/dna/close/{position_id}")
+async def dna_close_position(position_id: str):
+    """Manually close a specific DNA position."""
+    bot = _require_dna_bot()
+    result = await bot.close_position(position_id, reason="manual")
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.post("/dna/position/{position_id}/delete")
+async def dna_delete_position(position_id: str):
+    """Delete a closed DNA position from history."""
+    bot = _require_dna_bot()
+    result = bot.delete_position(position_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/dna/positions")
+async def dna_positions():
+    """List all DNA positions (open and closed)."""
+    bot = _require_dna_bot()
+    return {
+        "positions": [asdict(p) for p in bot._positions],
+        "open": len([p for p in bot._positions if p.status == "open"]),
+        "max": bot.config.max_positions,
+    }
 
 
 # ------------------------------------------------------------------

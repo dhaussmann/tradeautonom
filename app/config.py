@@ -103,9 +103,39 @@ class Settings(BaseSettings):
     # Simulation
     fn_simulation_mode: bool = False          # True = paper-trade (no real orders)
 
+    # ── Opt-in Optimierungen (alle Default off) ───────────────────
+    fn_opt_depth_spread: bool = False         # Opt 1: VWAP statt BBO für Spread Guard
+    fn_opt_max_slippage_bps: float = 10.0     # Opt 1+4: Max Slippage Budget (basis points)
+    fn_opt_ohi_monitoring: bool = False       # Opt 2: OHI im Dashboard anzeigen
+    fn_opt_min_ohi: float = 0.4              # Opt 2: Min OHI für Entry (0=disabled)
+    fn_opt_funding_history: bool = False      # Opt 3: V4 API historischer Funding Filter
+    fn_opt_funding_api_url: str = "https://api.fundingrate.de"  # Opt 3: V4 API Base URL
+    fn_opt_min_funding_consistency: float = 0.3  # Opt 3: Min Consistency Score (0-1)
+    fn_opt_dynamic_sizing: bool = False       # Opt 4: Liquiditätsbasiertes Sizing
+    fn_opt_max_utilization: float = 0.80      # Opt 4: Max Kapitalnutzung (0-1)
+    fn_opt_max_per_pair_ratio: float = 0.25   # Opt 4: Max Anteil pro Pair (0-1)
+    fn_opt_shared_monitor_url: str = ""       # Opt 5: OMS URL (leer = disabled)
+    fn_opt_taker_drift_guard: bool = False    # Opt 6: Taker-Drift-Guard während Maker-Wait
+    fn_opt_max_taker_drift_bps: float = 3.0  # Opt 6: Max erlaubter Taker-Drift (basis points)
+
+    # ── DNA Bot (Delta-Neutral Arbitrage) ──────────────────────
+    dna_oms_url: str = "http://192.168.133.253:8099"
+    dna_position_size_usd: float = 1000.0
+    dna_max_positions: int = 3
+    dna_min_profit_bps: float = 0.0        # 0 = use OMS fee thresholds
+    dna_exchanges: str = "extended,grvt,nado"
+    dna_slippage_tolerance_pct: float = 0.5
+    dna_size_tolerance_pct: float = 5.0
+    dna_simulation: bool = False           # default to live trading
+    dna_excluded_tokens: str = "SUI"       # comma-separated tokens to skip
+    dna_auto_exclude_open_positions: bool = True  # auto-exclude tokens with open exchange positions
+
     # ── History ingest (push snapshots to Cloudflare D1) ───────
     history_ingest_url: str = ""              # e.g. https://tradeautonom.workers.dev/api/history/ingest
     history_ingest_token: str = ""            # Bearer token for auth
     history_ingest_interval_s: int = 300      # seconds between pushes (default 5 min)
+
+    # ── Execution log (per-chunk AI training data) ─────────────
+    execution_log_enabled: bool = True        # Enable per-chunk execution logging to D1
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

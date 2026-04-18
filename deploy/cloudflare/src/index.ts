@@ -26,6 +26,8 @@ import {
   handleJournalPairedTrades,
   handleJournalSummary,
 } from "./journal";
+import { handleExecutionLogIngest, handleExecutionLogQuery } from "./execution_log";
+import { handleActivityIngest, handleActivityQuery } from "./activity_log";
 import { createAuth } from "./auth";
 import { loadSecrets, saveSecrets, hasSecrets, maskKeys, filterUpdates } from "./lib/secrets";
 // @ts-expect-error — generated at build time by wrangler sites
@@ -36,6 +38,7 @@ const assetManifest = JSON.parse(manifestJSON);
 interface Env {
   __STATIC_CONTENT: KVNamespace;
   NAS_BACKEND: Fetcher;
+  OMS_BACKEND: Fetcher;
   ORCHESTRATOR_ORIGIN: string;
   DB: D1Database;
   INGEST_TOKEN: string;
@@ -43,6 +46,9 @@ interface Env {
   ORCH_TOKEN: string;
   ENCRYPTION_KEY: string;
   ADMIN_EMAILS: string;
+  ACTIVITY_LOG: AnalyticsEngineDataset;
+  CF_API_TOKEN: string;
+  CF_ACCOUNT_ID: string;
 }
 
 export default {
@@ -124,6 +130,25 @@ export default {
       if (!targetUserId) return jsonResponse({ error: "user_id required" }, 400);
       return handleAdminDeleteUser(env, targetUserId);
     }
+    if (url.pathname === "/api/admin/activity" && request.method === "GET") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
+      return handleActivityQuery(request, env.CF_ACCOUNT_ID, env.CF_API_TOKEN);
+    }
+
+    // ── Execution log ingest: no user auth, uses INGEST_TOKEN ──
+    if (url.pathname === "/api/execution-log/ingest" && request.method === "POST") {
+      return handleExecutionLogIngest(request, env.DB, env.INGEST_TOKEN);
+    }
+
+    // ── Activity log ingest: no user auth, uses INGEST_TOKEN ──
+    if (url.pathname === "/api/activity/ingest" && request.method === "POST") {
+      const authHeader = request.headers.get("Authorization") || "";
+      const token = authHeader.replace("Bearer ", "");
+      if (token !== env.INGEST_TOKEN) return jsonResponse({ error: "Forbidden" }, 403);
+      return handleActivityIngest(request, env.ACTIVITY_LOG);
+    }
 
     // ── Journal ingest: no user auth, uses INGEST_TOKEN ──────
     if (url.pathname === "/api/journal/ingest" && request.method === "POST") {
@@ -158,6 +183,13 @@ export default {
       }
     }
 
+    // ── Execution log read: requires session ──────────────────
+    if (url.pathname === "/api/execution-log") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      return handleExecutionLogQuery(url, env.DB, session.user.id);
+    }
+
     // ── History read: requires session ──────────────────────
     if (url.pathname.startsWith("/api/history/")) {
       const session = await getSession(request, env);
@@ -172,6 +204,13 @@ export default {
       if (url.pathname === "/api/history/trades") {
         return handleTradesHistory(url, env.DB, session.user.id);
       }
+    }
+
+    // ── OMS proxy: /api/oms/* → OMS service (port 8099) ────
+    if (url.pathname.startsWith("/api/oms/") && request.method === "GET") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      return handleOmsProxy(request, url, env);
     }
 
     // ── Orchestrator admin API: /api/orch/* ──────────────────
@@ -425,6 +464,41 @@ async function handleOrchProxy(
     });
   } catch (err) {
     return jsonResponse({ error: "Orchestrator unreachable", detail: String(err) }, 502);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// OMS proxy — routes to OMS service (port 8099) via NAS_BACKEND
+// ─────────────────────────────────────────────────────────────
+
+async function handleOmsProxy(
+  request: Request,
+  url: URL,
+  env: Env,
+): Promise<Response> {
+  const omsPath = url.pathname.replace(/^\/api\/oms/, "") + url.search;
+  const omsUrl = `${env.ORCHESTRATOR_ORIGIN.replace(/:\d+$/, "")}:8099${omsPath}`;
+
+  const proxyHeaders = new Headers();
+  proxyHeaders.set("Accept", "application/json");
+
+  const proxyRequest = new Request(omsUrl, {
+    method: "GET",
+    headers: proxyHeaders,
+  });
+
+  try {
+    const response = await env.OMS_BACKEND.fetch(proxyRequest);
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Cache-Control", "no-store");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+    });
+  } catch (err) {
+    return jsonResponse({ error: "OMS unreachable", detail: String(err) }, 502);
   }
 }
 

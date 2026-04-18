@@ -19,6 +19,8 @@ async function handleLogout() {
 const baseLinks = [
   { to: '/', label: 'Dashboard', name: 'dashboard' },
   { to: '/strategies', label: 'Strategies', name: 'strategies' },
+  { to: '/arbitrage', label: 'Arbitrage', name: 'arbitrage' },
+  { to: '/dna', label: 'DNA Bot', name: 'dna' },
   { to: '/positions', label: 'Positions', name: 'positions' },
   { to: '/history', label: 'History', name: 'history' },
   { to: '/account', label: 'Account', name: 'account' },
@@ -28,7 +30,7 @@ const baseLinks = [
 
 const navLinks = computed(() => {
   if (authStore.isAdmin) {
-    return [...baseLinks, { to: '/admin', label: 'Admin', name: 'admin' }]
+    return [...baseLinks, { to: '/admin', label: 'Admin', name: 'admin' }, { to: '/admin/activity', label: 'Activity', name: 'admin-activity' }]
   }
   return baseLinks
 })

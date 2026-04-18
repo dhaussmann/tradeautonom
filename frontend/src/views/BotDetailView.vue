@@ -71,6 +71,27 @@ const editSpreadValue = ref(0.5)
 const showMinSpreadPopover = ref(false)
 const editMinSpreadValue = ref(-0.5)
 
+// Advanced settings panel
+const showAdvancedPanel = ref(false)
+
+// Local refs for numeric inputs (prevents SSE overwrite while editing)
+const localSlippageBps = ref(10)
+const localMinConsistency = ref(0.3)
+const localDriftBps = ref(3)
+const slippageFocused = ref(false)
+const consistencyFocused = ref(false)
+const driftBpsFocused = ref(false)
+
+watch(() => status.value?.config?.fn_opt_max_slippage_bps, (v) => {
+  if (!slippageFocused.value && v !== undefined) localSlippageBps.value = v as number
+}, { immediate: true })
+watch(() => status.value?.config?.fn_opt_min_funding_consistency, (v) => {
+  if (!consistencyFocused.value && v !== undefined) localMinConsistency.value = v as number
+}, { immediate: true })
+watch(() => status.value?.config?.fn_opt_max_taker_drift_bps, (v) => {
+  if (!driftBpsFocused.value && v !== undefined) localDriftBps.value = v as number
+}, { immediate: true })
+
 // ── Computed ────────────────────────────────────────
 const isActive = computed(() => status.value && status.value.state !== 'IDLE')
 const isIdle = computed(() => status.value?.state === 'IDLE')
@@ -182,6 +203,16 @@ const priceSpreadPct = computed(() => {
   if (!longAsk || !shortBid || shortBid <= 0) return null
   return ((longAsk - shortBid) / shortBid) * 100
 })
+
+// OHI data from SSE
+const longOhi = computed(() => status.value?.ohi?.long ?? null)
+const shortOhi = computed(() => status.value?.ohi?.short ?? null)
+
+// V4 funding data from SSE
+const v4Data = computed(() => status.value?.funding_v4 ?? null)
+const v4Score = computed(() => v4Data.value?.confidence_score ?? null)
+const v4Consistency = computed(() => v4Data.value?.spread_consistency ?? null)
+const v4PairFound = computed(() => v4Data.value?.pair_found ?? false)
 
 // Use config as primary source (always set), position as fallback
 const longEx = computed(() => status.value?.config.long_exchange || status.value?.position.long_exchange || '')
@@ -343,6 +374,18 @@ async function saveSpread() {
   if (!isNaN(val) && val >= 0) {
     try { await updateBotConfig(botId.value!, { max_spread_pct: val }) } catch (e) { console.error('saveSpread failed:', e) }
   }
+}
+
+// ── Feature flag toggles ─────────────────────────────
+async function toggleFlag(key: string) {
+  if (!botId.value || !status.value) return
+  const current = status.value.config?.[key] ?? false
+  try { await updateBotConfig(botId.value, { [key]: !current }) } catch { /* ignore */ }
+}
+
+async function saveNumericFlag(key: string, value: number) {
+  if (!botId.value) return
+  try { await updateBotConfig(botId.value, { [key]: value }) } catch { /* ignore */ }
 }
 
 // ── Actions ─────────────────────────────────────────
@@ -568,6 +611,142 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- ── Advanced Settings Panel ── -->
+      <div :class="$style.advancedToggle" @click="showAdvancedPanel = !showAdvancedPanel">
+        <Typography size="text-xs" weight="semibold" color="secondary">
+          {{ showAdvancedPanel ? '▾' : '▸' }} Advanced Settings
+        </Typography>
+      </div>
+      <div v-if="showAdvancedPanel" :class="$style.advancedPanel">
+        <!-- OMS Connection Status -->
+        <div v-if="status?.data" :class="$style.omsStatus">
+          <div :class="$style.flagHeader">
+            <StatusDot :status="status.data.oms_active ? 'success' : 'neutral'" />
+            <Typography size="text-sm" weight="semibold">
+              OMS {{ status.data.oms_active ? 'Connected' : 'Disabled' }}
+            </Typography>
+          </div>
+          <Typography v-if="status.data.oms_active" size="text-xs" color="tertiary">
+            Polling from {{ status.data.oms_url }}
+          </Typography>
+          <Typography v-else size="text-xs" color="tertiary">
+            Direct WS connections (no shared monitor)
+          </Typography>
+        </div>
+
+        <div :class="$style.flagGrid">
+          <!-- Depth-Aware Spread -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <label :class="$style.flagToggle">
+                <input type="checkbox" :checked="status.config?.fn_opt_depth_spread" @change="toggleFlag('fn_opt_depth_spread')" />
+                <span :class="$style.flagSlider"></span>
+              </label>
+              <Typography size="text-sm" weight="semibold">Depth Spread</Typography>
+            </div>
+            <Typography size="text-xs" color="tertiary">VWAP-based spread detection instead of BBO</Typography>
+          </div>
+          <!-- Max Slippage -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <Typography size="text-sm" weight="semibold">Max Slippage</Typography>
+              <div :class="$style.flagInput">
+                <input
+                  type="number"
+                  v-model.number="localSlippageBps"
+                  min="1" max="100" step="1"
+                  :class="$style.miniInput"
+                  @focus="slippageFocused = true"
+                  @blur="slippageFocused = false; saveNumericFlag('fn_opt_max_slippage_bps', localSlippageBps)"
+                  @keydown.enter="($event.target as HTMLInputElement).blur()"
+                />
+                <Typography size="text-xs" color="tertiary">bps</Typography>
+              </div>
+            </div>
+          </div>
+          <!-- OHI Monitoring -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <label :class="$style.flagToggle">
+                <input type="checkbox" :checked="status.config?.fn_opt_ohi_monitoring" @change="toggleFlag('fn_opt_ohi_monitoring')" />
+                <span :class="$style.flagSlider"></span>
+              </label>
+              <Typography size="text-sm" weight="semibold">OHI Monitoring</Typography>
+            </div>
+            <Typography size="text-xs" color="tertiary">Orderbook Health Index tracking</Typography>
+          </div>
+          <!-- Funding History V4 -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <label :class="$style.flagToggle">
+                <input type="checkbox" :checked="status.config?.fn_opt_funding_history" @change="toggleFlag('fn_opt_funding_history')" />
+                <span :class="$style.flagSlider"></span>
+              </label>
+              <Typography size="text-sm" weight="semibold">V4 Funding History</Typography>
+            </div>
+            <Typography size="text-xs" color="tertiary">Historical spread consistency via fundingrate.de API</Typography>
+          </div>
+          <!-- Dynamic Sizing -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <label :class="$style.flagToggle">
+                <input type="checkbox" :checked="status.config?.fn_opt_dynamic_sizing" @change="toggleFlag('fn_opt_dynamic_sizing')" />
+                <span :class="$style.flagSlider"></span>
+              </label>
+              <Typography size="text-sm" weight="semibold">Dynamic Sizing</Typography>
+            </div>
+            <Typography size="text-xs" color="tertiary">Auto-size positions based on liquidity + capital</Typography>
+          </div>
+          <!-- Taker Drift Guard -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <label :class="$style.flagToggle">
+                <input type="checkbox" :checked="status.config?.fn_opt_taker_drift_guard" @change="toggleFlag('fn_opt_taker_drift_guard')" />
+                <span :class="$style.flagSlider"></span>
+              </label>
+              <Typography size="text-sm" weight="semibold">Taker Drift Guard</Typography>
+            </div>
+            <Typography size="text-xs" color="tertiary">Cancel maker if taker price drifts during wait</Typography>
+          </div>
+          <!-- Max Taker Drift -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <Typography size="text-sm" weight="semibold">Max Drift</Typography>
+              <div :class="$style.flagInput">
+                <input
+                  type="number"
+                  v-model.number="localDriftBps"
+                  min="1" max="50" step="1"
+                  :class="$style.miniInput"
+                  @focus="driftBpsFocused = true"
+                  @blur="driftBpsFocused = false; saveNumericFlag('fn_opt_max_taker_drift_bps', localDriftBps)"
+                  @keydown.enter="($event.target as HTMLInputElement).blur()"
+                />
+                <Typography size="text-xs" color="tertiary">bps</Typography>
+              </div>
+            </div>
+          </div>
+          <!-- Min Funding Consistency -->
+          <div :class="$style.flagItem">
+            <div :class="$style.flagHeader">
+              <Typography size="text-sm" weight="semibold">Min Consistency</Typography>
+              <div :class="$style.flagInput">
+                <input
+                  type="number"
+                  v-model.number="localMinConsistency"
+                  min="0" max="1" step="0.05"
+                  :class="$style.miniInput"
+                  @focus="consistencyFocused = true"
+                  @blur="consistencyFocused = false; saveNumericFlag('fn_opt_min_funding_consistency', localMinConsistency)"
+                  @keydown.enter="($event.target as HTMLInputElement).blur()"
+                />
+              </div>
+            </div>
+            <Typography size="text-xs" color="tertiary">V4 spread_consistency threshold (0-1)</Typography>
+          </div>
+        </div>
+      </div>
+
       <!-- ── 3-Column Layout ── -->
       <div :class="$style.mainGrid">
         <!-- Left: Long Exchange -->
@@ -578,6 +757,25 @@ onUnmounted(() => {
             <Chip variant="long" size="sm">Long</Chip>
             <Chip variant="neutral" size="sm">{{ botId }}</Chip>
             <span :class="$style.dexBalance">Balance {{ balanceForExchange(longEx) }}</span>
+          </div>
+          <!-- OHI Bar (Long) -->
+          <div v-if="longOhi && longOhi.ohi > 0" :class="$style.ohiBar">
+            <div :class="$style.ohiLabel">
+              <Typography size="text-xs" color="tertiary">OHI</Typography>
+              <Typography size="text-xs" :color="longOhi.ohi >= 0.7 ? 'success' : longOhi.ohi >= 0.4 ? 'primary' : 'warning'">
+                {{ (longOhi.ohi * 100).toFixed(0) }}%
+              </Typography>
+            </div>
+            <div :class="$style.ohiTrack">
+              <div
+                :class="$style.ohiFill"
+                :style="{ width: (longOhi.ohi * 100) + '%', background: longOhi.ohi >= 0.7 ? '#22c55e' : longOhi.ohi >= 0.4 ? '#6366f1' : '#f59e0b' }"
+              />
+            </div>
+            <div :class="$style.ohiMeta">
+              <Typography size="text-xs" color="tertiary">{{ longOhi.spread_bps }}bps</Typography>
+              <Typography size="text-xs" color="tertiary">${{ ((longOhi.depth_usd ?? 0) / 1000).toFixed(0) }}k depth</Typography>
+            </div>
           </div>
           <div :class="$style.dexStats">
             <div :class="$style.dexStat">
@@ -599,19 +797,19 @@ onUnmounted(() => {
             <template v-if="positionForExchange(longEx)">
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Size</Typography>
-                <Typography size="text-sm">{{ Math.abs(Number(positionForExchange(longEx)!.size)) }}</Typography>
+                <Typography size="text-sm">{{ Math.abs(Number(positionForExchange(longEx)?.size ?? 0)) }}</Typography>
               </div>
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Value</Typography>
-                <Typography size="text-sm">${{ (Math.abs(Number(positionForExchange(longEx)!.size)) * Number(positionForExchange(longEx)!.mark_price)).toFixed(2) }}</Typography>
+                <Typography size="text-sm">${{ (Math.abs(Number(positionForExchange(longEx)?.size ?? 0)) * Number(positionForExchange(longEx)?.mark_price ?? 0)).toFixed(2) }}</Typography>
               </div>
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Entry</Typography>
-                <Typography size="text-sm">${{ Number(positionForExchange(longEx)!.entry_price).toFixed(4) }}</Typography>
+                <Typography size="text-sm">${{ Number(positionForExchange(longEx)?.entry_price ?? 0).toFixed(4) }}</Typography>
               </div>
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Liq.</Typography>
-                <Typography size="text-sm">{{ Number(positionForExchange(longEx)!.est_liquidation_price) ? '$' + Number(positionForExchange(longEx)!.est_liquidation_price).toFixed(4) : '—' }}</Typography>
+                <Typography size="text-sm">{{ Number(positionForExchange(longEx)?.est_liquidation_price ?? 0) ? '$' + Number(positionForExchange(longEx)?.est_liquidation_price ?? 0).toFixed(4) : '—' }}</Typography>
               </div>
             </template>
             <template v-else>
@@ -649,7 +847,34 @@ onUnmounted(() => {
           </div>
 
           <div :class="$style.quantScore">
-            <Typography size="text-xs" color="tertiary">—/4 quant score</Typography>
+            <Typography v-if="v4Score !== null" size="text-xs" :color="v4Score >= 3 ? 'success' : v4Score >= 2 ? 'primary' : 'warning'">
+              {{ v4Score }}/4 quant score
+            </Typography>
+            <Typography v-else size="text-xs" color="tertiary">—/4 quant score</Typography>
+          </div>
+
+          <!-- V4 Funding Details -->
+          <div v-if="v4Data && v4PairFound" :class="$style.v4Details">
+            <div :class="$style.v4Row">
+              <Typography size="text-xs" color="tertiary">Spread APR (V4)</Typography>
+              <Typography size="text-xs" :color="(v4Data.spread_apr ?? 0) >= 0 ? 'success' : 'error'">
+                {{ ((v4Data.spread_apr ?? 0) * 100).toFixed(2) }}%
+              </Typography>
+            </div>
+            <div :class="$style.v4Row">
+              <Typography size="text-xs" color="tertiary">Consistency</Typography>
+              <Typography size="text-xs" :color="(v4Consistency ?? 0) >= 0.5 ? 'success' : 'warning'">
+                {{ (v4Consistency ?? 0).toFixed(2) }}
+              </Typography>
+            </div>
+            <div :class="$style.v4Row">
+              <Typography size="text-xs" color="tertiary">Vol. Depth</Typography>
+              <Typography size="text-xs">{{ (v4Data.volume_depth ?? 0).toFixed(2) }}</Typography>
+            </div>
+            <div :class="$style.v4Row">
+              <Typography size="text-xs" color="tertiary">Stability</Typography>
+              <Typography size="text-xs">{{ (v4Data.rate_stability ?? 0).toFixed(2) }}</Typography>
+            </div>
           </div>
 
           <!-- PnL summary -->
@@ -719,6 +944,25 @@ onUnmounted(() => {
             <Chip variant="neutral" size="sm">{{ botId }}</Chip>
             <span :class="$style.dexBalance">Balance {{ balanceForExchange(shortEx) }}</span>
           </div>
+          <!-- OHI Bar (Short) -->
+          <div v-if="shortOhi && shortOhi.ohi > 0" :class="$style.ohiBar">
+            <div :class="$style.ohiLabel">
+              <Typography size="text-xs" color="tertiary">OHI</Typography>
+              <Typography size="text-xs" :color="shortOhi.ohi >= 0.7 ? 'success' : shortOhi.ohi >= 0.4 ? 'primary' : 'warning'">
+                {{ (shortOhi.ohi * 100).toFixed(0) }}%
+              </Typography>
+            </div>
+            <div :class="$style.ohiTrack">
+              <div
+                :class="$style.ohiFill"
+                :style="{ width: (shortOhi.ohi * 100) + '%', background: shortOhi.ohi >= 0.7 ? '#22c55e' : shortOhi.ohi >= 0.4 ? '#6366f1' : '#f59e0b' }"
+              />
+            </div>
+            <div :class="$style.ohiMeta">
+              <Typography size="text-xs" color="tertiary">{{ shortOhi.spread_bps }}bps</Typography>
+              <Typography size="text-xs" color="tertiary">${{ ((shortOhi.depth_usd ?? 0) / 1000).toFixed(0) }}k depth</Typography>
+            </div>
+          </div>
           <div :class="$style.dexStats">
             <div :class="$style.dexStat">
               <span :class="$style.statIcon">◉</span>
@@ -739,19 +983,19 @@ onUnmounted(() => {
             <template v-if="positionForExchange(shortEx)">
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Size</Typography>
-                <Typography size="text-sm">{{ Math.abs(Number(positionForExchange(shortEx)!.size)) }}</Typography>
+                <Typography size="text-sm">{{ Math.abs(Number(positionForExchange(shortEx)?.size ?? 0)) }}</Typography>
               </div>
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Value</Typography>
-                <Typography size="text-sm">${{ (Math.abs(Number(positionForExchange(shortEx)!.size)) * Number(positionForExchange(shortEx)!.mark_price)).toFixed(2) }}</Typography>
+                <Typography size="text-sm">${{ (Math.abs(Number(positionForExchange(shortEx)?.size ?? 0)) * Number(positionForExchange(shortEx)?.mark_price ?? 0)).toFixed(2) }}</Typography>
               </div>
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Entry</Typography>
-                <Typography size="text-sm">${{ Number(positionForExchange(shortEx)!.entry_price).toFixed(4) }}</Typography>
+                <Typography size="text-sm">${{ Number(positionForExchange(shortEx)?.entry_price ?? 0).toFixed(4) }}</Typography>
               </div>
               <div :class="$style.posRow">
                 <Typography size="text-xs" color="tertiary">Liq.</Typography>
-                <Typography size="text-sm">{{ Number(positionForExchange(shortEx)!.est_liquidation_price) ? '$' + Number(positionForExchange(shortEx)!.est_liquidation_price).toFixed(4) : '—' }}</Typography>
+                <Typography size="text-sm">{{ Number(positionForExchange(shortEx)?.est_liquidation_price ?? 0) ? '$' + Number(positionForExchange(shortEx)?.est_liquidation_price ?? 0).toFixed(4) : '—' }}</Typography>
               </div>
             </template>
             <template v-else>
@@ -1252,5 +1496,158 @@ onUnmounted(() => {
   width: 60px;
   justify-content: center;
   text-align: center;
+}
+
+/* ── Advanced Settings Panel ── */
+.advancedToggle {
+  cursor: pointer;
+  padding: var(--space-2) 0;
+  user-select: none;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+.advancedToggle:hover { opacity: 1; }
+
+.advancedPanel {
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-2);
+  padding: var(--space-4);
+  margin-bottom: var(--space-3);
+}
+
+.omsStatus {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-bottom: var(--space-3);
+  margin-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-stroke-divider);
+}
+
+.flagGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3);
+}
+
+.flagItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-bg-primary);
+}
+
+.flagHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.flagToggle {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+}
+.flagToggle input { opacity: 0; width: 0; height: 0; }
+.flagSlider {
+  position: absolute;
+  inset: 0;
+  border-radius: 9px;
+  background: var(--color-white-8);
+  transition: background 0.2s;
+  cursor: pointer;
+}
+.flagSlider::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: white;
+  transition: transform 0.2s;
+}
+.flagToggle input:checked + .flagSlider {
+  background: var(--color-brand, #6366f1);
+}
+.flagToggle input:checked + .flagSlider::before {
+  transform: translateX(14px);
+}
+
+.flagInput {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.miniInput {
+  width: 60px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-4);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  text-align: center;
+  outline: none;
+}
+.miniInput:focus { border-color: var(--color-brand, #6366f1); }
+
+/* ── OHI Bar ── */
+.ohiBar {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--color-stroke-divider);
+}
+
+.ohiLabel {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.ohiTrack {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-white-4);
+  overflow: hidden;
+}
+
+.ohiFill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.ohiMeta {
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ── V4 Details ── */
+.v4Details {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-2);
+}
+
+.v4Row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 </style>

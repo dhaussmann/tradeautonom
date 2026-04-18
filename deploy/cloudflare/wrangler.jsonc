@@ -15,6 +15,10 @@
 		{
 			"binding": "NAS_BACKEND",
 			"service_id": "019d5d2b-cd0c-72b0-ae1e-43dee260ab29"
+		},
+		{
+			"binding": "OMS_BACKEND",
+			"service_id": "019d9287-7110-7172-9dec-2442103640b4"
 		}
 	],
 	"routes": [
@@ -37,6 +41,12 @@
 			"database_name": "tradeautonom-history",
 			"database_id": "1ae6c186-e7d3-4baf-bc05-f9ba999eca93",
 			"remote": true
+		}
+	],
+	"analytics_engine_datasets": [
+		{
+			"binding": "ACTIVITY_LOG",
+			"dataset": "tradeautonom-activity"
 		}
 	]
 }

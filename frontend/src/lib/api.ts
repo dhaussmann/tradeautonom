@@ -167,6 +167,7 @@ export async function nadoPrepareLink(walletAddress: string, subaccountName?: st
 
 export async function nadoSubmitLink(signature: string): Promise<{
   status: string
+  trading_key: string
   trading_address: string
   wallet_address: string
   subaccount_name: string
@@ -285,4 +286,163 @@ export async function fetchJournalSummary(params?: {
   if (params?.to) q.set('to', String(params.to))
   if (params?.group_by) q.set('group_by', params.group_by)
   return request(`/journal/summary?${q}`)
+}
+
+// ── OMS Arbitrage ────────────────────────────────────────
+
+export interface ArbOpportunity {
+  token: string
+  buy_exchange: string
+  buy_symbol: string
+  sell_exchange: string
+  sell_symbol: string
+  buy_price_bbo: number
+  sell_price_bbo: number
+  bbo_spread_bps: number
+  buy_fill_vwap: number
+  sell_fill_vwap: number
+  net_profit_bps: number
+  max_qty: number
+  max_notional_usd: number
+  timestamp_ms: number
+}
+
+export interface ArbConfig {
+  scan_interval_s: number
+  max_notional_usd: number
+  exchanges: string[]
+  taker_fees_pct: Record<string, number>
+  fee_buffer_bps: number
+  min_profit_bps: Record<string, number>
+  tokens_tracked: number
+  active_opportunities: number
+}
+
+// ── DNA Bot ──────────────────────────────────────────────
+
+export interface DNAPosition {
+  position_id: string
+  token: string
+  buy_exchange: string
+  buy_symbol: string
+  sell_exchange: string
+  sell_symbol: string
+  quantity: number
+  buy_fill_price: number
+  sell_fill_price: number
+  entry_spread_bps: number
+  notional_usd: number
+  opened_at: number
+  status: string
+  exit_mode: string
+  exit_min_hold_s: number
+  exit_threshold_bps: number
+  closed_at: number | null
+  close_spread_bps: number | null
+  close_reason: string
+  close_buy_fill_price: number
+  close_sell_fill_price: number
+  buy_fill_qty: number
+  sell_fill_qty: number
+  simulation: boolean
+}
+
+export interface DNAConfig {
+  position_size_usd: number
+  max_positions: number
+  spread_mode: string
+  custom_min_spread_bps: number
+  exchanges: string[]
+  simulation: boolean
+  exit_mode: string
+  exit_min_hold_minutes: number
+  exit_min_hold_hours: number
+  exit_min_hold_days: number
+  exit_threshold_bps: number
+}
+
+export interface DNAActivityEntry {
+  timestamp: number
+  event: string
+  message: string
+}
+
+export interface DNAStatus {
+  bot_id: string
+  running: boolean
+  config: DNAConfig
+  positions: {
+    open: number
+    max: number
+    total_notional_usd: number
+    details: DNAPosition[]
+  }
+  all_positions: DNAPosition[]
+  trade_history: DNAPosition[]
+  activity_log: DNAActivityEntry[]
+}
+
+export interface PreflightExchangeCheck {
+  positions: boolean
+  balance: boolean | null
+  signer_ok?: boolean | null
+  error: string | null
+}
+
+export interface PreflightOmsCheck {
+  health: boolean
+  feeds?: number
+  books: Record<string, boolean>
+  error: string | null
+}
+
+export interface PreflightResult {
+  ok: boolean
+  can_start: boolean
+  checks: Record<string, PreflightExchangeCheck | PreflightOmsCheck>
+}
+
+export async function fetchDnaStatus(): Promise<DNAStatus> {
+  return request<DNAStatus>('/dna/status')
+}
+
+export async function fetchDnaPreflight(): Promise<PreflightResult> {
+  return request<PreflightResult>('/dna/preflight')
+}
+
+export async function startDna(): Promise<{ status: string }> {
+  return request('/dna/start', { method: 'POST' })
+}
+
+export async function stopDna(): Promise<{ status: string }> {
+  return request('/dna/stop', { method: 'POST' })
+}
+
+export async function updateDnaConfig(updates: Partial<DNAConfig>): Promise<{ status: string }> {
+  return request('/dna/config', { method: 'POST', body: JSON.stringify(updates) })
+}
+
+export async function resetDna(): Promise<{ status: string }> {
+  return request('/dna/reset', { method: 'POST' })
+}
+
+export async function closeDnaPosition(positionId: string): Promise<{ status: string; position_id: string }> {
+  return request(`/dna/close/${positionId}`, { method: 'POST' })
+}
+
+export async function deleteDnaPosition(positionId: string): Promise<{ status: string; position_id: string }> {
+  return request(`/dna/position/${positionId}/delete`, { method: 'POST' })
+}
+
+export async function fetchDnaPositions(): Promise<{ positions: DNAPosition[]; open: number; max: number }> {
+  return request('/dna/positions')
+}
+
+export async function fetchArbOpportunities(token?: string): Promise<ArbOpportunity[]> {
+  const q = token ? `?token=${encodeURIComponent(token)}` : ''
+  return request<ArbOpportunity[]>(`/oms/arb/opportunities${q}`)
+}
+
+export async function fetchArbConfig(): Promise<ArbConfig> {
+  return request<ArbConfig>('/oms/arb/config')
 }

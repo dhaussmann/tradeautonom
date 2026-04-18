@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import ssl as _ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 import websockets
 
 logger = logging.getLogger("tradeautonom.data_layer")
@@ -80,8 +82,9 @@ class DataLayer:
         await dl.stop()
     """
 
-    def __init__(self, stale_ms: int = 5000) -> None:
+    def __init__(self, stale_ms: int = 5000, shared_monitor_url: str = "") -> None:
         self._stale_ms = stale_ms
+        self._shared_monitor_url = shared_monitor_url.rstrip("/") if shared_monitor_url else ""
 
         # Caches keyed by (exchange_name, symbol)
         self._orderbooks: dict[tuple[str, str], OrderbookSnapshot] = {}
@@ -104,6 +107,10 @@ class DataLayer:
         # Clients + symbols stored for WS subscriptions
         self._clients: dict[str, Any] = {}
         self._symbols_map: dict[str, str] = {}
+
+        # OMS WebSocket state (shared connection for all symbols)
+        self._oms_ws_active = False  # True while OMS WS is connected
+        self._oms_ws_task: asyncio.Task | None = None
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -145,14 +152,6 @@ class DataLayer:
                 self._tasks.append(task)
                 logger.info("DataLayer: started funding rate feed for %s:%s", exch_name, symbol)
 
-            # Start orderbook WS subscription
-            task = asyncio.create_task(
-                self._run_orderbook_ws(client, exch_name, symbol),
-                name=f"ob-ws-{exch_name}-{symbol}",
-            )
-            self._tasks.append(task)
-            logger.info("DataLayer: started orderbook WS feed for %s:%s", exch_name, symbol)
-
             # Start position WS/poll subscription
             task = asyncio.create_task(
                 self._run_position_subscription(client, exch_name, symbol),
@@ -160,6 +159,25 @@ class DataLayer:
             )
             self._tasks.append(task)
             logger.info("DataLayer: started position feed for %s:%s", exch_name, symbol)
+
+        # Start OMS WS (shared connection) or per-symbol orderbook feeds
+        if self._shared_monitor_url:
+            self._oms_ws_task = asyncio.create_task(
+                self._run_oms_ws(), name="oms-ws-shared",
+            )
+            self._tasks.append(self._oms_ws_task)
+            logger.info("DataLayer: started OMS WS feed for %d symbols", len(symbols_map))
+        else:
+            for exch_name, symbol in symbols_map.items():
+                client = clients.get(exch_name)
+                if client is None:
+                    continue
+                task = asyncio.create_task(
+                    self._run_orderbook_ws(client, exch_name, symbol),
+                    name=f"ob-ws-{exch_name}-{symbol}",
+                )
+                self._tasks.append(task)
+                logger.info("DataLayer: started orderbook WS feed for %s:%s", exch_name, symbol)
 
         logger.info("DataLayer started: %d feeds", len(self._tasks))
 
@@ -251,6 +269,60 @@ class DataLayer:
             }
         return result
 
+    def get_orderbook_health(self, exchange: str, symbol: str) -> dict:
+        """Compute Orderbook Health Index (OHI) for one exchange+symbol.
+
+        OHI = weighted combination of:
+          - Spread tightness (40%): normalized bid-ask spread
+          - Depth score (30%): total liquidity within 0.5% of mid
+          - Symmetry (30%): bid/ask depth ratio (1.0 = perfectly symmetric)
+
+        Returns dict with ohi (0-1), spread_bps, depth_usd, symmetry, components.
+        """
+        snap = self._orderbooks.get((exchange, symbol), OrderbookSnapshot())
+        if not snap.bids or not snap.asks:
+            return {"ohi": 0.0, "spread_bps": 0.0, "depth_usd": 0.0, "symmetry": 0.0}
+
+        best_bid = float(snap.bids[0][0])
+        best_ask = float(snap.asks[0][0])
+        if best_bid <= 0 or best_ask <= 0:
+            return {"ohi": 0.0, "spread_bps": 0.0, "depth_usd": 0.0, "symmetry": 0.0}
+
+        mid = (best_bid + best_ask) / 2.0
+        spread_bps = (best_ask - best_bid) / mid * 10000
+
+        # Depth within 0.5% of mid
+        depth_range = mid * 0.005
+        bid_depth = sum(float(b[0]) * float(b[1]) for b in snap.bids if float(b[0]) >= mid - depth_range)
+        ask_depth = sum(float(a[0]) * float(a[1]) for a in snap.asks if float(a[0]) <= mid + depth_range)
+        total_depth_usd = bid_depth + ask_depth
+
+        # Symmetry: ratio of smaller/larger side (1.0 = perfect)
+        if bid_depth > 0 and ask_depth > 0:
+            symmetry = min(bid_depth, ask_depth) / max(bid_depth, ask_depth)
+        else:
+            symmetry = 0.0
+
+        # Component scores (each 0-1)
+        # Spread: 0 bps → 1.0, 50+ bps → 0.0
+        spread_score = max(0.0, 1.0 - spread_bps / 50.0)
+        # Depth: $100k+ → 1.0, $0 → 0.0 (log scale)
+        depth_score = min(1.0, math.log1p(total_depth_usd) / math.log1p(100_000))
+        # Symmetry already 0-1
+        symmetry_score = symmetry
+
+        ohi = 0.4 * spread_score + 0.3 * depth_score + 0.3 * symmetry_score
+
+        return {
+            "ohi": round(ohi, 4),
+            "spread_bps": round(spread_bps, 2),
+            "depth_usd": round(total_depth_usd, 2),
+            "symmetry": round(symmetry, 4),
+            "spread_score": round(spread_score, 4),
+            "depth_score": round(depth_score, 4),
+            "symmetry_score": round(symmetry_score, 4),
+        }
+
     # ── Position cache API ─────────────────────────────────────────────
 
     def get_position(self, exchange: str, symbol: str) -> PositionSnapshot:
@@ -334,6 +406,155 @@ class DataLayer:
                     self._orderbooks[key].is_synced = False
                     self._orderbooks[key].connected = False
             await asyncio.sleep(1.0)
+
+    async def _run_ob_oms_poll(self, exch_name: str, symbol: str) -> None:
+        """Poll orderbook from the shared Orderbook Monitor Service (OMS).
+
+        Falls back to direct WS if OMS is unreachable for too long.
+        """
+        key = (exch_name, symbol)
+        url = f"{self._shared_monitor_url}/book/{exch_name}/{symbol}"
+        consecutive_errors = 0
+        max_errors_before_fallback = 10
+
+        logger.info("DataLayer: OMS poll starting for %s:%s from %s", exch_name, symbol, url)
+
+        while self._running:
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                async with self._ob_locks[key]:
+                    snap = self._orderbooks[key]
+                    snap.bids = data.get("bids", [])
+                    snap.asks = data.get("asks", [])
+                    snap.timestamp_ms = data.get("timestamp_ms", time.time() * 1000)
+                    snap.is_synced = True
+                    snap.connected = data.get("connected", True)
+                    snap.update_count += 1
+                    self._ob_changed.set()
+                consecutive_errors = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                consecutive_errors += 1
+                logger.warning(
+                    "DataLayer: OMS poll %s:%s error (%d/%d): %s",
+                    exch_name, symbol, consecutive_errors, max_errors_before_fallback, exc,
+                )
+                async with self._ob_locks[key]:
+                    self._orderbooks[key].is_synced = False
+                    self._orderbooks[key].connected = False
+
+                if consecutive_errors >= max_errors_before_fallback:
+                    logger.warning("DataLayer: OMS unreachable for %s:%s — falling back to direct WS", exch_name, symbol)
+                    # Clear shared monitor URL for this feed and fall back
+                    break
+
+            await asyncio.sleep(0.5)
+
+        # Fallback to direct WS (re-enter the routing without OMS)
+        if self._running:
+            logger.info("DataLayer: OMS fallback → starting direct WS for %s:%s", exch_name, symbol)
+            old_url = self._shared_monitor_url
+            self._shared_monitor_url = ""  # temporarily disable to avoid recursion
+            client = self._clients.get(exch_name)
+            if client:
+                await self._run_orderbook_ws(client, exch_name, symbol)
+            self._shared_monitor_url = old_url
+
+    # ── OMS WebSocket (shared real-time connection) ─────────────────
+
+    async def _run_oms_ws(self) -> None:
+        """Shared WebSocket connection to the OMS for real-time orderbook updates.
+
+        Subscribes to all symbols in self._symbols_map over a single WS connection.
+        Falls back to per-symbol HTTP polling if the WS connection fails repeatedly.
+        """
+        base_url = self._shared_monitor_url
+        ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+        reconnect_delay = 1.0
+        max_reconnect_delay = 15.0
+        consecutive_failures = 0
+        max_failures_before_fallback = 5
+
+        logger.info("DataLayer: OMS WS connecting to %s (symbols: %d)", ws_url, len(self._symbols_map))
+
+        while self._running:
+            try:
+                async for ws in websockets.connect(ws_url, close_timeout=5):
+                    self._oms_ws_active = True
+                    reconnect_delay = 1.0
+                    consecutive_failures = 0
+                    logger.info("DataLayer: OMS WS connected to %s", ws_url)
+
+                    # Subscribe to all tracked symbols
+                    for exch_name, symbol in self._symbols_map.items():
+                        sub_msg = json.dumps({"action": "subscribe", "exchange": exch_name, "symbol": symbol})
+                        await ws.send(sub_msg)
+                        logger.info("DataLayer: OMS WS subscribed %s:%s", exch_name, symbol)
+
+                    try:
+                        async for raw in ws:
+                            try:
+                                msg = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+
+                            msg_type = msg.get("type", "")
+                            if msg_type != "book":
+                                continue
+
+                            exch = msg.get("exchange", "")
+                            sym = msg.get("symbol", "")
+                            key = (exch, sym)
+
+                            if key not in self._orderbooks:
+                                continue
+
+                            async with self._ob_locks[key]:
+                                snap = self._orderbooks[key]
+                                snap.bids = msg.get("bids", [])
+                                snap.asks = msg.get("asks", [])
+                                snap.timestamp_ms = msg.get("timestamp_ms", time.time() * 1000)
+                                snap.is_synced = True
+                                snap.connected = True
+                                snap.update_count += 1
+                                self._ob_changed.set()
+                    except websockets.ConnectionClosed:
+                        logger.warning("DataLayer: OMS WS disconnected — reconnecting")
+                    finally:
+                        self._oms_ws_active = False
+
+            except asyncio.CancelledError:
+                self._oms_ws_active = False
+                return
+            except Exception as exc:
+                self._oms_ws_active = False
+                consecutive_failures += 1
+                logger.warning(
+                    "DataLayer: OMS WS error (%d/%d): %s — retry in %.0fs",
+                    consecutive_failures, max_failures_before_fallback, exc, reconnect_delay,
+                )
+
+                if consecutive_failures >= max_failures_before_fallback:
+                    logger.warning("DataLayer: OMS WS failed %d times — falling back to HTTP poll", consecutive_failures)
+                    break
+
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+        # Fallback: start per-symbol OMS HTTP poll tasks
+        if self._running:
+            logger.info("DataLayer: OMS WS fallback → starting HTTP poll per symbol")
+            for exch_name, symbol in self._symbols_map.items():
+                task = asyncio.create_task(
+                    self._run_ob_oms_poll(exch_name, symbol),
+                    name=f"ob-oms-poll-{exch_name}-{symbol}",
+                )
+                self._tasks.append(task)
 
     # ── Extended WS orderbook ────────────────────────────────────────
 
@@ -941,7 +1162,13 @@ class DataLayer:
 
     def status(self) -> dict:
         """Return a summary of all feed states for monitoring."""
-        result = {"orderbooks": {}, "funding_rates": {}, "positions": {}, "feeds_ready": self.is_ready()}
+        result = {
+            "orderbooks": {}, "funding_rates": {}, "positions": {},
+            "feeds_ready": self.is_ready(),
+            "oms_url": self._shared_monitor_url or None,
+            "oms_active": bool(self._shared_monitor_url),
+            "oms_ws_connected": self._oms_ws_active,
+        }
         now_ms = time.time() * 1000
         for (exch, sym), snap in self._orderbooks.items():
             result["orderbooks"][f"{exch}:{sym}"] = {

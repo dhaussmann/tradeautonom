@@ -163,11 +163,17 @@ class GrvtClient:
             order_type="market",
             side=side,
             amount=amount,
-            params={"client_order_id": cid},
+            params={"client_order_id": cid, "time_in_force": "FILL_OR_KILL"},
         )
         if not resp:
-            raise RuntimeError(f"Order rejected by GRVT (empty response). Check server logs for details.")
-        logger.info("Market order sent: symbol=%s side=%s amount=%s cid=%s", symbol, side, amount, cid)
+            raise RuntimeError(f"GRVT market order rejected (empty response). symbol={symbol} side={side} amount={amount} cid={cid}")
+        state = resp.get("state", {})
+        status = state.get("status", "UNKNOWN")
+        reject = state.get("reject_reason", "")
+        traded = state.get("traded_size", ["0"])
+        traded_qty = float(traded[0]) if traded else 0.0
+        logger.info("GRVT market order: symbol=%s side=%s amount=%s cid=%s status=%s traded=%s reject=%s",
+                     symbol, side, amount, cid, status, traded_qty, reject)
         return resp
 
     def create_aggressive_limit_order(

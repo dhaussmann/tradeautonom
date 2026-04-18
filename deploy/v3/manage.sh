@@ -164,6 +164,7 @@ ENVEOF"
     # Start container
     ssh_nas "${P}/docker run -d \
         --name ${container_name} \
+        --hostname ${container_name} \
         --restart unless-stopped \
         -p ${port}:${port} \
         --env-file '${data_dir}/.env' \
@@ -308,6 +309,7 @@ for uid in sorted(d): print(uid)
         local data_dir="${BASE_DEPLOY}/data-${uid}"
         ssh_nas "${P}/docker run -d \
             --name ${container_name} \
+            --hostname ${container_name} \
             --restart unless-stopped \
             -p ${port}:${port} \
             --env-file '${data_dir}/.env' \

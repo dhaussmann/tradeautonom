@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
+
+import httpx
 
 from app.data_layer import DataLayer
 
@@ -52,6 +55,10 @@ class FundingMonitor:
         exchange_b: str,
         symbol_b: str,
         poll_interval_s: float = 60.0,
+        *,
+        v4_enabled: bool = False,
+        v4_api_url: str = "https://api.fundingrate.de",
+        v4_min_consistency: float = 0.3,
     ) -> None:
         self._data_layer = data_layer
         self._exchange_a = exchange_a
@@ -59,6 +66,12 @@ class FundingMonitor:
         self._exchange_b = exchange_b
         self._symbol_b = symbol_b
         self._poll_interval_s = poll_interval_s
+
+        # V4 API settings
+        self._v4_enabled = v4_enabled
+        self._v4_api_url = v4_api_url.rstrip("/")
+        self._v4_min_consistency = v4_min_consistency
+        self._v4_data: dict = {}
 
         self._suggestion = FundingSuggestion(
             exchange_a=exchange_a,
@@ -100,6 +113,20 @@ class FundingMonitor:
         """Return the latest funding suggestion (lock-free read)."""
         return self._suggestion
 
+    def get_v4_data(self) -> dict:
+        """Return latest V4 historical funding data (lock-free read)."""
+        return self._v4_data
+
+    def is_v4_consistent(self) -> bool:
+        """Check if V4 spread_consistency meets the minimum threshold.
+
+        Returns True (pass) if V4 is disabled or data unavailable (fail-open).
+        """
+        if not self._v4_enabled or not self._v4_data:
+            return True
+        consistency = self._v4_data.get("spread_consistency", 0.0)
+        return consistency >= self._v4_min_consistency
+
     def get_rates(self) -> dict:
         """Return current funding rates for both exchanges."""
         return {
@@ -132,6 +159,14 @@ class FundingMonitor:
                 self._update_suggestion()
             except Exception as exc:
                 logger.warning("FundingMonitor poll error: %s", exc)
+
+            # V4 API fetch (runs alongside local rate polling)
+            if self._v4_enabled:
+                try:
+                    await self._fetch_v4_data()
+                except Exception as exc:
+                    logger.warning("FundingMonitor V4 fetch error: %s", exc)
+
             # Fast-poll (10s) until we have real data, then slow down
             has_data = self._suggestion.funding_rate_a != 0.0 or self._suggestion.funding_rate_b != 0.0
             interval = self._poll_interval_s if has_data else 10.0
@@ -191,4 +226,91 @@ class FundingMonitor:
             self._exchange_a, rate_a, self._exchange_b, rate_b,
             spread, spread_annual * 100,
             rec_long, rec_short,
+        )
+
+    @staticmethod
+    def _extract_base_symbol(instrument: str) -> str:
+        """Extract the base ticker from an instrument string.
+
+        Examples: 'SOL-USD' → 'SOL', 'SOL_USDT_Perp' → 'SOL',
+                  'P-SUI-USDC-3600' → 'SUI', 'ETHPERP' → 'ETH'
+        """
+        # Remove common suffixes/patterns
+        s = instrument.upper()
+        # Variational: P-SUI-USDC-3600
+        if s.startswith("P-"):
+            parts = s.split("-")
+            if len(parts) >= 2:
+                return parts[1]
+        # Perp suffix: ETHPERP, BTC-PERP
+        s = re.sub(r"[-_]?PERP$", "", s)
+        # Split on common delimiters and take first part
+        parts = re.split(r"[-_/]", s)
+        return parts[0] if parts else instrument.upper()
+
+    async def _fetch_v4_data(self) -> None:
+        """Fetch analysis data from Funding Rate V4 API.
+
+        Uses /api/v4/analysis/{symbol} to get:
+        - Per-exchange funding rates + MAs
+        - Arbitrage pair confidence scores
+        - spread_consistency for our specific exchange pair
+        """
+        base_symbol = self._extract_base_symbol(self._symbol_a)
+        url = f"{self._v4_api_url}/api/v4/analysis/{base_symbol}"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        if not data.get("success"):
+            logger.warning("V4 API returned success=false for %s", base_symbol)
+            return
+
+        # Find the arbitrage pair matching our exchanges
+        arb_pairs = data.get("arbitrage_pairs", [])
+        exch_a_lower = self._exchange_a.lower()
+        exch_b_lower = self._exchange_b.lower()
+
+        matched_pair = None
+        for pair in arb_pairs:
+            short_ex = pair.get("short_exchange", "").lower()
+            long_ex = pair.get("long_exchange", "").lower()
+            if {short_ex, long_ex} == {exch_a_lower, exch_b_lower}:
+                matched_pair = pair
+                break
+
+        # Extract per-exchange MA data
+        exchanges_data = data.get("exchanges", [])
+        exchange_ma = {}
+        for exch_info in exchanges_data:
+            ex_key = exch_info.get("exchange", "").lower()
+            if ex_key in (exch_a_lower, exch_b_lower):
+                exchange_ma[ex_key] = {
+                    "funding_rate_apr": exch_info.get("funding_rate_apr", 0),
+                    "ma": exch_info.get("ma", {}),
+                }
+
+        confidence = matched_pair.get("confidence", {}) if matched_pair else {}
+        self._v4_data = {
+            "symbol": base_symbol,
+            "pair_found": matched_pair is not None,
+            "spread_apr": matched_pair.get("spread_apr", 0) if matched_pair else 0,
+            "confidence_score": matched_pair.get("confidence_score", 0) if matched_pair else 0,
+            "spread_consistency": confidence.get("spread_consistency", 0),
+            "volume_depth": confidence.get("volume_depth", 0),
+            "rate_stability": confidence.get("rate_stability", 0),
+            "historical_edge": confidence.get("historical_edge", 0),
+            "exchange_ma": exchange_ma,
+            "summary": data.get("summary", {}),
+            "timestamp_ms": time.time() * 1000,
+        }
+
+        logger.info(
+            "V4 API %s: pair_found=%s consistency=%.2f score=%d spread_apr=%.4f",
+            base_symbol, self._v4_data["pair_found"],
+            self._v4_data["spread_consistency"],
+            self._v4_data["confidence_score"],
+            self._v4_data["spread_apr"],
         )
