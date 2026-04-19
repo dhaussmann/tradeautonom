@@ -22,7 +22,7 @@ fi
 NAS_HOST="${NAS_HOST:?Set NAS_HOST in .env}"
 NAS_USER="${NAS_USER:-admin}"
 
-DEPLOY_PATH="/volume1/docker/tradeautonom-orchestrator"
+DEPLOY_PATH="/opt/tradeautonom-orchestrator"
 IMAGE_NAME="tradeautonom-orchestrator"
 IMAGE_TAG="latest"
 CONTAINER_NAME="ta-orchestrator"
@@ -39,7 +39,7 @@ info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
 err()   { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; }
 
-P="/usr/local/bin"
+P="/usr/bin"
 ssh_nas() { ssh ${SSH_OPTS} "$SSH_TARGET" "$@"; }
 
 cmd_sync() {
@@ -72,6 +72,8 @@ cmd_up() {
         -e BASE_PORT=9001 \
         -e ORCH_PORT=${ORCH_PORT} \
         -e STATE_FILE=/app/data/orchestrator_state.json \
+        -e SHARED_CODE_DIR=/opt/tradeautonom/app \
+        -e DOCKER_HOST_IP=172.17.0.1 \
         -v '${DEPLOY_PATH}/data:/app/data' \
         -v /var/run/docker.sock:/var/run/docker.sock \
         ${IMAGE_NAME}:${IMAGE_TAG}"

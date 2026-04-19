@@ -70,7 +70,7 @@ class DNAPosition:
 class DNAConfig:
     """Configuration for a DNA bot instance."""
     bot_id: str = ""
-    oms_url: str = "http://192.168.133.253:8099"
+    oms_url: str = "http://192.168.133.100:8099"
     position_size_usd: float = 1000.0     # notional USD per position
     max_positions: int = 3                 # max concurrent positions
     min_profit_bps: float = 0.0           # 0 = use OMS fee thresholds (already filtered)

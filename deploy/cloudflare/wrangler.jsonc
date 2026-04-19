@@ -26,7 +26,7 @@
 	],
 	"vars": {
 		// Orchestrator gateway on NAS (reachable via VPC on port 8090)
-		"ORCHESTRATOR_ORIGIN": "http://192.168.133.253:8090"
+		"ORCHESTRATOR_ORIGIN": "http://192.168.133.100:8090"
 		// INGEST_TOKEN is set via `wrangler secret put INGEST_TOKEN`
 		// BETTER_AUTH_SECRET is set via `wrangler secret put BETTER_AUTH_SECRET`
 		// ORCH_TOKEN is set via `wrangler secret put ORCH_TOKEN`

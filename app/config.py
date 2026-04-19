@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     fn_opt_max_taker_drift_bps: float = 3.0  # Opt 6: Max erlaubter Taker-Drift (basis points)
 
     # ── DNA Bot (Delta-Neutral Arbitrage) ──────────────────────
-    dna_oms_url: str = "http://192.168.133.253:8099"
+    dna_oms_url: str = "http://192.168.133.100:8099"
     dna_position_size_usd: float = 1000.0
     dna_max_positions: int = 3
     dna_min_profit_bps: float = 0.0        # 0 = use OMS fee thresholds

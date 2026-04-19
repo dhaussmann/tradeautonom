@@ -42,7 +42,7 @@ info()  { printf '\033[1;34m▸ %s\033[0m\n' "$*"; }
 ok()    { printf '\033[1;32m✔ %s\033[0m\n' "$*"; }
 err()   { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; }
 
-P="/usr/local/bin"  # docker lives here on Synology
+P="/usr/bin"
 ssh_nas() { ssh ${SSH_OPTS} "$SSH_TARGET" "$@"; }
 
 # ── Commands ──────────────────────────────────────────────────
@@ -87,7 +87,7 @@ GRVT_ENV=prod
 HISTORY_INGEST_URL=https://bot.defitool.de/api/history/ingest
 HISTORY_INGEST_TOKEN=qW3b6n2uDwZg6krrEbdqcpgihIgLzRc6mkF9dnjnTcw
 HISTORY_INGEST_INTERVAL_S=300
-FN_OPT_SHARED_MONITOR_URL=http://192.168.133.253:8099
+FN_OPT_SHARED_MONITOR_URL=http://192.168.133.100:8099
 ENVEOF"
     ssh_nas "${P}/docker run -d \
         --name ${CONTAINER_NAME} \
