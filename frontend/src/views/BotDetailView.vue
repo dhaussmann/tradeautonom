@@ -208,6 +208,29 @@ const priceSpreadPct = computed(() => {
 const longOhi = computed(() => status.value?.ohi?.long ?? null)
 const shortOhi = computed(() => status.value?.ohi?.short ?? null)
 
+// OHI sub-score expand state
+const longOhiExpanded = ref(false)
+const shortOhiExpanded = ref(false)
+
+// Tooltip state
+const activeTooltip = ref<string | null>(null)
+function toggleTooltip(key: string, e: Event) {
+  e.stopPropagation()
+  activeTooltip.value = activeTooltip.value === key ? null : key
+}
+function closeTooltip() { activeTooltip.value = null }
+
+const TOOLTIPS: Record<string, string> = {
+  fn_opt_depth_spread: 'Berechnet den realen Ausführungsspread über VWAP-Fill-Preise statt nur Best-Bid/Ask. Blockiert einen Chunk wenn der zusätzliche Slippage den Schwellenwert (bps) überschreitet — wartet dann bis das Buch tief genug ist.',
+  fn_opt_ohi_monitoring: 'Orderbook Health Index: bewertet die Qualität beider Orderbücher vor jedem Chunk (0–100%). Setzt sich zusammen aus Spread-Enge (40%), Tiefe in USD (30%) und Symmetrie Bid/Ask (30%). Unter dem Mindestwert wird der Chunk übersprungen.',
+  fn_opt_funding_history: 'Prüft historische Funding-Rate-Konsistenz via fundingrate.de API. Ein niedriger Konsistenz-Score bedeutet das die Spread-Opportunität instabil war — der Bot blockt den Entry bis der Score über dem Threshold liegt.',
+  fn_opt_dynamic_sizing: 'Berechnet die Positionsgröße automatisch aus verfügbarem Kapital, Liquidität beider Orderbücher und dem Max-Slippage-Budget. Verhindert zu große Orders die das Buch bewegen würden.',
+  fn_opt_taker_drift_guard: 'Überwacht den Taker-Preis während der Maker-Order wartet. Wenn der Taker-Preis um mehr als N bps driftet wird die Maker-Order gecancelt und der Chunk neu gestartet — schützt vor nachteiligen Fills.',
+}
+
+// Depth Spread Analysis from SSE
+const depthAnalysis = computed(() => status.value?.depth_analysis ?? null)
+
 // V4 funding data from SSE
 const v4Data = computed(() => status.value?.funding_v4 ?? null)
 const v4Score = computed(() => v4Data.value?.confidence_score ?? null)
@@ -419,6 +442,15 @@ async function handleResume() {
   finally { actionLoading.value = null }
 }
 
+function handleBack() {
+  // Go back to previous page if history exists, otherwise default to bots page
+  if (window.history.length > 1) {
+    router.back()
+  } else {
+    router.push('/bots')
+  }
+}
+
 function openTimerEditor() {
   if (!status.value) return
   const h = status.value.timer.duration_h || 0
@@ -448,6 +480,7 @@ function setTimerPreset(val: number) {
 
 onMounted(async () => {
   if (!botId.value) { router.push('/'); return }
+  document.addEventListener('click', closeTooltip)
   await accountStore.loadAccounts()
   await accountStore.loadPositions()
   accountPoll = setInterval(() => accountStore.loadAccounts(), 15000)
@@ -462,6 +495,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  document.removeEventListener('click', closeTooltip)
   if (accountPoll) clearInterval(accountPoll)
   if (positionPoll) clearInterval(positionPoll)
   if (fundingPoll) clearInterval(fundingPoll)
@@ -473,7 +507,7 @@ onUnmounted(() => {
   <div :class="$style.page">
     <!-- Back button -->
     <div :class="$style.back">
-      <Button variant="ghost" size="sm" @click="router.push('/')">← Back</Button>
+      <Button variant="ghost" size="sm" @click="handleBack">← Back</Button>
     </div>
 
     <div v-if="!status" :class="$style.loading">
@@ -643,8 +677,12 @@ onUnmounted(() => {
                 <span :class="$style.flagSlider"></span>
               </label>
               <Typography size="text-sm" weight="semibold">Depth Spread</Typography>
+              <div :class="$style.tooltipWrap">
+                <button :class="$style.tooltipBtn" @click="toggleTooltip('fn_opt_depth_spread', $event)">?</button>
+                <div v-if="activeTooltip === 'fn_opt_depth_spread'" :class="$style.tooltipBox">{{ TOOLTIPS.fn_opt_depth_spread }}</div>
+              </div>
             </div>
-            <Typography size="text-xs" color="tertiary">VWAP-based spread detection instead of BBO</Typography>
+            <Typography size="text-xs" color="tertiary">VWAP-Fill statt BBO — blockiert Chunk bei zu hohem Slippage</Typography>
           </div>
           <!-- Max Slippage -->
           <div :class="$style.flagItem">
@@ -663,6 +701,7 @@ onUnmounted(() => {
                 <Typography size="text-xs" color="tertiary">bps</Typography>
               </div>
             </div>
+            <Typography size="text-xs" color="tertiary">Max zusätzlicher Slippage über BBO hinaus (für Depth Spread)</Typography>
           </div>
           <!-- OHI Monitoring -->
           <div :class="$style.flagItem">
@@ -672,8 +711,12 @@ onUnmounted(() => {
                 <span :class="$style.flagSlider"></span>
               </label>
               <Typography size="text-sm" weight="semibold">OHI Monitoring</Typography>
+              <div :class="$style.tooltipWrap">
+                <button :class="$style.tooltipBtn" @click="toggleTooltip('fn_opt_ohi_monitoring', $event)">?</button>
+                <div v-if="activeTooltip === 'fn_opt_ohi_monitoring'" :class="$style.tooltipBox">{{ TOOLTIPS.fn_opt_ohi_monitoring }}</div>
+              </div>
             </div>
-            <Typography size="text-xs" color="tertiary">Orderbook Health Index tracking</Typography>
+            <Typography size="text-xs" color="tertiary">Orderbuch-Gesundheit: Spread 40% + Tiefe 30% + Symmetrie 30%</Typography>
           </div>
           <!-- Funding History V4 -->
           <div :class="$style.flagItem">
@@ -683,8 +726,12 @@ onUnmounted(() => {
                 <span :class="$style.flagSlider"></span>
               </label>
               <Typography size="text-sm" weight="semibold">V4 Funding History</Typography>
+              <div :class="$style.tooltipWrap">
+                <button :class="$style.tooltipBtn" @click="toggleTooltip('fn_opt_funding_history', $event)">?</button>
+                <div v-if="activeTooltip === 'fn_opt_funding_history'" :class="$style.tooltipBox">{{ TOOLTIPS.fn_opt_funding_history }}</div>
+              </div>
             </div>
-            <Typography size="text-xs" color="tertiary">Historical spread consistency via fundingrate.de API</Typography>
+            <Typography size="text-xs" color="tertiary">Historische Spread-Konsistenz via fundingrate.de API</Typography>
           </div>
           <!-- Dynamic Sizing -->
           <div :class="$style.flagItem">
@@ -694,8 +741,12 @@ onUnmounted(() => {
                 <span :class="$style.flagSlider"></span>
               </label>
               <Typography size="text-sm" weight="semibold">Dynamic Sizing</Typography>
+              <div :class="$style.tooltipWrap">
+                <button :class="$style.tooltipBtn" @click="toggleTooltip('fn_opt_dynamic_sizing', $event)">?</button>
+                <div v-if="activeTooltip === 'fn_opt_dynamic_sizing'" :class="$style.tooltipBox">{{ TOOLTIPS.fn_opt_dynamic_sizing }}</div>
+              </div>
             </div>
-            <Typography size="text-xs" color="tertiary">Auto-size positions based on liquidity + capital</Typography>
+            <Typography size="text-xs" color="tertiary">Positionsgröße automatisch aus Kapital + Liquidität berechnen</Typography>
           </div>
           <!-- Taker Drift Guard -->
           <div :class="$style.flagItem">
@@ -705,8 +756,12 @@ onUnmounted(() => {
                 <span :class="$style.flagSlider"></span>
               </label>
               <Typography size="text-sm" weight="semibold">Taker Drift Guard</Typography>
+              <div :class="$style.tooltipWrap">
+                <button :class="$style.tooltipBtn" @click="toggleTooltip('fn_opt_taker_drift_guard', $event)">?</button>
+                <div v-if="activeTooltip === 'fn_opt_taker_drift_guard'" :class="$style.tooltipBox">{{ TOOLTIPS.fn_opt_taker_drift_guard }}</div>
+              </div>
             </div>
-            <Typography size="text-xs" color="tertiary">Cancel maker if taker price drifts during wait</Typography>
+            <Typography size="text-xs" color="tertiary">Maker canceln wenn Taker-Preis während Wait driftet</Typography>
           </div>
           <!-- Max Taker Drift -->
           <div :class="$style.flagItem">
@@ -725,6 +780,7 @@ onUnmounted(() => {
                 <Typography size="text-xs" color="tertiary">bps</Typography>
               </div>
             </div>
+            <Typography size="text-xs" color="tertiary">Max Taker-Preisdrift während Maker wartet (für Drift Guard)</Typography>
           </div>
           <!-- Min Funding Consistency -->
           <div :class="$style.flagItem">
@@ -742,7 +798,7 @@ onUnmounted(() => {
                 />
               </div>
             </div>
-            <Typography size="text-xs" color="tertiary">V4 spread_consistency threshold (0-1)</Typography>
+            <Typography size="text-xs" color="tertiary">V4 Konsistenz-Schwellenwert (0–1, für V4 Funding History)</Typography>
           </div>
         </div>
       </div>
@@ -760,8 +816,8 @@ onUnmounted(() => {
           </div>
           <!-- OHI Bar (Long) -->
           <div v-if="longOhi && longOhi.ohi > 0" :class="$style.ohiBar">
-            <div :class="$style.ohiLabel">
-              <Typography size="text-xs" color="tertiary">OHI</Typography>
+            <div :class="[$style.ohiLabel, $style.ohiLabelClickable]" @click="longOhiExpanded = !longOhiExpanded">
+              <Typography size="text-xs" color="tertiary">OHI {{ longOhiExpanded ? '▾' : '▸' }}</Typography>
               <Typography size="text-xs" :color="longOhi.ohi >= 0.7 ? 'success' : longOhi.ohi >= 0.4 ? 'primary' : 'warning'">
                 {{ (longOhi.ohi * 100).toFixed(0) }}%
               </Typography>
@@ -775,6 +831,20 @@ onUnmounted(() => {
             <div :class="$style.ohiMeta">
               <Typography size="text-xs" color="tertiary">{{ longOhi.spread_bps }}bps</Typography>
               <Typography size="text-xs" color="tertiary">${{ ((longOhi.depth_usd ?? 0) / 1000).toFixed(0) }}k depth</Typography>
+            </div>
+            <div v-if="longOhiExpanded" :class="$style.ohiSubScores">
+              <div :class="$style.ohiSubRow">
+                <Typography size="text-xs" color="tertiary">Spread</Typography>
+                <Typography size="text-xs" :color="(longOhi.spread_score ?? 0) >= 0.7 ? 'success' : (longOhi.spread_score ?? 0) >= 0.4 ? 'primary' : 'warning'">{{ ((longOhi.spread_score ?? 0) * 100).toFixed(0) }}%</Typography>
+              </div>
+              <div :class="$style.ohiSubRow">
+                <Typography size="text-xs" color="tertiary">Depth</Typography>
+                <Typography size="text-xs" :color="(longOhi.depth_score ?? 0) >= 0.7 ? 'success' : (longOhi.depth_score ?? 0) >= 0.4 ? 'primary' : 'warning'">{{ ((longOhi.depth_score ?? 0) * 100).toFixed(0) }}%</Typography>
+              </div>
+              <div :class="$style.ohiSubRow">
+                <Typography size="text-xs" color="tertiary">Symmetry</Typography>
+                <Typography size="text-xs" :color="(longOhi.symmetry_score ?? 0) >= 0.7 ? 'success' : (longOhi.symmetry_score ?? 0) >= 0.4 ? 'primary' : 'warning'">{{ ((longOhi.symmetry_score ?? 0) * 100).toFixed(0) }}%</Typography>
+              </div>
             </div>
           </div>
           <div :class="$style.dexStats">
@@ -914,11 +984,39 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <!-- Depth Spread Analysis -->
+          <div v-if="depthAnalysis && depthAnalysis.slippage_bps != null" :class="[$style.depthWidget, !depthAnalysis.is_acceptable && $style.depthWidgetWarn]">
+            <div :class="$style.depthHeader">
+              <Typography size="text-xs" weight="semibold" color="secondary">Depth Spread</Typography>
+              <Chip :variant="depthAnalysis.is_acceptable ? 'success' : 'warning'" size="sm">
+                {{ Number(depthAnalysis.slippage_bps).toFixed(1) }}bps slip
+              </Chip>
+            </div>
+            <div :class="$style.depthGrid">
+              <div :class="$style.depthRow">
+                <Typography size="text-xs" color="tertiary">BBO Spread</Typography>
+                <Typography size="text-xs" :color="Number(depthAnalysis.bbo_spread_pct) <= 0 ? 'success' : 'primary'">{{ Number(depthAnalysis.bbo_spread_pct).toFixed(4) }}%</Typography>
+              </div>
+              <div :class="$style.depthRow">
+                <Typography size="text-xs" color="tertiary">Exec Spread</Typography>
+                <Typography size="text-xs" :color="Number(depthAnalysis.exec_spread_pct) <= 0 ? 'success' : 'primary'">{{ Number(depthAnalysis.exec_spread_pct).toFixed(4) }}%</Typography>
+              </div>
+              <div :class="$style.depthRow">
+                <Typography size="text-xs" color="tertiary">Long VWAP</Typography>
+                <Typography size="text-xs">${{ Number(depthAnalysis.long_fill_price).toFixed(4) }}</Typography>
+              </div>
+              <div :class="$style.depthRow">
+                <Typography size="text-xs" color="tertiary">Short VWAP</Typography>
+                <Typography size="text-xs">${{ Number(depthAnalysis.short_fill_price).toFixed(4) }}</Typography>
+              </div>
+            </div>
+          </div>
+
           <!-- Mark Price -->
           <div :class="$style.pnlRow">
             <div :class="$style.pnlItem">
               <Typography size="text-xs" color="tertiary">Long Mark</Typography>
-              <Typography size="text-sm">{{ longPrice ? '$' + longPrice.mid.toFixed(4) : '—' }}</Typography>
+              <Typography size="text-sm">{{ longPrice && longPrice.mid != null ? '$' + Number(longPrice.mid).toFixed(4) : '—' }}</Typography>
             </div>
             <div :class="$style.pnlItem">
               <Typography size="text-xs" color="tertiary">Spread</Typography>
@@ -930,7 +1028,7 @@ onUnmounted(() => {
             </div>
             <div :class="$style.pnlItem">
               <Typography size="text-xs" color="tertiary">Short Mark</Typography>
-              <Typography size="text-sm">{{ shortPrice ? '$' + shortPrice.mid.toFixed(4) : '—' }}</Typography>
+              <Typography size="text-sm">{{ shortPrice && shortPrice.mid != null ? '$' + Number(shortPrice.mid).toFixed(4) : '—' }}</Typography>
             </div>
           </div>
         </div>
@@ -946,8 +1044,8 @@ onUnmounted(() => {
           </div>
           <!-- OHI Bar (Short) -->
           <div v-if="shortOhi && shortOhi.ohi > 0" :class="$style.ohiBar">
-            <div :class="$style.ohiLabel">
-              <Typography size="text-xs" color="tertiary">OHI</Typography>
+            <div :class="[$style.ohiLabel, $style.ohiLabelClickable]" @click="shortOhiExpanded = !shortOhiExpanded">
+              <Typography size="text-xs" color="tertiary">OHI {{ shortOhiExpanded ? '▾' : '▸' }}</Typography>
               <Typography size="text-xs" :color="shortOhi.ohi >= 0.7 ? 'success' : shortOhi.ohi >= 0.4 ? 'primary' : 'warning'">
                 {{ (shortOhi.ohi * 100).toFixed(0) }}%
               </Typography>
@@ -961,6 +1059,20 @@ onUnmounted(() => {
             <div :class="$style.ohiMeta">
               <Typography size="text-xs" color="tertiary">{{ shortOhi.spread_bps }}bps</Typography>
               <Typography size="text-xs" color="tertiary">${{ ((shortOhi.depth_usd ?? 0) / 1000).toFixed(0) }}k depth</Typography>
+            </div>
+            <div v-if="shortOhiExpanded" :class="$style.ohiSubScores">
+              <div :class="$style.ohiSubRow">
+                <Typography size="text-xs" color="tertiary">Spread</Typography>
+                <Typography size="text-xs" :color="(shortOhi.spread_score ?? 0) >= 0.7 ? 'success' : (shortOhi.spread_score ?? 0) >= 0.4 ? 'primary' : 'warning'">{{ ((shortOhi.spread_score ?? 0) * 100).toFixed(0) }}%</Typography>
+              </div>
+              <div :class="$style.ohiSubRow">
+                <Typography size="text-xs" color="tertiary">Depth</Typography>
+                <Typography size="text-xs" :color="(shortOhi.depth_score ?? 0) >= 0.7 ? 'success' : (shortOhi.depth_score ?? 0) >= 0.4 ? 'primary' : 'warning'">{{ ((shortOhi.depth_score ?? 0) * 100).toFixed(0) }}%</Typography>
+              </div>
+              <div :class="$style.ohiSubRow">
+                <Typography size="text-xs" color="tertiary">Symmetry</Typography>
+                <Typography size="text-xs" :color="(shortOhi.symmetry_score ?? 0) >= 0.7 ? 'success' : (shortOhi.symmetry_score ?? 0) >= 0.4 ? 'primary' : 'warning'">{{ ((shortOhi.symmetry_score ?? 0) * 100).toFixed(0) }}%</Typography>
+              </div>
             </div>
           </div>
           <div :class="$style.dexStats">
@@ -1024,9 +1136,9 @@ onUnmounted(() => {
               {{ new Date(entry.ts * 1000).toLocaleTimeString() }}
             </Typography>
             <Chip
-              :variant="entry.cat === 'FILL' ? 'success' : entry.cat === 'RISK' ? 'warning' : entry.cat === 'ORDER' ? 'info' : entry.extra?.level === 'error' ? 'error' : 'neutral'"
+              :variant="entry.cat === 'FILL' ? 'success' : entry.cat === 'RISK' ? 'warning' : entry.cat === 'ORDER' ? 'info' : entry.cat === 'CONFIG' ? 'info' : entry.cat === 'OHI' ? 'neutral' : entry.cat === 'SPREAD' ? 'neutral' : entry.extra?.level === 'error' ? 'error' : 'neutral'"
               size="sm"
-              :class="$style.logCat"
+              :class="[$style.logCat, entry.cat === 'CONFIG' && $style['logCat--config'], entry.cat === 'OHI' && $style['logCat--ohi'], entry.cat === 'SPREAD' && $style['logCat--spread']]"
             >
               {{ entry.cat }}
             </Chip>
@@ -1634,6 +1746,122 @@ onUnmounted(() => {
   justify-content: space-between;
 }
 
+/* ── Tooltip ── */
+.tooltipWrap {
+  position: relative;
+  margin-left: auto;
+}
+
+.tooltipBtn {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-4);
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 0;
+}
+.tooltipBtn:hover {
+  border-color: var(--color-brand, #6366f1);
+  color: var(--color-brand, #6366f1);
+}
+
+.tooltipBox {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 260px;
+  padding: 10px 12px;
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-stroke-divider);
+  border-radius: var(--radius-md);
+  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  z-index: 200;
+  white-space: normal;
+}
+
+/* ── Activity Log Category Colors ── */
+.logCat--config {
+  background: rgba(99,102,241,0.15) !important;
+  color: #818cf8 !important;
+}
+.logCat--ohi {
+  background: rgba(34,197,94,0.12) !important;
+  color: #4ade80 !important;
+}
+.logCat--spread {
+  background: rgba(14,165,233,0.12) !important;
+  color: #38bdf8 !important;
+}
+
+/* ── OHI Sub-Scores ── */
+.ohiLabelClickable {
+  cursor: pointer;
+  user-select: none;
+}
+.ohiLabelClickable:hover { opacity: 0.8; }
+
+.ohiSubScores {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-stroke-divider);
+  margin-top: var(--space-1);
+}
+
+.ohiSubRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+/* ── Depth Spread Widget ── */
+.depthWidget {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-2);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.depthWidgetWarn {
+  border-color: rgba(245,158,11,0.4);
+  background: rgba(245,158,11,0.05);
+}
+
+.depthHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.depthGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 12px;
+}
+
+.depthRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
 /* ── V4 Details ── */
 .v4Details {
   display: grid;
@@ -1649,5 +1877,171 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+/* ===== MOBILE RESPONSIVE BREAKPOINTS ===== */
+
+@media (max-width: 1024px) {
+  .page {
+    padding: 20px 20px 40px;
+  }
+
+  .mainGrid {
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-4);
+  }
+
+  .centerPanel {
+    grid-column: 1 / -1;
+    order: -1;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: center;
+    padding: var(--space-3);
+  }
+
+  .ringWrap {
+    width: 120px;
+    height: 120px;
+  }
+
+  .ringValue {
+    font-size: 18px;
+  }
+
+  .flagGrid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 767px) {
+  .page {
+    padding: 16px 16px 80px;
+    gap: var(--space-4);
+  }
+
+  .topBar {
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-3);
+  }
+
+  .pills {
+    flex-wrap: wrap;
+    justify-content: center;
+    width: 100%;
+  }
+
+  .pill {
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+
+  .controls {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .mainGrid {
+    grid-template-columns: 1fr;
+    gap: var(--space-3);
+  }
+
+  .centerPanel {
+    order: 0;
+    min-width: auto;
+  }
+
+  .dexCard {
+    padding: var(--space-4);
+  }
+
+  .dexHeader {
+    flex-wrap: wrap;
+  }
+
+  .dexBalance {
+    margin-left: 0;
+    width: 100%;
+    margin-top: var(--space-2);
+    text-align: center;
+  }
+
+  .flagGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .logEntry {
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .logTime {
+    width: auto;
+  }
+
+  .logCat {
+    width: auto;
+  }
+
+  .popover,
+  .timerPopover {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 90%;
+    max-width: 300px;
+    z-index: 1000;
+  }
+
+  .tooltipBox {
+    position: fixed;
+    top: auto;
+    bottom: 100px;
+    left: 16px;
+    right: 16px;
+    width: auto;
+    z-index: 1000;
+  }
+}
+
+@media (max-width: 480px) {
+  .ringWrap {
+    width: 100px;
+    height: 100px;
+  }
+
+  .ringValue {
+    font-size: 16px;
+  }
+
+  .pnlRow {
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .pnlItem {
+    flex-direction: row;
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .dexStats {
+    gap: var(--space-2);
+  }
+
+  .dexStat {
+    font-size: 13px;
+  }
+
+  .posRow {
+    padding: 4px 0;
+  }
+
+  .v4Details,
+  .depthGrid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

@@ -209,7 +209,8 @@ class VariationalClient:
         """Synchronous GET.
 
         Public endpoints (stats API) → direct via curl_cffi (no auth needed).
-        Authenticated endpoints (positions, portfolio, etc.) → proxy first, curl_cffi fallback.
+        Authenticated endpoints → CF Worker proxy only (when configured).
+        Direct requests to omni.variational.io are blocked by Cloudflare — no curl_cffi fallback.
 
         max_retries=0 (default): no retry, fail fast (dashboard/portfolio reads).
         max_retries=N: retry N times on 403 (position checks in order flow).
@@ -220,19 +221,23 @@ class VariationalClient:
             resp.raise_for_status()
             return resp.json()
 
-        # Authenticated endpoints — proxy first (handles auth server-side), curl_cffi fallback
+        # Authenticated endpoints — proxy only (direct is always blocked by Cloudflare)
         if self._proxy_session and url.startswith(self._base_url):
-            try:
-                proxy_url = self._proxy_rewrite_url(url)
+            proxy_url = self._proxy_rewrite_url(url)
+
+            def _do_proxy_get():
                 resp = self._proxy_session.get(
                     proxy_url, headers=self._headers(), cookies=self._cookies(),
                     params=params, timeout=15,
                 )
                 resp.raise_for_status()
                 return resp.json()
-            except Exception as exc:
-                logger.warning("Variational proxy GET failed (%s), falling back to curl_cffi", exc)
 
+            if max_retries == 0:
+                return _do_proxy_get()
+            return self._retry_on_403(_do_proxy_get, max_retries=max_retries)
+
+        # No proxy configured — curl_cffi direct (dev/testing only)
         def _do_get():
             resp = self._cffi_session.get(
                 url, headers=self._headers(), cookies=self._cookies(),
@@ -246,26 +251,30 @@ class VariationalClient:
         return self._retry_on_403(_do_get, max_retries=max_retries)
 
     def _sync_post(self, endpoint: str, payload: dict, max_retries: int | None = 3) -> Any:
-        """Synchronous POST — CF Worker proxy first, curl_cffi fallback.
+        """Synchronous POST — CF Worker proxy only (when configured).
 
-        max_retries=3 (default): retry 3× on 403 (non-critical POSTs).
-        max_retries=None: retry indefinitely (IOC orders).
+        Direct requests to omni.variational.io are blocked by Cloudflare — no curl_cffi fallback.
+
+        max_retries=3 (default): retry 3× on proxy failure (non-critical POSTs).
+        max_retries=None: retry indefinitely (IOC orders — must not give up).
         """
         post_url = f"{self._base_url}/{endpoint.lstrip('/')}"
 
-        # Try CF Worker proxy first
+        # Proxy only — direct is always blocked by Cloudflare
         if self._proxy_session:
-            try:
-                proxy_url = self._proxy_rewrite_url(post_url)
+            proxy_url = self._proxy_rewrite_url(post_url)
+
+            def _do_proxy_post():
                 resp = self._proxy_session.post(
                     proxy_url, headers=self._headers(), cookies=self._cookies(),
                     json=payload, timeout=15,
                 )
                 resp.raise_for_status()
                 return resp.json()
-            except Exception as exc:
-                logger.warning("Variational proxy POST failed (%s), falling back to curl_cffi", exc)
 
+            return self._retry_on_403(_do_proxy_post, max_retries=max_retries)
+
+        # No proxy configured — curl_cffi direct (dev/testing only)
         def _do_post():
             resp = self._cffi_session.post(
                 post_url, headers=self._headers(), cookies=self._cookies(),

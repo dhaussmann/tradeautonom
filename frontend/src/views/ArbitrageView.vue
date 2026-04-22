@@ -113,10 +113,6 @@ function displayExchange(ex: string): string {
   return ex.charAt(0).toUpperCase() + ex.slice(1)
 }
 
-function formatPairLabel(pair: string): string {
-  return pair.split('_').map(displayExchange).join('↔')
-}
-
 function bpsToPercent(bps: number): string {
   return (bps / 100).toFixed(3)
 }
@@ -126,6 +122,12 @@ function profitColor(bps: number): string {
   if (bps >= 5) return '#4ade80'
   if (bps >= 2) return 'var(--color-text-primary)'
   return 'var(--color-text-tertiary)'
+}
+
+function profitBgColor(bps: number): string {
+  if (bps >= 10) return 'rgba(34, 197, 94, 0.15)'
+  if (bps >= 5) return 'rgba(74, 222, 128, 0.1)'
+  return 'var(--color-white-4)'
 }
 
 function formatUsd(val: number): string {
@@ -167,13 +169,8 @@ function ageLabel(ts: number): string {
         </Typography>
       </div>
       <div v-if="config" :class="$style.headerMeta">
-        <span :class="$style.metaPill">{{ config.tokens_tracked }} tokens tracked</span>
-        <span :class="$style.metaPill">scan every {{ config.scan_interval_s }}s</span>
-        <span
-          v-for="(bps, pair) in config.min_profit_bps"
-          :key="pair"
-          :class="$style.metaPill"
-        >{{ formatPairLabel(pair) }}: min {{ bpsToPercent(bps) }}%</span>
+        <span :class="$style.metaPill">{{ config.tokens_tracked }} tokens</span>
+        <span :class="$style.metaPill">{{ config.scan_interval_s }}s scan</span>
       </div>
     </div>
 
@@ -258,80 +255,136 @@ function ageLabel(ts: number): string {
       <Typography color="tertiary">No arbitrage opportunities found{{ search ? ` matching "${search}"` : '' }}</Typography>
     </div>
 
-    <!-- ── Table ── -->
-    <div v-else :class="$style.table">
-      <div :class="[$style.row, $style.rowHeader]">
-        <div :class="[$style.cell, $style.cellToken]" @click="toggleSort('token')">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Token{{ sortIcon('token') }}</Typography>
+    <!-- ── Results (Table + Cards) ── -->
+    <template v-else>
+      <!-- Desktop Table -->
+      <div :class="$style.table">
+        <div :class="[$style.row, $style.rowHeader]">
+          <div :class="[$style.cell, $style.cellToken]" @click="toggleSort('token')">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Token{{ sortIcon('token') }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellExch]">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Buy</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellExch]">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Sell</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellPrice]">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Buy Ask</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellPrice]">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Sell Bid</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellRight]" @click="toggleSort('bbo_spread_bps')">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Spread %{{ sortIcon('bbo_spread_bps') }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellRight]" @click="toggleSort('net_profit_bps')">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Profit %{{ sortIcon('net_profit_bps') }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellQty]">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Max Qty</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellRight]" @click="toggleSort('max_notional_usd')">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Notional{{ sortIcon('max_notional_usd') }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellAge]">
+            <Typography size="text-xs" weight="semibold" color="tertiary">Age</Typography>
+          </div>
         </div>
-        <div :class="[$style.cell, $style.cellExch]">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Buy</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellExch]">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Sell</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellPrice]">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Buy Ask</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellPrice]">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Sell Bid</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellRight]" @click="toggleSort('bbo_spread_bps')">
-          <Typography size="text-xs" weight="semibold" color="tertiary">BBO Spread %{{ sortIcon('bbo_spread_bps') }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellRight]" @click="toggleSort('net_profit_bps')">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Net Profit %{{ sortIcon('net_profit_bps') }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellQty]">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Max Qty</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellRight]" @click="toggleSort('max_notional_usd')">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Notional{{ sortIcon('max_notional_usd') }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellAge]">
-          <Typography size="text-xs" weight="semibold" color="tertiary">Age</Typography>
+
+        <div
+          v-for="(row, idx) in filtered"
+          :key="`${row.token}-${row.buy_exchange}-${row.sell_exchange}-${idx}`"
+          :class="[$style.row, $style.rowData]"
+        >
+          <div :class="[$style.cell, $style.cellToken]">
+            <Typography size="text-md" weight="medium">{{ row.token }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellExch]">
+            <span :class="$style.badge">{{ displayExchange(row.buy_exchange) }}</span>
+          </div>
+          <div :class="[$style.cell, $style.cellExch]">
+            <span :class="$style.badge">{{ displayExchange(row.sell_exchange) }}</span>
+          </div>
+          <div :class="[$style.cell, $style.cellPrice]">
+            <Typography size="text-sm" color="secondary">{{ formatPrice(row.buy_price_bbo) }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellPrice]">
+            <Typography size="text-sm" color="secondary">{{ formatPrice(row.sell_price_bbo) }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellRight]">
+            <Typography size="text-sm" color="secondary">{{ bpsToPercent(row.bbo_spread_bps) }}%</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellRight]">
+            <Typography size="text-sm" weight="semibold" :style="{ color: profitColor(row.net_profit_bps) }">
+              {{ bpsToPercent(row.net_profit_bps) }}%
+            </Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellQty]">
+            <Typography size="text-sm" color="secondary">{{ formatQty(row.max_qty) }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellRight]">
+            <Typography size="text-sm" weight="medium">{{ formatUsd(row.max_notional_usd) }}</Typography>
+          </div>
+          <div :class="[$style.cell, $style.cellAge]">
+            <Typography size="text-xs" color="tertiary">{{ ageLabel(row.timestamp_ms) }}</Typography>
+          </div>
         </div>
       </div>
 
-      <div
-        v-for="(row, idx) in filtered"
-        :key="`${row.token}-${row.buy_exchange}-${row.sell_exchange}-${idx}`"
-        :class="[$style.row, $style.rowData]"
-      >
-        <div :class="[$style.cell, $style.cellToken]">
-          <Typography size="text-md" weight="medium">{{ row.token }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellExch]">
-          <span :class="$style.badge">{{ displayExchange(row.buy_exchange) }}</span>
-        </div>
-        <div :class="[$style.cell, $style.cellExch]">
-          <span :class="$style.badge">{{ displayExchange(row.sell_exchange) }}</span>
-        </div>
-        <div :class="[$style.cell, $style.cellPrice]">
-          <Typography size="text-sm" color="secondary">{{ formatPrice(row.buy_price_bbo) }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellPrice]">
-          <Typography size="text-sm" color="secondary">{{ formatPrice(row.sell_price_bbo) }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellRight]">
-          <Typography size="text-sm" color="secondary">{{ bpsToPercent(row.bbo_spread_bps) }}%</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellRight]">
-          <Typography size="text-sm" weight="semibold" :style="{ color: profitColor(row.net_profit_bps) }">
-            {{ bpsToPercent(row.net_profit_bps) }}%
-          </Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellQty]">
-          <Typography size="text-sm" color="secondary">{{ formatQty(row.max_qty) }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellRight]">
-          <Typography size="text-sm" weight="medium">{{ formatUsd(row.max_notional_usd) }}</Typography>
-        </div>
-        <div :class="[$style.cell, $style.cellAge]">
-          <Typography size="text-xs" color="tertiary">{{ ageLabel(row.timestamp_ms) }}</Typography>
+      <!-- Mobile Cards -->
+      <div :class="$style.mobileCards">
+        <div
+          v-for="(row, idx) in filtered"
+          :key="`mobile-${row.token}-${row.buy_exchange}-${row.sell_exchange}-${idx}`"
+          :class="$style.oppCard"
+          :style="{ background: profitBgColor(row.net_profit_bps) }"
+        >
+          <div :class="$style.oppHeader">
+            <div :class="$style.oppTitle">
+              <Typography size="text-lg" weight="bold">{{ row.token }}</Typography>
+              <Typography
+                size="text-sm"
+                weight="bold"
+                :style="{ color: profitColor(row.net_profit_bps) }"
+              >
+                {{ bpsToPercent(row.net_profit_bps) }}%
+              </Typography>
+            </div>
+            <Typography size="text-xs" color="tertiary">{{ ageLabel(row.timestamp_ms) }}</Typography>
+          </div>
+
+          <div :class="$style.oppExchanges">
+            <div :class="$style.oppExchange">
+              <Typography size="text-xs" color="tertiary">BUY</Typography>
+              <span :class="$style.badge">{{ displayExchange(row.buy_exchange) }}</span>
+              <Typography size="text-sm">{{ formatPrice(row.buy_price_bbo) }}</Typography>
+            </div>
+            <div :class="$style.oppArrow">→</div>
+            <div :class="$style.oppExchange">
+              <Typography size="text-xs" color="tertiary">SELL</Typography>
+              <span :class="$style.badge">{{ displayExchange(row.sell_exchange) }}</span>
+              <Typography size="text-sm">{{ formatPrice(row.sell_price_bbo) }}</Typography>
+            </div>
+          </div>
+
+          <div :class="$style.oppStats">
+            <div :class="$style.oppStat">
+              <Typography size="text-xs" color="tertiary">Spread</Typography>
+              <Typography size="text-sm" color="secondary">{{ bpsToPercent(row.bbo_spread_bps) }}%</Typography>
+            </div>
+            <div :class="$style.oppStat">
+              <Typography size="text-xs" color="tertiary">Max Qty</Typography>
+              <Typography size="text-sm">{{ formatQty(row.max_qty) }}</Typography>
+            </div>
+            <div :class="$style.oppStat">
+              <Typography size="text-xs" color="tertiary">Notional</Typography>
+              <Typography size="text-sm" weight="medium">{{ formatUsd(row.max_notional_usd) }}</Typography>
+            </div>
+          </div>
         </div>
       </div>
-    </div>
+    </template>
   </div>
 </template>
 
@@ -349,12 +402,15 @@ function ageLabel(ts: number): string {
 .header {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: flex-start;
+  gap: var(--space-4);
+  flex-wrap: wrap;
 }
 
 .headerMeta {
   display: flex;
   gap: var(--space-2);
+  flex-wrap: wrap;
 }
 
 .metaPill {
@@ -365,6 +421,7 @@ function ageLabel(ts: number): string {
   border: 1px solid var(--color-stroke-divider);
   font-size: 11px;
   color: var(--color-text-tertiary);
+  white-space: nowrap;
 }
 
 /* ── Stat cards ── */
@@ -419,6 +476,8 @@ function ageLabel(ts: number): string {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  flex: 1;
+  min-width: 250px;
 }
 
 .filterItemRight {
@@ -433,7 +492,7 @@ function ageLabel(ts: number): string {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  min-width: 200px;
+  flex: 1;
 }
 
 .slider {
@@ -444,6 +503,7 @@ function ageLabel(ts: number): string {
   background: var(--color-stroke-divider);
   border-radius: 2px;
   outline: none;
+  min-width: 120px;
 }
 .slider::-webkit-slider-thumb {
   -webkit-appearance: none;
@@ -485,7 +545,7 @@ function ageLabel(ts: number): string {
   padding: var(--space-1) 0;
 }
 
-/* ── Table ── */
+/* ── Desktop Table ── */
 .table {
   border-radius: var(--radius-xl);
   border: 1px solid var(--color-stroke-divider);
@@ -557,5 +617,178 @@ function ageLabel(ts: number): string {
 .empty {
   padding: var(--space-16) 0;
   text-align: center;
+}
+
+/* ── Mobile Cards ── */
+.mobileCards {
+  display: none;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.oppCard {
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--color-stroke-divider);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  transition: transform 0.1s ease;
+}
+
+.oppCard:active {
+  transform: scale(0.99);
+}
+
+.oppHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.oppTitle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.oppExchanges {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-3);
+  background: var(--color-white-4);
+  border-radius: var(--radius-lg);
+}
+
+.oppExchange {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.oppArrow {
+  font-size: 18px;
+  color: var(--color-text-tertiary);
+}
+
+.oppStats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-stroke-divider);
+}
+
+.oppStat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+/* ===== RESPONSIVE BREAKPOINTS ===== */
+
+/* Tablet */
+@media (max-width: 1024px) {
+  .page {
+    padding: 24px 20px;
+  }
+
+  .statRow {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .searchInput {
+    width: 200px;
+  }
+}
+
+/* Mobile */
+@media (max-width: 767px) {
+  .page {
+    padding: 16px;
+    gap: var(--space-3);
+  }
+
+  .header {
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .headerMeta {
+    width: 100%;
+  }
+
+  .statRow {
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-3);
+  }
+
+  .statCard {
+    padding: var(--space-3);
+  }
+
+  .filterRow {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-3);
+  }
+
+  .filterItem {
+    width: 100%;
+  }
+
+  .filterItemRight {
+    margin-left: 0;
+  }
+
+  .searchInput {
+    width: 100%;
+  }
+
+  /* Hide desktop table on mobile */
+  .table {
+    display: none;
+  }
+
+  /* Show mobile cards */
+  .mobileCards {
+    display: flex;
+  }
+}
+
+/* Small mobile */
+@media (max-width: 480px) {
+  .statRow {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .oppExchanges {
+    grid-template-columns: 1fr;
+    gap: var(--space-2);
+  }
+
+  .oppArrow {
+    transform: rotate(90deg);
+  }
+
+  .oppStats {
+    grid-template-columns: 1fr;
+    text-align: center;
+  }
+
+  .oppStat {
+    flex-direction: row;
+    justify-content: space-between;
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--color-stroke-divider);
+  }
+
+  .oppStat:last-child {
+    border-bottom: none;
+  }
 }
 </style>

@@ -4,6 +4,7 @@ import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
 import AppHeader from '@/components/layout/AppHeader.vue'
 import VaultScreen from '@/components/VaultScreen.vue'
+import MobileBottomNav from '@/components/mobile/MobileBottomNav.vue'
 
 const appStore = useAppStore()
 const authStore = useAuthStore()
@@ -51,6 +52,8 @@ watch(() => authStore.isAuthenticated, async (isAuth) => {
       <main class="app-main">
         <RouterView />
       </main>
+      <!-- Mobile bottom navigation (only on mobile) -->
+      <MobileBottomNav v-if="authStore.isAuthenticated" />
     </template>
   </div>
 </template>
@@ -65,6 +68,13 @@ watch(() => authStore.isAuthenticated, async (isAuth) => {
 .app-main {
   flex: 1;
   overflow: auto;
+}
+
+/* Add padding for mobile bottom nav */
+@media (max-width: 767px) {
+  .app-main {
+    padding-bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+  }
 }
 
 .app-loading {

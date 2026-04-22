@@ -25,6 +25,7 @@ from app.data_layer import DataLayer
 from app.execution_logger import ExecutionLogger
 from app.funding_monitor import FundingMonitor, FundingSuggestion
 from app.position_sizer import compute_position_size
+from app.spread_analyzer import analyze_cross_venue_spread
 from app.risk_manager import RiskManager
 from app.state_machine import (
     ChunkResult,
@@ -168,10 +169,18 @@ class FundingArbEngine:
         config: EngineConfig,
         clients: dict[str, Any],
         activity_forwarder: Any | None = None,
+        shared_data_cache: Any | None = None,
+        shared_ws_registry: Any | None = None,
+        oms_data_layer: DataLayer | None = None,
     ) -> None:
         self.config = config
         self._clients = clients
         self._activity_forwarder = activity_forwarder
+        
+        # Shared resources (from BotRegistry for multi-bot setups)
+        self._shared_data_cache = shared_data_cache
+        self._shared_ws_registry = shared_ws_registry
+        self._oms_data_layer = oms_data_layer  # Shared OMS DataLayer
 
         # Determine which symbol maps to which exchange
         self._symbols_map = {
@@ -324,16 +333,25 @@ class FundingArbEngine:
         """Initialize and start all sub-components.
 
         Optionally accepts a shared DataLayer (for multi-job setups).
+        When using shared resources (shared_data_cache, shared_ws_registry), 
+        the OMS DataLayer is used from BotRegistry.
         """
         if self._started:
             return
 
         # DataLayer
         if data_layer:
+            # Explicit shared DataLayer passed (legacy support)
             self._data_layer = data_layer
+        elif self._oms_data_layer:
+            # Use shared OMS DataLayer from BotRegistry
+            self._data_layer = self._oms_data_layer
+            logger.info("Engine[%s]: Using shared OMS DataLayer", self.config.job_id)
         else:
+            # Create own DataLayer (legacy behavior)
             self._data_layer = DataLayer(shared_monitor_url=self.config.fn_opt_shared_monitor_url)
             await self._data_layer.start(self._clients, self._symbols_map)
+            logger.info("Engine[%s]: Created own DataLayer", self.config.job_id)
 
         # FundingMonitor
         self._funding_monitor = FundingMonitor(
@@ -372,9 +390,20 @@ class FundingArbEngine:
         # Restore persisted position state (survives container restarts)
         if self._state_machine.load_state():
             self.log_activity("ENGINE", f"Restored position from disk: long={self._state_machine.position_info['long_qty']:.6f} short={self._state_machine.position_info['short_qty']:.6f}")
-            # Overwrite disk values with actual exchange positions
-            await self._state_machine.sync_position_from_exchange()
-            self.log_activity("ENGINE", f"Synced from exchange: long={self._state_machine.position_info['long_qty']:.6f} short={self._state_machine.position_info['short_qty']:.6f}")
+            # Overwrite disk values with actual exchange positions — retry up to 3× with delay
+            # so transient API failures at startup don't leave the engine with a stale baseline.
+            sync_ok = False
+            for _attempt in range(3):
+                sync_ok = await self._state_machine.sync_position_from_exchange()
+                if sync_ok:
+                    break
+                logger.warning("sync_position_from_exchange attempt %d/3 failed — retrying in 3s", _attempt + 1)
+                await asyncio.sleep(3)
+            if not sync_ok:
+                logger.error("sync_position_from_exchange failed after 3 attempts — baseline may be stale, proceeding with disk values")
+                self.log_activity("ENGINE", "WARNING: position sync from exchange failed — trading with disk baseline (may be stale)")
+            else:
+                self.log_activity("ENGINE", f"Synced from exchange: long={self._state_machine.position_info['long_qty']:.6f} short={self._state_machine.position_info['short_qty']:.6f}")
             # Restore timer state (resume countdown if it was running)
             self._load_timer()
         # Start WS fill subscriptions for real-time fill monitoring
@@ -399,22 +428,33 @@ class FundingArbEngine:
         else:
             self.log_activity("INFO", f"Data feeds active — Direct WS (no OMS) | Feeds: {len(self._symbols_map)} symbols")
 
-        # ── Activity Log: active features summary ──
-        features = []
-        if self.config.fn_opt_depth_spread:
-            features.append(f"Depth Spread (max {self.config.fn_opt_max_slippage_bps}bps)")
-        if self.config.fn_opt_taker_drift_guard:
-            features.append(f"Taker Drift Guard (max {self.config.fn_opt_max_taker_drift_bps}bps)")
-        if self.config.fn_opt_ohi_monitoring:
-            features.append(f"OHI Monitoring (min {self.config.fn_opt_min_ohi})")
-        if self.config.fn_opt_funding_history:
-            features.append(f"V4 Funding History (min consistency {self.config.fn_opt_min_funding_consistency})")
-        if self.config.fn_opt_dynamic_sizing:
-            features.append(f"Dynamic Sizing ({self.config.fn_opt_max_utilization*100:.0f}%/{self.config.fn_opt_max_per_pair_ratio*100:.0f}%)")
-        if features:
-            self.log_activity("INFO", f"Active features: {' | '.join(features)}")
-        else:
-            self.log_activity("INFO", "Active features: none (all opt-in features disabled)")
+        # ── Activity Log: bot config snapshot ──
+        self.log_activity("CONFIG", (
+            f"Pair: {self.config.long_exchange}:{self.config.instrument_a} ↔ "
+            f"{self.config.short_exchange}:{self.config.instrument_b} | "
+            f"maker={self.config.maker_exchange} | "
+            f"qty={self.config.quantity} | "
+            f"chunks={self.config.twap_num_chunks}×{self.config.twap_interval_s}s | "
+            f"spread=[{self.config.min_spread_pct}%..{self.config.max_spread_pct}%] | "
+            f"lev={self.config.leverage_long}x/{self.config.leverage_short}x"
+        ))
+
+        # ── Activity Log: opt-in features (ON and OFF) ──
+        def _on_off(enabled: bool) -> str:
+            return "ON" if enabled else "OFF"
+
+        self.log_activity("CONFIG", (
+            f"Depth Spread: {_on_off(self.config.fn_opt_depth_spread)}"
+            + (f" (max {self.config.fn_opt_max_slippage_bps}bps)" if self.config.fn_opt_depth_spread else "") + " | "
+            f"OHI: {_on_off(self.config.fn_opt_ohi_monitoring)}"
+            + (f" (min {self.config.fn_opt_min_ohi})" if self.config.fn_opt_ohi_monitoring else "") + " | "
+            f"Drift Guard: {_on_off(self.config.fn_opt_taker_drift_guard)}"
+            + (f" (max {self.config.fn_opt_max_taker_drift_bps}bps)" if self.config.fn_opt_taker_drift_guard else "") + " | "
+            f"V4 Funding: {_on_off(self.config.fn_opt_funding_history)}"
+            + (f" (min consistency {self.config.fn_opt_min_funding_consistency})" if self.config.fn_opt_funding_history else "") + " | "
+            f"Dynamic Sizing: {_on_off(self.config.fn_opt_dynamic_sizing)}"
+            + (f" ({self.config.fn_opt_max_utilization*100:.0f}%/{self.config.fn_opt_max_per_pair_ratio*100:.0f}%)" if self.config.fn_opt_dynamic_sizing else "")
+        ))
 
         logger.info(
             "FundingArbEngine started: job=%s long=%s:%s short=%s:%s maker=%s",
@@ -444,7 +484,7 @@ class FundingArbEngine:
             await self._risk_manager.stop()
         if self._funding_monitor:
             await self._funding_monitor.stop()
-        if self._data_layer:
+        if self._data_layer and self._data_layer is not self._oms_data_layer:
             await self._data_layer.stop()
         self._started = False
         logger.info("FundingArbEngine stopped: job=%s", self.config.job_id)
@@ -977,6 +1017,10 @@ class FundingArbEngine:
             max_slippage_bps=self.config.fn_opt_max_slippage_bps,
             taker_drift_guard=self.config.fn_opt_taker_drift_guard,
             max_taker_drift_bps=self.config.fn_opt_max_taker_drift_bps,
+            ohi_monitoring=self.config.fn_opt_ohi_monitoring,
+            min_ohi=self.config.fn_opt_min_ohi,
+            long_exchange=self.config.long_exchange,
+            short_exchange=self.config.short_exchange,
         )
 
         self.log_activity("ENTRY", f"Maker={maker_exch} {maker_side} {maker_symbol}, Taker={taker_exch} {taker_side} {taker_symbol}, qty={qty}, chunks={config.num_chunks}")
@@ -1050,6 +1094,10 @@ class FundingArbEngine:
             max_slippage_bps=self.config.fn_opt_max_slippage_bps,
             taker_drift_guard=self.config.fn_opt_taker_drift_guard,
             max_taker_drift_bps=self.config.fn_opt_max_taker_drift_bps,
+            ohi_monitoring=self.config.fn_opt_ohi_monitoring,
+            min_ohi=self.config.fn_opt_min_ohi,
+            long_exchange=self.config.long_exchange,
+            short_exchange=self.config.short_exchange,
         )
 
         self.log_activity("EXIT", f"Maker={maker_exch} {maker_side} {maker_symbol}, Taker={taker_exch} {taker_side} {taker_symbol}, qty={qty} (reduce_only)")
@@ -1117,6 +1165,49 @@ class FundingArbEngine:
             "total_pnl": round(long_pnl + short_pnl, 4),
         }
 
+    def _compute_depth_analysis_for_status(self) -> dict | None:
+        """Return depth spread analysis for status — uses cached value when executing, live calc when idle."""
+        if not self.config.fn_opt_depth_spread:
+            return None
+        if not self._data_layer or not self.config.instrument_a or not self.config.instrument_b:
+            return None
+        # During execution: use the last cached analysis from state machine
+        if self._state_machine and self._state_machine.last_depth_analysis is not None:
+            a = self._state_machine.last_depth_analysis
+            return {
+                "bbo_spread_pct": a.bbo_spread_pct,
+                "exec_spread_pct": a.exec_spread_pct,
+                "slippage_bps": a.slippage_bps,
+                "is_acceptable": a.is_acceptable,
+                "long_fill_price": a.long_fill_price,
+                "short_fill_price": a.short_fill_price,
+                "long_bbo": a.long_bbo,
+                "short_bbo": a.short_bbo,
+            }
+        # IDLE: compute live from current orderbooks
+        try:
+            long_snap = self._data_layer.get_orderbook(self.config.long_exchange, self.config.instrument_a)
+            short_snap = self._data_layer.get_orderbook(self.config.short_exchange, self.config.instrument_b)
+            if not long_snap or not short_snap:
+                return None
+            long_book = {"asks": long_snap.asks, "bids": long_snap.bids}
+            short_book = {"asks": short_snap.asks, "bids": short_snap.bids}
+            a = analyze_cross_venue_spread(long_book, short_book, self.config.quantity, self.config.fn_opt_max_slippage_bps)
+            if a is None:
+                return None
+            return {
+                "bbo_spread_pct": a.bbo_spread_pct,
+                "exec_spread_pct": a.exec_spread_pct,
+                "slippage_bps": a.slippage_bps,
+                "is_acceptable": a.is_acceptable,
+                "long_fill_price": a.long_fill_price,
+                "short_fill_price": a.short_fill_price,
+                "long_bbo": a.long_bbo,
+                "short_bbo": a.short_bbo,
+            }
+        except Exception:
+            return None
+
     def get_status(self) -> dict:
         """Return comprehensive engine status for dashboard."""
         now = time.time()
@@ -1158,7 +1249,8 @@ class FundingArbEngine:
             "ohi": {
                 "long": self._data_layer.get_orderbook_health(self.config.long_exchange, self.config.instrument_a),
                 "short": self._data_layer.get_orderbook_health(self.config.short_exchange, self.config.instrument_b),
-            } if self._data_layer and self.config.fn_opt_ohi_monitoring and self.config.instrument_a and self.config.instrument_b else {},
+            } if self._data_layer and self.config.instrument_a and self.config.instrument_b else {},
+            "depth_analysis": self._compute_depth_analysis_for_status(),
             "config": {
                 "long_exchange": self.config.long_exchange,
                 "short_exchange": self.config.short_exchange,
@@ -1245,6 +1337,7 @@ class FundingArbEngine:
         "fn_opt_funding_history", "fn_opt_min_funding_consistency",
         "fn_opt_dynamic_sizing", "fn_opt_max_utilization", "fn_opt_max_per_pair_ratio",
         "fn_opt_shared_monitor_url",
+        "fn_opt_taker_drift_guard", "fn_opt_max_taker_drift_bps",
     }
 
     def update_config(self, **kwargs) -> None:
@@ -1283,8 +1376,8 @@ class FundingArbEngine:
         needs_restart = self.update_config(**kwargs)
         if needs_restart and self._started:
             logger.info("Exchange/instrument changed — restarting data feeds")
-            # Stop existing feeds
-            if self._data_layer:
+            # Stop existing feeds (never stop the shared OMS DataLayer)
+            if self._data_layer and self._data_layer is not self._oms_data_layer:
                 await self._data_layer.stop()
             if self._funding_monitor:
                 await self._funding_monitor.stop()

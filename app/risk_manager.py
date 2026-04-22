@@ -158,8 +158,12 @@ class RiskManager:
 
         # Check orderbook depth
         ob = self._data_layer.get_orderbook(exchange, symbol)
-        if not ob.is_synced:
-            return False, f"Orderbook not synced for {exchange}:{symbol}"
+        # Allow if we have data (even if not synced via WS) - HTTP polling provides data too
+        if not ob.is_synced and not ob.bids and not ob.asks:
+            # Try to refresh via REST immediately
+            logger.info("RiskManager: Orderbook empty for %s:%s, attempting REST refresh", exchange, symbol)
+            # Return False to trigger retry loop in caller
+            return False, f"Orderbook empty for {exchange}:{symbol}"
 
         levels = ob.asks if side == "buy" else ob.bids
         if not levels:

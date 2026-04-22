@@ -81,6 +81,10 @@ class ExtendedClient:
         self._vault = vault
         self._has_credentials = bool(api_key and private_key and public_key and vault is not None)
 
+        # Shared fill WS state — one connection per client, multiple symbol callbacks
+        self._fill_callbacks: list[tuple[str, object]] = []  # [(symbol, callback), ...]
+        self._fill_ws_task: object = None  # asyncio.Task | None
+
         if self._has_credentials:
             self._init_trading_client()
             logger.info("ExtendedClient initialised WITH trading (base=%s)", self._base_url)
@@ -192,19 +196,18 @@ class ExtendedClient:
     def _round_qty(self, amount: Decimal, symbol: str) -> Decimal:
         """Round quantity down to the instrument's qty step size."""
         step = self.get_qty_step(symbol)
-        return (amount / step).to_integral_value(rounding="ROUND_DOWN") * step
+        return (Decimal(str(amount)) / step).to_integral_value(rounding="ROUND_DOWN") * step
 
     def _round_price(self, price: Decimal, symbol: str, up: bool = False) -> Decimal:
         """Round price to tick size. up=True rounds up (for buys), False rounds down (for sells)."""
         tick = self._get_tick_size(symbol)
         rounding = "ROUND_UP" if up else "ROUND_DOWN"
-        return (price / tick).to_integral_value(rounding=rounding) * tick
+        return (Decimal(str(price)) / tick).to_integral_value(rounding=rounding) * tick
 
     def _round_to_tick(self, price: Decimal, symbol: str) -> Decimal:
         """Round price down (sell) or up (buy) to the instrument's tick size."""
         tick = self._get_tick_size(symbol)
-        # quantize with ROUND_DOWN — caller adjusts direction via slippage buffer
-        return (price / tick).to_integral_value(rounding="ROUND_DOWN") * tick
+        return (Decimal(str(price)) / tick).to_integral_value(rounding="ROUND_DOWN") * tick
 
     def fetch_markets(self) -> list[dict]:
         """Return list of available markets with normalised keys."""
@@ -320,14 +323,14 @@ class ExtendedClient:
 
         if not self._trading_client._PerpetualTradingClient__markets:
             self._trading_client._PerpetualTradingClient__markets = (
-                await self._trading_client._PerpetualTradingClient__markets_info_module.get_markets_dict()
+                await self._trading_client.markets_info.get_markets_dict()
             )
         market = self._trading_client._PerpetualTradingClient__markets.get(symbol)
         if not market:
             raise ValueError(f"Market {symbol} not found on Extended")
 
-        account = self._trading_client._PerpetualTradingClient__stark_account
-        config = self._trading_client._PerpetualTradingClient__config
+        account = self._trading_client.stark_account
+        config = self._trading_client.config
 
         from datetime import datetime, timedelta, timezone
         expire = datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -919,39 +922,69 @@ class ExtendedClient:
         }
 
     async def async_subscribe_fills(self, symbol: str, callback) -> None:
-        """Subscribe to Extended private WS account stream for fill events.
+        """Register a per-symbol fill callback on the shared Extended account WS.
 
-        Endpoint: wss://api.starknet.extended.exchange/stream.extended.exchange/v1/account
-        Events of type "TRADE" contain fill information.
+        Extended enforces a per-API-key connection limit on the account stream.
+        All symbol subscriptions share one WS connection; this method registers
+        the callback and blocks until cancelled (matching the expected coroutine
+        contract from StateMachine.start_fill_subscriptions).
+        """
+        import asyncio
+
+        self._fill_callbacks.append((symbol, callback))
+
+        # Start the shared WS task if not already running
+        if self._fill_ws_task is None or self._fill_ws_task.done():
+            self._fill_ws_task = asyncio.create_task(
+                self._run_shared_fill_ws(), name="extended-fill-ws-shared"
+            )
+
+        # Block until cancelled (caller expects this to be a long-running coroutine)
+        try:
+            await asyncio.get_event_loop().create_future()
+        except asyncio.CancelledError:
+            self._fill_callbacks = [(s, cb) for s, cb in self._fill_callbacks if cb is not callback]
+            raise
+
+    async def _run_shared_fill_ws(self) -> None:
+        """Single shared WS connection to the Extended account stream.
+
+        Routes TRADE events to all registered callbacks filtered by symbol.
         """
         import ssl as _ssl
         import websockets
         import json
 
         ws_url = "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/account"
-        ssl_ctx = _ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = _ssl.CERT_NONE
+        _ctx = _ssl.create_default_context()
+        _ctx.check_hostname = False
+        _ctx.verify_mode = _ssl.CERT_NONE
 
         logger.info("Extended fill WS connecting: %s", ws_url)
-        async for ws in websockets.connect(ws_url, ssl=ssl_ctx, extra_headers={"X-Api-Key": self._api_key}):
+        async for ws in websockets.connect(ws_url, ssl=_ctx, extra_headers={"X-Api-Key": self._api_key, "User-Agent": "tradeautonom/1.0"}):
             try:
+                logger.info("Extended fill WS connected (serving %d symbol callbacks)", len(self._fill_callbacks))
                 async for raw in ws:
                     msg = json.loads(raw)
-                    if msg.get("type") == "TRADE":
-                        for trade in msg.get("data", {}).get("trades", []):
-                            if symbol and trade.get("market") != symbol:
-                                continue
-                            fill = {
-                                "order_id": str(trade.get("orderId", "")),
-                                "filled_qty": float(trade.get("qty", 0)),
-                                "remaining_qty": 0.0,
-                                "price": float(trade.get("price", 0)),
-                                "is_taker": trade.get("isTaker", True),
-                                "fee": float(trade.get("fee", 0)),
-                                "symbol": trade.get("market", symbol),
-                            }
-                            await callback(fill)
+                    if msg.get("type") != "TRADE":
+                        continue
+                    for trade in msg.get("data", {}).get("trades", []):
+                        trade_symbol = trade.get("market", "")
+                        fill = {
+                            "order_id": str(trade.get("orderId", "")),
+                            "filled_qty": float(trade.get("qty", 0)),
+                            "remaining_qty": 0.0,
+                            "price": float(trade.get("price", 0)),
+                            "is_taker": trade.get("isTaker", True),
+                            "fee": float(trade.get("fee", 0)),
+                            "symbol": trade_symbol,
+                        }
+                        for sym, cb in list(self._fill_callbacks):
+                            if not sym or sym == trade_symbol:
+                                try:
+                                    await cb(fill)
+                                except Exception:
+                                    pass
             except websockets.ConnectionClosed:
                 logger.warning("Extended fill WS disconnected, reconnecting…")
                 continue
@@ -971,7 +1004,7 @@ class ExtendedClient:
         ssl_ctx.verify_mode = ssl.CERT_NONE
 
         logger.info("Extended funding WS connecting: %s", ws_url)
-        async for ws in websockets.connect(ws_url, ssl=ssl_ctx):
+        async for ws in websockets.connect(ws_url, ssl=ssl_ctx, extra_headers={"User-Agent": "tradeautonom/1.0"}):
             try:
                 logger.info("Extended funding WS connected")
                 async for raw in ws:

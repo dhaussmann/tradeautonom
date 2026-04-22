@@ -66,14 +66,14 @@ cmd_up() {
     ssh_nas "${P}/docker run -d \
         --name ${CONTAINER_NAME} \
         --restart unless-stopped \
-        -p ${ORCH_PORT}:${ORCH_PORT} \
+        --network host \
         -e ORCH_TOKEN='${ORCH_TOKEN}' \
         -e TRADEAUTONOM_IMAGE=tradeautonom:v3 \
         -e BASE_PORT=9001 \
         -e ORCH_PORT=${ORCH_PORT} \
         -e STATE_FILE=/app/data/orchestrator_state.json \
-        -e SHARED_CODE_DIR=/opt/tradeautonom/app \
-        -e DOCKER_HOST_IP=172.17.0.1 \
+        -e SHARED_CODE_DIR=/opt/tradeautonom-v3/app \
+        -e DOCKER_HOST_IP=127.0.0.1 \
         -v '${DEPLOY_PATH}/data:/app/data' \
         -v /var/run/docker.sock:/var/run/docker.sock \
         ${IMAGE_NAME}:${IMAGE_TAG}"

@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
-# deploy-v3.sh — Deploy TradeAutonom V3 (multi-user) to Synology NAS
+# deploy.sh — Deploy TradeAutonom V3 (testing container)
 #
-# Runs alongside v1/v2 on a separate port + data volume.
+# tradeautonom-v3 is the testing instance (port 8005).
+# All user containers (ta-user-*) share the same code folder:
+#   /opt/tradeautonom-v3/app  (bind-mounted read-only into every container)
 #
 # Usage:
-#   ./deploy-v3.sh              # sync code + rebuild + restart
-#   ./deploy-v3.sh --restart    # restart container only (no rebuild)
-#   ./deploy-v3.sh --logs       # tail live container logs
-#   ./deploy-v3.sh --stop       # stop the container
-#   ./deploy-v3.sh --status     # show container + health status
+#   ./deploy.sh                 # full deploy: sync + rebuild + (re)start
+#   ./deploy.sh --deploy-code   # fast: push app/ only — all containers hot-reload
+#   ./deploy.sh --restart       # restart tradeautonom-v3 only
+#   ./deploy.sh --logs          # tail live container logs
+#   ./deploy.sh --stop          # stop the container
+#   ./deploy.sh --status        # show container + health status
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -33,6 +36,9 @@ IMAGE_NAME="tradeautonom"
 IMAGE_TAG="v3"
 CONTAINER_NAME="tradeautonom-v3"
 APP_PORT="8005"
+# Shared code directory — mounted read-only into tradeautonom-v3 AND all user containers.
+# Pushing to this path is sufficient to update every container (uvicorn --reload picks it up).
+SHARED_CODE_PATH="/opt/tradeautonom-v3/app"
 
 SSH_TARGET="${NAS_USER}@${NAS_HOST}"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
@@ -96,8 +102,33 @@ ENVEOF"
         -p ${APP_PORT}:${APP_PORT} \
         --env-file '${V3_DEPLOY_PATH}/.env.container' \
         -v '${V3_DEPLOY_PATH}/data:/app/data' \
+        -v '${SHARED_CODE_PATH}:/app/app:ro' \
         ${IMAGE_NAME}:${IMAGE_TAG}"
     ok "Container started"
+}
+
+cmd_deploy_code() {
+    info "Deploying app code to ${SSH_TARGET}:${SHARED_CODE_PATH}"
+    # Abort if any bots are actively trading (state != IDLE/ERROR)
+    local active
+    active=$(curl -s --connect-timeout 3 "http://${NAS_HOST}:${APP_PORT}/fn/bots" \
+        | python3 -c "
+import sys, json
+try:
+    bots = json.load(sys.stdin)
+    active = [b for b in bots if b.get('state','') not in ('IDLE','ERROR','')]
+    print(len(active))
+except Exception:
+    print('?')
+" 2>/dev/null || echo "?")
+    if [[ "$active" != "0" && "$active" != "?" ]]; then
+        err "Aborted — ${active} bot(s) are actively trading on ${CONTAINER_NAME}"
+        exit 1
+    fi
+    rsync -avz --exclude='__pycache__' --exclude='*.pyc' --exclude='.env' \
+        "${PROJECT_ROOT}/app/" \
+        "${SSH_TARGET}:${SHARED_CODE_PATH}/"
+    ok "Code deployed — all containers will hot-reload in ~3s"
 }
 
 cmd_restart() {
@@ -136,22 +167,24 @@ cmd_deploy() {
 # ── Main ──────────────────────────────────────────────────────
 
 case "${1:-deploy}" in
-    --restart|-r)   cmd_restart ;;
-    --logs|-l)      cmd_logs ;;
-    --stop|-s)      cmd_stop ;;
-    --status|-t)    cmd_status ;;
-    --sync)         cmd_sync ;;
-    --build)        cmd_sync; cmd_build ;;
-    deploy|"")      cmd_deploy ;;
+    --deploy-code|-c)  cmd_deploy_code ;;
+    --restart|-r)      cmd_restart ;;
+    --logs|-l)         cmd_logs ;;
+    --stop|-s)         cmd_stop ;;
+    --status|-t)       cmd_status ;;
+    --sync)            cmd_sync ;;
+    --build)           cmd_sync; cmd_build ;;
+    deploy|"")         cmd_deploy ;;
     *)
-        echo "Usage: $0 [--restart|--logs|--stop|--status|--sync|--build]"
-        echo "  (no args)    Full deploy: sync + build + start"
-        echo "  --restart    Restart container only"
-        echo "  --logs       Tail live container logs"
-        echo "  --stop       Stop the container"
-        echo "  --status     Show container & health status"
-        echo "  --sync       Sync code only (no rebuild)"
-        echo "  --build      Sync + rebuild (no restart)"
+        echo "Usage: $0 [option]"
+        echo "  (no args)         Full deploy: sync + build + start"
+        echo "  --deploy-code     Fast: push app/ to shared folder — all containers hot-reload"
+        echo "  --restart         Restart tradeautonom-v3 only (no rebuild)"
+        echo "  --logs            Tail live container logs"
+        echo "  --stop            Stop the container"
+        echo "  --status          Show container & health status"
+        echo "  --sync            Sync entire project code to server (no rebuild)"
+        echo "  --build           Sync + rebuild image (no restart)"
         exit 1
         ;;
 esac

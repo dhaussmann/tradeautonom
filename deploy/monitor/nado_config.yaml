@@ -1,0 +1,84 @@
+# Nado Watchdog Configuration
+# Default active symbols (the 43 that were confirmed working)
+
+default_active_symbols:
+  - BTC-PERP      # product_id: 2
+  - ETH-PERP      # product_id: 4
+  - SOL-PERP      # product_id: 8
+  - XRP-PERP      # product_id: 10
+  - BNB-PERP      # product_id: 14
+  - HYPE-PERP     # product_id: 16
+  - ZEC-PERP      # product_id: 18
+  - FARTCOIN-PERP # product_id: 22
+  - SUI-PERP      # product_id: 24
+  - XAUT-PERP     # product_id: 28
+  - PUMP-PERP     # product_id: 30
+  - TAO-PERP      # product_id: 32
+  - XMR-PERP      # product_id: 34
+  - LIT-PERP      # product_id: 36
+  - kPEPE-PERP    # product_id: 38
+  - PENGU-PERP    # product_id: 40
+  - USELESS-PERP  # product_id: 42
+  - UNI-PERP      # product_id: 46
+  - ASTER-PERP    # product_id: 48
+  - XPL-PERP      # product_id: 50
+  - DOGE-PERP     # product_id: 52
+  - WLFI-PERP     # product_id: 54
+  - kBONK-PERP    # product_id: 56
+  - ZRO-PERP      # product_id: 58
+  - ADA-PERP      # product_id: 60
+  - ARB-PERP      # product_id: 62
+  - AVAX-PERP     # product_id: 64
+  - AXS-PERP      # product_id: 66
+  - BCH-PERP      # product_id: 68
+  - BERA-PERP     # product_id: 70
+  - ENA-PERP      # product_id: 72
+  - LINK-PERP     # product_id: 74
+  - LTC-PERP      # product_id: 76
+  - NEAR-PERP     # product_id: 78
+  - ONDO-PERP     # product_id: 80
+  - SKY-PERP      # product_id: 82
+  - VIRTUAL-PERP  # product_id: 84
+  - JUP-PERP      # product_id: 86
+  - XAG-PERP      # product_id: 88
+  - WTI-PERP      # product_id: 90
+  - EURUSD-PERP   # product_id: 92
+  - GBPUSD-PERP   # product_id: 94
+  - USDJPY-PERP   # product_id: 96
+  - QQQ-PERP      # product_id: 98
+  - SPY-PERP      # product_id: 100
+  - AAPL-PERP     # product_id: 102
+  - AMZN-PERP     # product_id: 104
+  - GOOGL-PERP    # product_id: 106
+  - META-PERP     # product_id: 108
+  - MSFT-PERP     # product_id: 110
+  - NVDA-PERP     # product_id: 112
+  - TSLA-PERP     # product_id: 114
+  - AAVE-PERP     # product_id: 26
+
+# Watchdog configuration
+watchdog:
+  suspect_threshold_seconds: 120      # 2 minutes
+  retry_max_attempts: 10
+  retry_base_delay_seconds: 10        # Exponential backoff starting at 10s
+  retry_max_delay_seconds: 7200       # Max 2 hours
+  reactivation_check_interval_hours: 24
+  state_persistence_path: "/app/data/nado_watchdog_state.json"
+
+# Discovery configuration
+discovery:
+  interval_hours: 24
+  test_duration_seconds: 30
+  nado_api_url: "https://gateway.prod.nado.xyz"
+  
+# WebSocket configuration
+websocket:
+  endpoint: "wss://gateway.prod.nado.xyz/v1/subscribe"
+  subscription_delay_ms: 50           # Delay between subscribe messages
+  connection_timeout_seconds: 5
+  message_timeout_seconds: 30
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s %(name)s %(levelname)s %(message)s"

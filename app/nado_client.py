@@ -163,6 +163,10 @@ class NadoClient:
         self._min_size_cache: dict[str, Decimal] = {}     # symbol -> min qty (base)
         self._min_notional_cache: dict[str, Decimal] = {}  # symbol -> min notional (USD)
         self._size_increment_cache: dict[str, Decimal] = {}  # symbol -> size_increment
+
+        # Shared fill WS state — one connection per client, multiple symbol callbacks
+        self._fill_callbacks: list[tuple[str, object]] = []
+        self._fill_ws_task: object = None
         self._product_type_cache: dict[str, str] = {}     # symbol -> "perp" or "spot"
         self._order_product_cache: dict[str, int] = {}     # digest -> product_id
 
@@ -644,9 +648,13 @@ class NadoClient:
             error_code = resp_data.get("error_code", "")
             raise RuntimeError(f"NADO order failed: {error_msg} (code={error_code})")
 
+        # IOC orders on Nado either fill immediately or are cancelled
+        # Since status="success" means the order was accepted and matched,
+        # the traded_qty equals the full amount
         return {
             "id": digest,
             "status": status,
+            "traded_qty": float(amount),  # IOC = immediate full fill
             "limit_price": float(final_limit),
             "digest": digest,
         }
@@ -954,14 +962,36 @@ class NadoClient:
 
     async def async_create_ioc_order(
         self, symbol: str, side: str, amount: Decimal, price: Decimal,
-        reduce_only: bool = False,
+        reduce_only: bool = False, ioc_slippage_buffer_pct: float = 5.0,
     ) -> dict:
-        """Place an IOC limit order on NADO (taker)."""
+        """Place an IOC limit order on NADO (taker) with aggressive pricing.
+
+        IOC orders on NADO should behave like market orders. Since NADO only supports
+        limit orders, we apply a slippage buffer to ensure immediate execution:
+        - BUY: limit price is 5% higher than requested (clears the ask side)
+        - SELL: limit price is 5% lower than requested (clears the bid side)
+
+        This ensures the order fills completely even if price moves during transmission.
+        """
         import asyncio
+
+        # Apply aggressive slippage buffer for market-like execution
+        buffer_multiplier = Decimal(str(1 + ioc_slippage_buffer_pct / 100))
+        if side.upper() == "BUY":
+            adjusted_price = price * buffer_multiplier
+        else:  # SELL
+            adjusted_price = price / buffer_multiplier
+
+        logger.info(
+            "NADO IOC %s %s qty=%s: original_price=%s → adjusted_price=%s (buffer=%.1f%%) reduce_only=%s",
+            side.upper(), symbol, amount, price, adjusted_price, ioc_slippage_buffer_pct, reduce_only
+        )
+
         appendix = _build_reduce_only_ioc_appendix() if reduce_only else _build_ioc_appendix()
-        logger.info("NADO IOC %s %s qty=%s @ %s reduce_only=%s", side.upper(), symbol, amount, price, reduce_only)
-        result = await asyncio.to_thread(self._place_signed_order, symbol, side, amount, price, appendix)
-        logger.info("NADO IOC placed: digest=%s status=%s", result.get("digest"), result.get("status"))
+        result = await asyncio.to_thread(self._place_signed_order, symbol, side, amount, adjusted_price, appendix)
+        # Add traded_qty for IOC orders (immediate fill)
+        result["traded_qty"] = float(amount)
+        logger.info("NADO IOC placed: digest=%s status=%s traded_qty=%s", result.get("digest"), result.get("status"), result["traded_qty"])
         return result
 
     def _sign_cancellation(self, product_ids: list[int], digests_hex: list[str], nonce: int) -> str:
@@ -1190,35 +1220,49 @@ class NadoClient:
         }
 
     async def async_subscribe_fills(self, symbol: str, callback) -> None:
-        """Subscribe to NADO fill WS stream.
+        """Register a per-symbol fill callback on the shared NADO subaccount WS.
 
-        Endpoint: wss://gateway.prod.nado.xyz/v1/subscribe
-        Stream: fill (per-subaccount, no auth needed)
+        All bots share one WS using a subaccount-level subscription (product_id=null);
+        fills are fanned out by symbol via _product_id_to_symbol mapping.
         """
+        import asyncio
+        self._fill_callbacks.append((symbol, callback))
+        if self._fill_ws_task is None or self._fill_ws_task.done():
+            self._fill_ws_task = asyncio.create_task(
+                self._run_shared_fill_ws(), name="nado-fill-ws-shared"
+            )
+        try:
+            await asyncio.get_event_loop().create_future()
+        except asyncio.CancelledError:
+            self._fill_callbacks = [(s, cb) for s, cb in self._fill_callbacks if cb is not callback]
+            raise
+
+    async def _run_shared_fill_ws(self) -> None:
+        """Single shared WS connection to the NADO subaccount fill stream."""
         import websockets
         import json
+        import asyncio
 
         ws_url = self._gateway_rest.replace("https://", "wss://") + "/subscribe"
-        product_id = self._get_product_id(symbol) if symbol else None
+        # product_id=null subscribes to all fills for the subaccount
+        sub_msg = json.dumps({
+            "method": "subscribe",
+            "stream": {"type": "fill", "subaccount": self._sender_hex, "product_id": None},
+        })
 
-        logger.info("NADO fill WS connecting: %s subaccount=%s", ws_url, self._sender_hex[:20] if self._sender_hex else "?")
+        logger.info("NADO fill WS connecting (shared): %s subaccount=%s",
+                    ws_url, self._sender_hex[:20] if self._sender_hex else "?")
         async for ws in websockets.connect(ws_url, ssl=False):
             try:
-                sub_msg = json.dumps({
-                    "method": "subscribe",
-                    "stream": {
-                        "type": "fill",
-                        "subaccount": self._sender_hex,
-                        "product_id": product_id,
-                    },
-                })
                 await ws.send(sub_msg)
-                logger.info("NADO fill WS subscribed")
+                logger.info("NADO fill WS connected (serving %d callbacks)", len(self._fill_callbacks))
 
                 async for raw in ws:
                     msg = json.loads(raw)
                     if msg.get("type") != "fill":
                         continue
+                    pid = msg.get("product_id", 0)
+                    fill_symbol = self._product_id_to_symbol.get(pid, "")
                     fill = {
                         "order_id": msg.get("order_digest", ""),
                         "filled_qty": abs(float(_from_x18(msg.get("filled_qty", "0")))),
@@ -1226,12 +1270,19 @@ class NadoClient:
                         "price": float(_from_x18(msg.get("price", "0"))),
                         "is_taker": msg.get("is_taker", True),
                         "fee": float(_from_x18(msg.get("fee", "0"))),
-                        "symbol": self._product_id_to_symbol.get(msg.get("product_id", 0), symbol or ""),
+                        "symbol": fill_symbol,
                     }
-                    await callback(fill)
+                    for sym, cb in list(self._fill_callbacks):
+                        if not sym or sym == fill_symbol:
+                            try:
+                                await cb(fill)
+                            except Exception:
+                                pass
             except websockets.ConnectionClosed:
                 logger.warning("NADO fill WS disconnected, reconnecting…")
                 continue
+            except asyncio.CancelledError:
+                break
 
     async def async_subscribe_funding_rate(self, symbol: str, callback) -> None:
         """Subscribe to NADO real-time funding rate WS stream.

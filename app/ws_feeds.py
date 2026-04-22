@@ -255,7 +255,7 @@ class _GrvtFeedThread(threading.Thread):
                 "method": "subscribe",
                 "params": {
                     "stream": "v1.book.s",
-                    "selectors": [f"{self.instrument}@500-10"],
+                    "selectors": [f"{self.instrument}@500-50"],
                 },
                 "id": 1,
             })
@@ -294,20 +294,21 @@ class _GrvtFeedThread(threading.Thread):
         except json.JSONDecodeError:
             return
 
-        # GRVT feed data: {"stream":"v1.book.s","selector":"...","sequence_number":"...","feed":{...}}
-        feed = msg.get("feed")
+        # Full field names: feed/sequence_number/prev_sequence_number, bids/asks
+        # Lite field names: f/sn/psn, b/a
+        feed = msg.get("feed") or msg.get("f")
         if not feed:
             return
 
-        seq = int(msg.get("sequence_number", 0))
-        prev_seq = int(msg.get("prev_sequence_number", 0))
+        seq = int(msg.get("sequence_number") or msg.get("sn") or 0)
+        prev_seq = int(msg.get("prev_sequence_number") or msg.get("psn") or 0)
 
-        bids_raw = feed.get("bids", [])
-        asks_raw = feed.get("asks", [])
+        bids_raw = feed.get("bids") or feed.get("b") or []
+        asks_raw = feed.get("asks") or feed.get("a") or []
 
-        # GRVT format: [{"price": "123.45", "size": "0.5", "num_orders": 1}, ...]
-        bids = [[float(b["price"]), float(b["size"])] for b in bids_raw if "price" in b]
-        asks = [[float(a["price"]), float(a["size"])] for a in asks_raw if "price" in a]
+        # GRVT format: full {"price","size"} or lite {"p","s"}
+        bids = [[float(b.get("price") or b["p"]), float(b.get("size") or b["s"])] for b in bids_raw if b.get("price") or b.get("p")]
+        asks = [[float(a.get("price") or a["p"]), float(a.get("size") or a["s"])] for a in asks_raw if a.get("price") or a.get("p")]
 
         if not bids and not asks:
             return

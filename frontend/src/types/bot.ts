@@ -113,9 +113,32 @@ export interface ActivityEntry {
   extra?: { level?: string }
 }
 
+export interface OhiEntry {
+  exchange?: string
+  ohi: number
+  volume_24h?: number
+  spread_bps?: number
+  depth_usd?: number
+  symmetry?: number
+  spread_score?: number
+  depth_score?: number
+  symmetry_score?: number
+}
+
 export interface OhiInfo {
-  long?: { exchange: string; ohi: number; volume_24h: number; spread_bps?: number; depth_usd?: number } | null
-  short?: { exchange: string; ohi: number; volume_24h: number; spread_bps?: number; depth_usd?: number } | null
+  long?: OhiEntry | null
+  short?: OhiEntry | null
+}
+
+export interface DepthAnalysis {
+  bbo_spread_pct: number
+  exec_spread_pct: number
+  slippage_bps: number
+  is_acceptable: boolean
+  long_fill_price: number
+  short_fill_price: number
+  long_bbo: number
+  short_bbo: number
 }
 
 export interface FundingV4Info {
@@ -144,6 +167,7 @@ export interface BotStatus {
   funding: FundingInfo
   funding_v4?: FundingV4Info | null
   ohi?: OhiInfo | null
+  depth_analysis?: DepthAnalysis | null
   risk: RiskInfo
   feeds_ready: boolean
   data: Record<string, unknown> & { oms_active?: boolean; oms_url?: string | null }

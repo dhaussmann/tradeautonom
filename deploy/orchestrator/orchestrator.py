@@ -328,6 +328,7 @@ async def create_container(request: Request):
             mem_limit=CONTAINER_MEM_LIMIT,
             cpu_period=100000,
             cpu_quota=CONTAINER_CPU_QUOTA,
+            ulimits=[docker.types.Ulimit(name="nofile", soft=65536, hard=65536)],
         )
         state.set(user_id, port, container_name, "running")
         logger.info("Created container %s on port %d for user %s", container_name, port, user_id)

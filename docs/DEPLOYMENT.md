@@ -1,166 +1,279 @@
-# TradeAutonom Deployment Guide
+# TradeAutonom — Deployment Guide
 
-All containers run on a **Synology NAS** (`192.168.133.253`). SSH access via `~/.ssh/id_ed25519`.
-NAS connection settings are in `.env` (`NAS_HOST`, `NAS_USER`, `NAS_DEPLOY_PATH`).
+## Systemübersicht
 
-## Architecture Overview
-
-| Component | Port / URL | Image Tag | Deploy Path | Script |
-|-----------|-----------|-----------|-------------|--------|
-| **Frontend** (Cloudflare Worker) | `bot.defitool.de` | — | Workers KV | `deploy/cloudflare/deploy.sh` |
-| `tradeautonom` (prod) | 8002 | `latest` | `/volume1/docker/tradeautonom` | `deploy/prod/deploy.sh` |
-| `tradeautonom-v2` | 8004 | `v2` | `/volume1/docker/tradeautonom-v2` | `deploy/v2/deploy.sh` |
-| `tradeautonom-v3` (test) | 8005 | `v3` | `/volume1/docker/tradeautonom-v3` | `deploy/v3/deploy.sh` |
-| `ta-user-*` (user containers) | 9001+ | `v3` | shared volume mount | `./deploy.sh` + restart |
-| `tradeautonom-dashboard` | 8003 | `latest` | `/volume1/docker/tradeautonom` | `deploy/dashboard/deploy.sh` |
-| `ta-orchestrator` | 8090 | `latest` | `/volume1/docker/tradeautonom-orchestrator` | `deploy/orchestrator/deploy.sh` |
-
-**Important:** The frontend runs as a **Cloudflare Worker** on `bot.defitool.de`, NOT inside Docker.
-Backend containers share `deploy/prod/Dockerfile` (except dashboard and orchestrator).
-
-## Three Deployment Methods
-
-### 1. Hot-Deploy (Python only, zero-downtime)
-
-```bash
-# From project root
-./deploy.sh                          # Deploy ALL app/*.py files
-./deploy.sh config.py engine.py      # Deploy specific files only
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Cloudflare (Edge)                                               │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Workers + KV  —  bot.defitool.de/*                      │   │
+│  │  Account: CloudflareOne - Demo Account                   │   │
+│  │  Worker: tradeautonom                                    │   │
+│  └─────────────────────┬────────────────────────────────────┘   │
+│                         │ Workers VPC                            │
+└─────────────────────────┼────────────────────────────────────────┘
+                           │
+┌─────────────────────────┼────────────────────────────────────────┐
+│  Server  192.168.133.100                                         │
+│                         │                                        │
+│  ┌──────────────────────▼──────────────┐                        │
+│  │  ta-orchestrator          :8090     │  User-Container-Manager │
+│  └──────────────────────┬──────────────┘                        │
+│                          │ Docker Socket                         │
+│  ┌───────────────────────▼──────────────────────────────────┐   │
+│  │  ta-user-XXXXXXXX  :9001                                 │   │
+│  │  ta-user-YYYYYYYY  :9002   (je ein Container pro User)   │   │
+│  │  ...               :9003..9008                           │   │
+│  │                                                          │   │
+│  │  Image:   tradeautonom:v3                                │   │
+│  │  Code:    /opt/tradeautonom-v3/app  →  /app/app  (ro)   │   │
+│  │  Daten:   ta-data-XXXXXXXX          →  /app/data (rw)   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  tradeautonom-v3   :8005   (Legacy-Testcontainer)                │
+│  oms               :8099   (Shared Orderbook Monitor)            │
+│  portainer         :8000   (Docker UI)                           │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**How it works:**
-- Copies `app/*.py` files via SSH to `/volume1/docker/tradeautonom/app/` on the NAS
-- This directory is bind-mounted read-only into all `ta-user-*` containers at `/app/app`
-- Uvicorn runs with `reload=True, reload_dirs=["/app/app"]` — **but** inotify does not reliably trigger on Synology bind-mounts, so a **manual container restart is required** after deploy
-- Vault auto-inject from D1 happens on next frontend access after restart
+---
 
-**Safety:**
-- Checks all containers (ports 8005, 9001–9006) for active bots before deploying
-- Aborts if any bot is in ENTERING or EXITING state
-- IDLE and HOLDING bots are considered safe (no active TWAP execution)
+## Voraussetzungen
 
-**Limitations:**
-- Only deploys Python backend files (`app/*.py`)
-- Does NOT deploy frontend changes, Dockerfile changes, or dependency changes
-- Only affects containers with the `/volume1/docker/tradeautonom/app/` bind-mount (= `ta-user-*` containers)
-- Does **NOT** affect `tradeautonom-v3` (port 8005) — that container bakes code into the Docker image at build time; use `deploy/v3/deploy.sh` for V3
+**Lokale Maschine:**
+- SSH-Zugang: Key `~/.ssh/id_ed25519` muss auf `root@192.168.133.100` autorisiert sein
+- Node.js + npm (für Cloudflare Frontend-Build)
 
-> **Important:** After hot-deploy, restart all user containers:
-> ```bash
-> ssh dhaussmann@192.168.133.253 'for c in $(/usr/local/bin/docker ps --format "{{.Names}}" | grep "^ta-user-"); do /usr/local/bin/docker restart $c; done'
-> ```
-
-### 2. Full Deploy (Docker rebuild, brief downtime)
-
+**`.env` im Projekt-Root** (wird von allen Deploy-Scripts gelesen):
 ```bash
-# V3 (primary multi-user instance)
-./deploy/v3/deploy.sh                # Full: sync + build + restart
-./deploy/v3/deploy.sh --restart      # Restart only (no rebuild)
-./deploy/v3/deploy.sh --logs         # Tail logs
-./deploy/v3/deploy.sh --status       # Check health
-
-# Production (legacy)
-./deploy/prod/deploy.sh
-
-# V2 (legacy)
-./deploy/v2/deploy.sh
-
-# Dashboard
-./deploy/dashboard/deploy.sh
-
-# Orchestrator (requires ORCH_TOKEN env var)
-ORCH_TOKEN=xxx ./deploy/orchestrator/deploy.sh
+NAS_HOST=192.168.133.100
+NAS_USER=root
+NAS_DEPLOY_PATH=/opt/tradeautonom
 ```
 
-**How it works:**
-1. `cmd_sync` — tars the project (excluding `.venv`, `.git`, `data`, `.env`, etc.) and extracts on NAS
-2. `cmd_build` — runs `docker build` on the NAS using `deploy/prod/Dockerfile`
-3. `cmd_up` — stops old container, starts new one with volume mounts and env
+---
 
-**All deploy scripts support these flags:**
-
-| Flag | Short | Action |
-|------|-------|--------|
-| *(none)* | | Full deploy: sync + build + start |
-| `--restart` | `-r` | Restart container only |
-| `--logs` | `-l` | Tail container logs |
-| `--stop` | `-s` | Stop + remove container |
-| `--status` | `-t` | Show container status + health check |
-| `--sync` | | Sync code only (no build/restart) |
-| `--build` | | Sync + build (no restart) |
-
-### 3. Frontend Deploy (Cloudflare Worker)
+## Typischer Release-Workflow
 
 ```bash
-./deploy/cloudflare/deploy.sh              # Full: build Vue app + deploy Worker
-./deploy/cloudflare/deploy.sh --worker     # Deploy Worker only (skip build)
-./deploy/cloudflare/deploy.sh --build      # Build frontend only (no deploy)
+# 1. Backend-Code deployen (sync + Docker Image bauen)
+./deploy/v3/manage.sh update
+
+# 2. User-Container neu starten (lädt neuen Python-Code)
+ssh root@192.168.133.100 \
+  "for c in \$(docker ps --filter name=ta-user- --format '{{.Names}}'); \
+   do docker restart \$c && echo \"Restarted \$c\"; done"
+
+# 3. Frontend deployen (Build + Cloudflare Workers)
+./deploy/cloudflare/deploy.sh
 ```
 
-**How it works:**
-1. Builds the Vue app from `frontend/` → `frontend/dist/`
-2. Uploads static assets to Workers KV (site bucket configured in `wrangler.jsonc`)
-3. Deploys the Worker to Cloudflare route `bot.defitool.de/*`
+---
 
-**Config:** `deploy/cloudflare/wrangler.jsonc`
-- VPC binding to NAS backend (`192.168.133.253:8090` via orchestrator)
-- D1 database `tradeautonom-history` for trade history
-- Secrets: `INGEST_TOKEN`, `BETTER_AUTH_SECRET`, `ORCH_TOKEN` (set via `wrangler secret put`)
+## 1. Backend — User-Container (`deploy/v3/manage.sh`)
 
-## Typical Deployment Scenarios
+### Code-Update
 
-### Backend-only change (Python files) → User containers
 ```bash
-./deploy.sh server.py dna_bot.py nado_client.py     # 1. Copy files to NAS shared volume
-ssh dhaussmann@192.168.133.253 \                     # 2. Restart all user containers
-  'for c in $(/usr/local/bin/docker ps --format "{{.Names}}" | grep "^ta-user-"); do /usr/local/bin/docker restart $c; done'
+./deploy/v3/manage.sh update
 ```
 
-### Backend-only change → V3 test container (port 8005)
+**Was passiert:**
+1. Projekt wird per SSH+tar auf `192.168.133.100:/opt/tradeautonom-v3` übertragen
+   - Ausgeschlossen: `.venv`, `.git`, `__pycache__`, `*.pyc`, `.env`, `data/`
+2. Docker Image `tradeautonom:v3` wird auf dem Server neu gebaut
+3. Legacy-Testcontainer `ta-testbot1` wird neu gestartet *(kann Port-Konflikt mit User-Containern erzeugen — harmlos, Code ist trotzdem deployed)*
+
+> **Wichtig:** Die produktiven `ta-user-*` Container werden **nicht automatisch** neu gestartet.  
+> Da `app/` als Read-Only-Volume eingebunden ist, muss Python neu gestartet werden um den Code zu laden:
+
 ```bash
-./deploy/v3/deploy.sh                               # Full rebuild (code baked into image)
+ssh root@192.168.133.100 \
+  "for c in \$(docker ps --filter name=ta-user- --format '{{.Names}}'); \
+   do docker restart \$c && echo \"Restarted \$c\"; done"
 ```
 
-### Backend change → ALL containers (V3 + user containers)
+### Weitere Befehle
+
 ```bash
-./deploy/v3/deploy.sh                               # 1. Rebuild V3 image + restart
-./deploy.sh server.py dna_bot.py nado_client.py     # 2. Copy to shared volume
-ssh dhaussmann@192.168.133.253 \                     # 3. Restart user containers
-  'for c in $(/usr/local/bin/docker ps --format "{{.Names}}" | grep "^ta-user-"); do /usr/local/bin/docker restart $c; done'
+./deploy/v3/manage.sh list                  # Alle registrierten User + Ports anzeigen
+./deploy/v3/manage.sh create <user_id>      # Neuen User-Container anlegen
+./deploy/v3/manage.sh start  <user_id>      # Container starten
+./deploy/v3/manage.sh stop   <user_id>      # Container stoppen
+./deploy/v3/manage.sh destroy <user_id>     # Container + Daten löschen (irreversibel!)
+./deploy/v3/manage.sh logs   <user_id>      # Live-Logs (Ctrl+C zum Beenden)
+./deploy/v3/manage.sh status <user_id>      # Container-Status + Health
 ```
 
-### Frontend + Backend change
+### Aufbau eines User-Containers
+
+| Eigenschaft | Wert |
+|---|---|
+| Docker Image | `tradeautonom:v3` |
+| Code-Volume | `/opt/tradeautonom-v3/app` → `/app/app` (read-only, shared) |
+| Daten-Volume | `ta-data-{uid[:8]}` → `/app/data` (persistent, named Docker volume) |
+| Port-Range | 9001 – 9008 |
+| Env-Vars | Direkt vom Orchestrator übergeben (kein `.env`-File im Container) |
+| Restart-Policy | `unless-stopped` |
+| DNS | `1.1.1.1`, `1.0.0.1` |
+
+---
+
+## 2. Orchestrator (`deploy/orchestrator/deploy.sh`)
+
+Der Orchestrator ist verantwortlich für den Lifecycle aller User-Container (erstellen, starten, stoppen, Watchdog).
+
+### Erstes Setup / Rebuild
+
 ```bash
-./deploy.sh config.py engine.py state_machine.py   # 1. Hot-deploy Python
-ssh dhaussmann@192.168.133.253 \                     # 2. Restart user containers
-  'for c in $(/usr/local/bin/docker ps --format "{{.Names}}" | grep "^ta-user-"); do /usr/local/bin/docker restart $c; done'
-./deploy/cloudflare/deploy.sh                       # 3. Build + deploy frontend to CF Worker
+ORCH_TOKEN=<token> ./deploy/orchestrator/deploy.sh
 ```
 
-### Frontend-only change
+**Was passiert:**
+1. `orchestrator.py`, `requirements.txt`, `Dockerfile` → `/opt/tradeautonom-orchestrator/` per SCP
+2. Docker Image `tradeautonom-orchestrator:latest` wird auf dem Server gebaut
+3. Container `ta-orchestrator` wird gestartet mit:
+   - `--network host` (erreicht User-Container auf localhost)
+   - `/var/run/docker.sock` gemountet (Docker API Zugriff)
+   - State-Datei: `/opt/tradeautonom-orchestrator/data/orchestrator_state.json`
+
+### Weitere Befehle
+
+```bash
+ORCH_TOKEN=<token> ./deploy/orchestrator/deploy.sh --restart   # Nur neu starten
+ORCH_TOKEN=<token> ./deploy/orchestrator/deploy.sh --logs      # Live-Logs
+ORCH_TOKEN=<token> ./deploy/orchestrator/deploy.sh --stop      # Stoppen
+ORCH_TOKEN=<token> ./deploy/orchestrator/deploy.sh --status    # Health-Check
+```
+
+### Orchestrator API (manuell)
+
+Alle Requests benötigen Header: `X-Orch-Token: <ORCH_TOKEN>`
+
+```bash
+BASE=http://192.168.133.100:8090
+
+# Alle Container anzeigen
+curl $BASE/orch/containers -H "X-Orch-Token: <token>"
+
+# Container neu erstellen (wenn verloren)
+curl -X POST $BASE/orch/containers \
+  -H "X-Orch-Token: <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "<full_uid>", "port": <port>}'
+
+# Container starten / stoppen
+curl -X POST $BASE/orch/containers/<uid>/start -H "X-Orch-Token: <token>"
+curl -X POST $BASE/orch/containers/<uid>/stop  -H "X-Orch-Token: <token>"
+
+# Logs eines Containers
+curl $BASE/orch/containers/<uid>/logs -H "X-Orch-Token: <token>"
+
+# Health
+curl $BASE/orch/health
+```
+
+---
+
+## 3. Frontend — Cloudflare Workers (`deploy/cloudflare/deploy.sh`)
+
+### Vollständiges Deploy (Standard)
+
 ```bash
 ./deploy/cloudflare/deploy.sh
 ```
 
-### Dependency change (requirements.txt)
-```bash
-./deploy/v3/deploy.sh    # Full Docker rebuild required (V3 + user containers share same image)
-```
+**Was passiert:**
+1. Vue-App wird gebaut: `cd frontend && npm ci && npm run build` → `frontend/dist/`
+2. Worker-Dependencies werden installiert (`deploy/cloudflare/node_modules/`)
+3. `wrangler deploy` lädt neue Assets hoch, entfernt veraltete, deployed den Worker
 
-### Quick restart (no code change)
-```bash
-./deploy/v3/deploy.sh --restart
-```
-
-## Monitoring
+### Optionen
 
 ```bash
-# Health check
-curl http://192.168.133.253:8005/health
-
-# Bot status
-curl http://192.168.133.253:8005/fn/bots
-
-# Container logs
-./deploy/v3/deploy.sh --logs
+./deploy/cloudflare/deploy.sh --worker   # Nur Worker deployen (kein Frontend-Build)
+./deploy/cloudflare/deploy.sh --build    # Nur Frontend bauen (kein Deploy)
 ```
+
+### Konfiguration (`deploy/cloudflare/wrangler.jsonc`)
+
+| Parameter | Wert |
+|---|---|
+| `account_id` | `e52977b75e8923af6487772b5e91c2b8` (CloudflareOne - Demo Account) |
+| Worker Name | `tradeautonom` |
+| Route | `bot.defitool.de/*` |
+| D1 Datenbank | `tradeautonom-history` (`1ae6c186-e7d3-4baf-bc05-f9ba999eca93`) |
+| VPC NAS Backend | Service ID `019d5d2b-cd0c-72b0-ae1e-43dee260ab29` |
+| VPC OMS Backend | Service ID `019d9287-7110-7172-9dec-2442103640b4` |
+| Orchestrator Origin | `http://192.168.133.100:8090` |
+| Cron | Täglich 03:00 UTC (Cleanup) |
+
+### Secrets (einmalig setzen, bleiben auf Cloudflare gespeichert)
+
+```bash
+cd deploy/cloudflare
+npx wrangler secret put ORCH_TOKEN          # Orchestrator Auth-Token
+npx wrangler secret put BETTER_AUTH_SECRET  # Session-Signatur-Secret
+npx wrangler secret put INGEST_TOKEN        # Execution Log Ingest Token
+```
+
+### D1 Datenbank-Migrationen
+
+Neue SQL-Dateien unter `deploy/cloudflare/migrations/` werden folgendermaßen auf Cloudflare angewendet:
+
+```bash
+cd deploy/cloudflare
+npx wrangler d1 migrations apply tradeautonom-history --remote
+```
+
+---
+
+## 4. Dependency-Update (`requirements.txt`)
+
+Wenn sich Python-Pakete ändern, reicht ein Volume-Update nicht — das Docker Image muss neu gebaut und die Container neu erstellt werden:
+
+```bash
+# 1. Image neu bauen
+./deploy/v3/manage.sh update
+
+# 2. Alle User-Container neu starten (nutzen neues Image erst nach Neustart)
+ssh root@192.168.133.100 \
+  "for c in \$(docker ps --filter name=ta-user- --format '{{.Names}}'); \
+   do docker restart \$c && echo \"Restarted \$c\"; done"
+```
+
+---
+
+## Troubleshooting
+
+### `Port already allocated` beim `manage.sh update`
+
+`manage.sh update` versucht am Ende `ta-testbot1` auf Port 9001 zu starten. Da User-Container Port 9001 belegen, schlägt das fehl. **Der Fehler ist harmlos** — Code und Image wurden trotzdem korrekt deployed. User-Container manuell neu starten.
+
+### User-Container fehlen (nach Server-Neustart o.Ä.)
+
+```bash
+# 1. State prüfen
+ssh root@192.168.133.100 "cat /opt/tradeautonom-orchestrator/data/orchestrator_state.json"
+
+# 2. Fehlende Container über API neu erstellen
+curl -X POST http://192.168.133.100:8090/orch/containers \
+  -H "X-Orch-Token: <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "<full_uid>", "port": <port>}'
+```
+
+### Code-Änderungen nach Deploy nicht sichtbar
+
+Python lädt Module beim Start — kein Hot-Reload. Nach jedem Code-Update Container neu starten:
+```bash
+ssh root@192.168.133.100 "docker restart ta-user-<name>"
+```
+
+### Cloudflare-Deploy fragt nach Account
+
+Falls wrangler nach dem Account fragt: `account_id` in `deploy/cloudflare/wrangler.jsonc` prüfen. Muss `e52977b75e8923af6487772b5e91c2b8` sein.
+
+### Frontend-Build schlägt mit TypeScript-Fehler fehl
+
+TypeScript-Typen in `frontend/src/types/bot.ts` müssen zu neuen Backend-Feldern passen. Fehlende Felder dort ergänzen, dann erneut deployen.

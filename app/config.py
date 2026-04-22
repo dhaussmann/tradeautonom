@@ -64,6 +64,7 @@ class Settings(BaseSettings):
 
     # ── Funding-Arb Maker-Taker Engine (new) ─────────────────────────
     # Direction: user-defined per job (which DEX holds long vs short)
+    fn_enabled: bool = True                  # set False to skip legacy single-job engine startup
     fn_long_exchange: str = "extended"        # exchange holding the LONG position
     fn_short_exchange: str = "grvt"           # exchange holding the SHORT position
     fn_maker_exchange: str = "extended"       # exchange used as maker (post-only) side

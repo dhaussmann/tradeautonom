@@ -201,7 +201,7 @@ In Märkten mit 1-Tick-Spread gibt es nur einen gültigen Post-Only-Preis. Tick-
 
 ### 6.3 Step 2b: Maker-Fill Erkennung (`_wait_for_maker_fill`)
 
-**Code:** `state_machine.py` Zeile 1160–1214
+**Code:** `state_machine.py` — `_wait_for_maker_fill()`
 
 Hybrides System aus WS-Events und REST-Polling:
 
@@ -210,11 +210,12 @@ Deadline = now + maker_timeout_ms
 
 while now < deadline:
     1. WS-Fill-Events prüfen (sofort, kein Netzwerk)    ← Primär
+       → wenn Fill via WS: 300ms settle + REST-Confirm (siehe 6.3a)
     2. REST-Poll alle 500ms (async_check_order_fill)      ← Fallback
     3. Auf nächstes WS-Event warten (100ms max)
     4. Wiederholen
 
-Final: WS nochmal prüfen, dann letzter REST-Check
+Final: WS nochmal prüfen (300ms settle + REST), dann letzter REST-Check
 ```
 
 **Warum WS-First?**
@@ -222,13 +223,52 @@ Final: WS nochmal prüfen, dann letzter REST-Check
 - REST-Poll dauert 200-500ms pro Roundtrip
 - WS reduziert die Gesamtlatenz pro Chunk um ~1.7s
 
+### 6.3a WS Fill Settle Window (Extended Batch-Fill Problem)
+
+Extended liefert Fill-Events für denselben Order manchmal in **mehreren schnellen Batches** — z.B. erst 300+98=398 Einheiten, dann 254ms später weitere 7102 Einheiten für denselben Order. Ohne Settle-Window würde der Bot den Taker nach dem ersten Batch (398) platzieren, obwohl der Maker bereits 7500 gefüllt hat → Imbalance von 7102.
+
+**Fix:** Wenn ein WS-Fill eintrifft, wird vor der Rückgabe ein 300ms Settle-Window geöffnet:
+
+```
+Zeitlinie (Extended ADA-Beispiel, 2026-04-22):
+  T+0ms:   WS fill events 300+98 = 398 → fill detected
+  T+0ms:   asyncio.sleep(0.3) beginnt
+  T+254ms: WS fill event 7102 → akkumuliert in _fill_events
+  T+300ms: _get_ws_filled_qty() → 7500
+  T+300ms: REST async_check_order_fill() → filledQty=7500 ✓
+  T+300ms: return {"filled": True, "traded_qty": 7500}
+  → Taker wird korrekt für 7500 platziert
+```
+
+**Code:**
+```python
+ws_qty = self._get_ws_filled_qty(oid)
+if ws_qty > 0:
+    # Settle window: Extended delivers fills in rapid batches
+    await asyncio.sleep(0.3)
+    ws_qty = self._get_ws_filled_qty(oid)  # re-check after settle
+    # REST confirmation to catch fills not yet delivered via WS
+    try:
+        rest_result = await client.async_check_order_fill(oid)
+        rest_qty = float(rest_result.get("traded_qty", 0))
+        if rest_qty > ws_qty:
+            ws_qty = rest_qty  # REST is authoritative when it shows more
+    except Exception:
+        pass
+    return {"filled": True, "traded_qty": ws_qty}
+```
+
+Die 300ms Wartezeit ist vertretbar: sie ist vernachlässigbar gegenüber dem 10s TWAP-Intervall zwischen Chunks und vermeidet Imbalances, die sonst eine Repair-Order auslösen.
+
 ### 6.4 Step 2c: Partial-Fill + Cancel Race Condition
 
-Wenn der Maker nur partiell gefüllt ist und gecancelt wird, gibt es ein Zeitfenster zwischen "Cancel gesendet" und "Cancel verarbeitet", in dem weitere Fills ankommen können:
+Dieser Pfad wird nur bei **REST-erkannten** Partial-Fills durchlaufen (`filled=False, traded_qty>0`). WS-erkannte Fills durchlaufen stattdessen den Settle Window (6.3a).
+
+Wenn der Maker via REST als partiell gefüllt erkannt und gecancelt wird, gibt es ein Zeitfenster zwischen "Cancel gesendet" und "Cancel verarbeitet", in dem weitere Fills ankommen können:
 
 ```
 Zeitlinie:
-  t0: Maker partial fill erkannt (0.9 SOL)
+  t0: Maker partial fill erkannt via REST (0.9 SOL)
   t1: Cancel-Request gesendet
   t2: Weiterer Fill kommt an (0.1 SOL) ← vor Cancel-Verarbeitung
   t3: Cancel verarbeitet (order already fully filled)

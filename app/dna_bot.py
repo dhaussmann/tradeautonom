@@ -296,6 +296,7 @@ class DNABot:
 
         self._running = True
         self._ws_task = asyncio.create_task(self._ws_loop())
+        self._spread_poll_task: asyncio.Task | None = asyncio.create_task(self._spread_poll_loop())
         self._signer_check_task: asyncio.Task | None = None
         if "nado" in self.config.exchanges:
             self._signer_check_task = asyncio.create_task(self._nado_signer_watchdog())
@@ -312,6 +313,12 @@ class DNABot:
             self._ws_task.cancel()
             try:
                 await self._ws_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if getattr(self, "_spread_poll_task", None):
+            self._spread_poll_task.cancel()
+            try:
+                await self._spread_poll_task
             except (asyncio.CancelledError, Exception):
                 pass
         if getattr(self, "_signer_check_task", None):
@@ -396,6 +403,80 @@ class DNABot:
                 self._log_activity("signer_mismatch", msg)
                 await self.stop()
                 break
+        except asyncio.CancelledError:
+            pass
+
+    async def _spread_poll_loop(self) -> None:
+        """Fallback polling: every 60s fetch current spread via OMS REST for all open positions.
+
+        Acts as a safety net for arb_close WS messages that may have been missed during
+        a reconnect. Triggers exit if spread <= exit_threshold_bps and hold time is met.
+        """
+        _POLL_INTERVAL = 60.0
+        try:
+            while self._running:
+                await asyncio.sleep(_POLL_INTERVAL)
+                if not self._running:
+                    break
+
+                now = time.time()
+                candidates = [
+                    p for p in self._positions
+                    if p.status == "open"
+                    and p.exit_mode != "manual"
+                    and (now - p.opened_at) >= p.exit_min_hold_s
+                ]
+                if not candidates:
+                    continue
+
+                oms_base = self.config.oms_url.rstrip("/")
+                for pos in candidates:
+                    url = f"{oms_base}/book/{pos.buy_exchange}/{pos.buy_symbol}"
+                    try:
+                        data_buy = await asyncio.get_event_loop().run_in_executor(
+                            None, self._fetch_json, url,
+                        )
+                        url = f"{oms_base}/book/{pos.sell_exchange}/{pos.sell_symbol}"
+                        data_sell = await asyncio.get_event_loop().run_in_executor(
+                            None, self._fetch_json, url,
+                        )
+                    except Exception as exc:
+                        logger.debug("DNA poll: book fetch error for %s: %s", pos.token, exc)
+                        continue
+
+                    if not data_buy or not data_sell:
+                        continue
+
+                    # Best ask on buy side, best bid on sell side
+                    try:
+                        buy_ask = float(data_buy["asks"][0][0])
+                        sell_bid = float(data_sell["bids"][0][0])
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        continue
+
+                    if buy_ask <= 0:
+                        continue
+
+                    spread_bps = (sell_bid - buy_ask) / buy_ask * 10000
+
+                    logger.debug(
+                        "DNA poll [%s] %s: spread=%.2f bps (threshold=%.2f bps, held=%.0fs)",
+                        pos.position_id, pos.token, spread_bps, pos.exit_threshold_bps,
+                        now - pos.opened_at,
+                    )
+
+                    if spread_bps <= pos.exit_threshold_bps:
+                        logger.info(
+                            "DNA POLL EXIT [%s] %s: spread=%.2f bps ≤ threshold=%.2f bps — closing",
+                            pos.position_id, pos.token, spread_bps, pos.exit_threshold_bps,
+                        )
+                        self._log_activity(
+                            "poll_exit_trigger",
+                            f"[{pos.position_id}] {pos.token}: poll detected spread={spread_bps:.2f}bps "
+                            f"≤ threshold={pos.exit_threshold_bps:.2f}bps — closing",
+                        )
+                        await self._close_position(pos, spread_bps, "arb_closed_poll")
+
         except asyncio.CancelledError:
             pass
 
@@ -597,6 +678,19 @@ class DNABot:
         for p in open_positions:
             if p.token == token and p.buy_exchange == buy_exchange and p.sell_exchange == sell_exchange:
                 return  # already positioned
+
+        # Skip if any open position uses this token on either of the target exchanges.
+        # Prevents accumulating two longs or two shorts for the same token across exchange pairs.
+        occupied_exchange_tokens = set()
+        for p in open_positions:
+            occupied_exchange_tokens.add((p.token, p.buy_exchange))
+            occupied_exchange_tokens.add((p.token, p.sell_exchange))
+        if (token, buy_exchange) in occupied_exchange_tokens or (token, sell_exchange) in occupied_exchange_tokens:
+            logger.debug(
+                "DNA: skipping %s %s→%s — exchange already holds this token in another position",
+                token, buy_exchange, sell_exchange,
+            )
+            return
 
         # Skip excluded tokens
         if token.upper() in (t.upper() for t in self.config.excluded_tokens):
@@ -992,10 +1086,14 @@ class DNABot:
         sell_exchange: str, sell_symbol: str,
         expected_qty: float,
     ) -> None:
-        """Verify actual exchange positions match after a trade.
+        """Verify actual exchange positions match after a trade and repair any delta imbalance.
 
-        Queries both exchanges for the specific symbol, compares sizes,
-        and fires a corrective IOC order if there's an imbalance.
+        Strategy:
+        - diff <= size_tolerance_pct → OK, nothing to do
+        - diff <= 20% of larger side → fill_up: add qty to the smaller side
+        - diff >  20% of larger side → trim_down: reduce the larger side (less risky)
+
+        Uses 2.5s settlement delay to allow Extended's async fill confirmation to complete.
         """
         buy_client = self._clients.get(buy_exchange)
         sell_client = self._clients.get(sell_exchange)
@@ -1003,7 +1101,7 @@ class DNABot:
             return
 
         try:
-            await asyncio.sleep(1.0)  # allow settlement
+            await asyncio.sleep(2.5)  # Extended needs ~0.8s internally + network round-trips
             buy_positions, sell_positions = await asyncio.gather(
                 asyncio.to_thread(buy_client.fetch_positions, [buy_symbol]),
                 asyncio.to_thread(sell_client.fetch_positions, [sell_symbol]),
@@ -1024,62 +1122,77 @@ class DNABot:
 
             if diff_pct <= self.config.size_tolerance_pct:
                 logger.info(
-                    "DNA %s %s: position balance OK — %s=%s %.6f, %s=%s %.6f (diff=%.2f%%)",
-                    position_id, token, buy_exchange, buy_symbol, buy_size,
-                    sell_exchange, sell_symbol, sell_size, diff_pct,
+                    "DNA %s %s: position balance OK — %s %.6f, %s %.6f (diff=%.2f%%)",
+                    position_id, token, buy_exchange, buy_size, sell_exchange, sell_size, diff_pct,
                 )
                 return
 
             logger.warning(
-                "DNA %s %s: POSITION IMBALANCE — %s=%s %.6f, %s=%s %.6f (diff=%.6f, %.2f%%)",
-                position_id, token, buy_exchange, buy_symbol, buy_size,
-                sell_exchange, sell_symbol, sell_size, diff, diff_pct,
+                "DNA %s %s: POSITION IMBALANCE — %s=%.6f, %s=%.6f (diff=%.6f, %.2f%%)",
+                position_id, token, buy_exchange, buy_size, sell_exchange, sell_size, diff, diff_pct,
             )
             self._log_activity("position_imbalance",
                                f"[{position_id}] {token}: {buy_exchange}={buy_size:.6f}, "
                                f"{sell_exchange}={sell_size:.6f} (diff={diff:.6f}, {diff_pct:.2f}%)")
 
-            # Fire corrective order on the side with smaller position
+            # Choose repair strategy:
+            # fill_up  (≤20% diff): add to the smaller side — preserves target notional
+            # trim_down (>20% diff): reduce the larger side — safer, avoids extra market exposure
+            _FILL_UP_THRESHOLD_PCT = 20.0
+            correction_qty = Decimal(str(diff))
+
             if buy_size < sell_size:
-                # Need more on buy side
-                correction_qty = Decimal(str(sell_size - buy_size))
-                correction_client = buy_client
-                correction_symbol = buy_symbol
-                correction_side = "buy"
-                correction_exchange = buy_exchange
+                larger_client, larger_symbol, larger_exchange = sell_client, sell_symbol, sell_exchange
+                smaller_client, smaller_symbol, smaller_exchange = buy_client, buy_symbol, buy_exchange
+                fill_up_side, trim_down_side = "buy", "sell"
             else:
-                # Need more on sell side
-                correction_qty = Decimal(str(buy_size - sell_size))
-                correction_client = sell_client
-                correction_symbol = sell_symbol
-                correction_side = "sell"
-                correction_exchange = sell_exchange
+                larger_client, larger_symbol, larger_exchange = buy_client, buy_symbol, buy_exchange
+                smaller_client, smaller_symbol, smaller_exchange = sell_client, sell_symbol, sell_exchange
+                fill_up_side, trim_down_side = "sell", "buy"
+
+            if diff_pct <= _FILL_UP_THRESHOLD_PCT:
+                # Small imbalance → fill up the smaller side
+                step = self._get_qty_step(smaller_client, smaller_symbol)
+                correction_qty = (correction_qty / step).to_integral_value(rounding="ROUND_DOWN") * step
+                repair_client, repair_symbol, repair_side, repair_exchange = (
+                    smaller_client, smaller_symbol, fill_up_side, smaller_exchange
+                )
+                strategy = "fill_up"
+            else:
+                # Large imbalance → trim down the larger side
+                step = self._get_qty_step(larger_client, larger_symbol)
+                correction_qty = (correction_qty / step).to_integral_value(rounding="ROUND_DOWN") * step
+                repair_client, repair_symbol, repair_side, repair_exchange = (
+                    larger_client, larger_symbol, trim_down_side, larger_exchange
+                )
+                strategy = "trim_down"
+
+            if correction_qty <= 0:
+                logger.warning("DNA %s %s: repair qty rounded to 0 (step too large) — skipping", position_id, token)
+                return
 
             logger.info(
-                "DNA %s %s: firing corrective %s %s %.6f on %s",
-                position_id, token, correction_side, correction_symbol,
-                correction_qty, correction_exchange,
+                "DNA %s %s: repairing delta [%s] — %s %s %.6f on %s",
+                position_id, token, strategy, repair_side, repair_symbol, correction_qty, repair_exchange,
             )
-            corrective = await self._execute_leg(
-                correction_client, correction_symbol, correction_side, correction_qty,
-            )
+            corrective = await self._execute_leg(repair_client, repair_symbol, repair_side, correction_qty)
             if corrective.success:
                 logger.info(
-                    "DNA %s %s: corrective fill OK — %s %.6f on %s",
-                    position_id, token, correction_side, corrective.quantity, correction_exchange,
+                    "DNA %s %s: delta repair OK [%s] — %s %.6f on %s",
+                    position_id, token, strategy, repair_side, corrective.quantity, repair_exchange,
                 )
                 self._log_activity("position_corrected",
-                                   f"[{position_id}] {token}: corrective {correction_side} "
-                                   f"{corrective.quantity:.6f} on {correction_exchange}")
+                                   f"[{position_id}] {token}: delta repair [{strategy}] "
+                                   f"{repair_side} {corrective.quantity:.6f} on {repair_exchange}")
             else:
                 logger.error(
-                    "DNA %s %s: CORRECTIVE FAILED — %s %s on %s: %s",
-                    position_id, token, correction_side, correction_symbol,
-                    correction_exchange, corrective.error,
+                    "DNA %s %s: DELTA REPAIR FAILED [%s] — %s %s on %s: %s",
+                    position_id, token, strategy, repair_side, repair_symbol,
+                    repair_exchange, corrective.error,
                 )
                 self._log_activity("corrective_failed",
-                                   f"[{position_id}] {token}: corrective {correction_side} on "
-                                   f"{correction_exchange} FAILED: {corrective.error}")
+                                   f"[{position_id}] {token}: delta repair [{strategy}] "
+                                   f"{repair_side} on {repair_exchange} FAILED: {corrective.error}")
 
         except Exception as exc:
             logger.warning("DNA %s %s: position balance check error: %s", position_id, token, exc)

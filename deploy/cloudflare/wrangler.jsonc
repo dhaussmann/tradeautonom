@@ -1,5 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
+	"account_id": "e52977b75e8923af6487772b5e91c2b8",
 	"name": "tradeautonom",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-04-05",

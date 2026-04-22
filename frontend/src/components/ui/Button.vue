@@ -58,9 +58,16 @@ defineEmits<{ click: [e: MouseEvent] }>()
 }
 
 /* ── Sizes ── */
-.Button--sm { height: 32px; padding: 0 var(--space-3); font-size: var(--text-sm); }
-.Button--md { height: 40px; padding: 0 var(--space-4); }
-.Button--lg { height: 48px; padding: 0 var(--space-6); font-size: var(--text-lg); }
+.Button--sm { height: 32px; padding: 0 var(--space-3); font-size: var(--text-sm); min-width: var(--touch-target-min); }
+.Button--md { height: 40px; padding: 0 var(--space-4); min-width: var(--touch-target-min); }
+.Button--lg { height: 48px; padding: 0 var(--space-6); font-size: var(--text-lg); min-width: var(--touch-target-comfortable); }
+
+/* Mobile: Ensure touch-friendly minimum sizes */
+@media (max-width: 767px) and (hover: none) and (pointer: coarse) {
+  .Button--sm { height: 40px; padding: 0 var(--space-4); }
+  .Button--md { height: 44px; padding: 0 var(--space-5); }
+  .Button--lg { height: 52px; padding: 0 var(--space-6); font-size: var(--text-lg); }
+}
 
 /* ── Outline ── */
 .Button--outline {

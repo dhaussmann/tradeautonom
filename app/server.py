@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -189,15 +189,16 @@ async def _init_exchange_clients():
         _activity_forwarder.start()
 
     # ── Funding-Arb engine (legacy single-bot — kept for backward compat) ──
-    try:
-        fn_config = EngineConfig.from_settings(_settings, job_id="default")
-        _fn_engine = FundingArbEngine(config=fn_config, clients=_exchange_clients, activity_forwarder=_activity_forwarder)
-        await _fn_engine.start()
-        logger.info("FundingArbEngine started: long=%s short=%s maker=%s",
-                    fn_config.long_exchange, fn_config.short_exchange, fn_config.maker_exchange)
-    except Exception as exc:
-        logger.warning("FundingArbEngine failed to start (non-fatal): %s", exc)
-        _fn_engine = None
+    if _settings.fn_enabled:
+        try:
+            fn_config = EngineConfig.from_settings(_settings, job_id="default")
+            _fn_engine = FundingArbEngine(config=fn_config, clients=_exchange_clients, activity_forwarder=_activity_forwarder)
+            await _fn_engine.start()
+            logger.info("FundingArbEngine started: long=%s short=%s maker=%s",
+                        fn_config.long_exchange, fn_config.short_exchange, fn_config.maker_exchange)
+        except Exception as exc:
+            logger.warning("FundingArbEngine failed to start (non-fatal): %s", exc)
+            _fn_engine = None
 
     # ── Bot Registry (multi-bot v2) ────────────────────────────────
     try:
@@ -289,6 +290,10 @@ async def _shutdown_exchange_clients():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio as _asyncio
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    _asyncio.get_running_loop().set_default_executor(_TPE(max_workers=64))
+
     global _settings, _current_password
     _settings = Settings()
     # Check if auth is set up AND we have plaintext secrets (legacy migration)
@@ -901,11 +906,11 @@ def _extract_token(instrument: str) -> str:
 
 
 @app.get("/portfolio/stream")
-async def portfolio_stream(interval_ms: int = 3000):
+async def portfolio_stream(request: Request, interval_ms: int = 3000):
     """SSE stream: consolidated positions + funding from all exchanges."""
 
     async def event_generator():
-        while True:
+        while not await request.is_disconnected():
             try:
                 exchanges = {}
                 for exchange_name, client in _exchange_clients.items():
@@ -1437,7 +1442,7 @@ async def job_clear_trade_log(job_id: str):
 
 
 @app.get("/jobs/{job_id}/spread-stream")
-async def job_spread_stream(job_id: str, interval_ms: int = 1000):
+async def job_spread_stream(request: Request, job_id: str, interval_ms: int = 1000):
     """SSE real-time spread stream for a specific job."""
     try:
         _job_manager.get_job(job_id)
@@ -1445,7 +1450,7 @@ async def job_spread_stream(job_id: str, interval_ms: int = 1000):
         raise HTTPException(status_code=404, detail=str(exc))
 
     async def event_generator():
-        while True:
+        while not await request.is_disconnected():
             try:
                 job = _job_manager.get_job(job_id)
                 snapshot = job.engine.get_spread_snapshot()
@@ -1752,12 +1757,12 @@ async def fn_data():
 
 
 @app.get("/fn/stream")
-async def fn_stream(interval_ms: int = 2000):
+async def fn_stream(request: Request, interval_ms: int = 2000):
     """SSE stream for real-time funding-arb dashboard updates."""
     engine = _require_fn_engine()
 
     async def event_generator():
-        while True:
+        while not await request.is_disconnected():
             try:
                 now = time.time()
                 remaining_s = None
@@ -1875,8 +1880,47 @@ async def fn_bot_funding(bot_id: str):
 async def fn_bot_start(bot_id: str, req: dict | None = None):
     """Start a specific bot."""
     engine = _require_bot(bot_id)
+    
+    # Try to dynamically subscribe missing symbols
+    if engine._data_layer and hasattr(engine._data_layer, 'add_symbols'):
+        symbols = {
+            engine.config.long_exchange: engine.config.instrument_a,
+            engine.config.short_exchange: engine.config.instrument_b,
+        }
+        # Check which symbols are missing
+        missing = {}
+        for exch, sym in symbols.items():
+            snap = engine._data_layer.get_orderbook(exch, sym)
+            if not snap or not snap.connected:
+                missing[exch] = sym
+        
+        if missing:
+            logger.info("Server: Dynamically subscribing missing symbols for %s: %s", bot_id, missing)
+            results = await engine._data_layer.add_symbols(missing)
+            failed = [sym for sym, success in results.items() if not success]
+            if failed:
+                logger.warning("Server: Some OMS subscriptions failed for %s: %s", bot_id, failed)
+    
+    # Check if ready (with short delay for subscriptions to process)
+    # Be lenient: if OMS is disconnected, still allow start with REST fallback
     if engine._data_layer and not engine._data_layer.is_ready():
-        raise HTTPException(status_code=409, detail="Orderbook feeds not ready.")
+        # Check if we have the symbols at all (even stale is OK - REST will refresh)
+        symbols_ready = True
+        for exch in [engine.config.long_exchange, engine.config.short_exchange]:
+            sym = engine.config.instrument_a if exch == engine.config.long_exchange else engine.config.instrument_b
+            snap = engine._data_layer.get_orderbook(exch, sym)
+            if not snap:  # Symbol not even in cache
+                symbols_ready = False
+                break
+        
+        if not symbols_ready:
+            # Wait a bit for subscriptions to process
+            await asyncio.sleep(2.0)
+            if not engine._data_layer.is_ready():
+                raise HTTPException(status_code=409, detail="Orderbook feeds not ready.")
+        else:
+            logger.info("Server: Allowing %s start with REST fallback (OMS may be disconnected)", bot_id)
+    
     body = req or {}
 
     async def _run_entry():
@@ -2048,12 +2092,12 @@ async def fn_bot_log(bot_id: str, since_seq: int = 0, limit: int = 100):
 
 
 @app.get("/fn/bots/{bot_id}/stream")
-async def fn_bot_stream(bot_id: str, interval_ms: int = 2000):
+async def fn_bot_stream(request: Request, bot_id: str, interval_ms: int = 2000):
     """SSE stream for a specific bot."""
     engine = _require_bot(bot_id)
 
     async def event_generator():
-        while True:
+        while not await request.is_disconnected():
             try:
                 now = time.time()
                 remaining_s = None
@@ -2085,6 +2129,11 @@ async def fn_bot_stream(bot_id: str, interval_ms: int = 2000):
                         "long": engine._data_layer.get_orderbook_depth(engine.config.long_exchange, engine.config.instrument_a, depth=10) if engine._data_layer else {},
                         "short": engine._data_layer.get_orderbook_depth(engine.config.short_exchange, engine.config.instrument_b, depth=10) if engine._data_layer else {},
                     } if engine._data_layer and engine.config.instrument_a and engine.config.instrument_b else {},
+                    "ohi": {
+                        "long": engine._data_layer.get_orderbook_health(engine.config.long_exchange, engine.config.instrument_a),
+                        "short": engine._data_layer.get_orderbook_health(engine.config.short_exchange, engine.config.instrument_b),
+                    } if engine._data_layer and engine.config.instrument_a and engine.config.instrument_b else {},
+                    "depth_analysis": engine._compute_depth_analysis_for_status(),
                     "activity_log": engine.get_activity_log(limit=50),
                     "config": {
                         "long_exchange": engine.config.long_exchange,
@@ -2100,6 +2149,17 @@ async def fn_bot_stream(bot_id: str, interval_ms: int = 2000):
                         "max_spread_pct": engine.config.max_spread_pct,
                         "duration_h": engine.config.duration_h,
                         "duration_m": engine.config.duration_m,
+                        "fn_opt_depth_spread": engine.config.fn_opt_depth_spread,
+                        "fn_opt_max_slippage_bps": engine.config.fn_opt_max_slippage_bps,
+                        "fn_opt_ohi_monitoring": engine.config.fn_opt_ohi_monitoring,
+                        "fn_opt_min_ohi": engine.config.fn_opt_min_ohi,
+                        "fn_opt_funding_history": engine.config.fn_opt_funding_history,
+                        "fn_opt_min_funding_consistency": engine.config.fn_opt_min_funding_consistency,
+                        "fn_opt_dynamic_sizing": engine.config.fn_opt_dynamic_sizing,
+                        "fn_opt_shared_monitor_url": engine.config.fn_opt_shared_monitor_url,
+                        "fn_opt_taker_drift_guard": engine.config.fn_opt_taker_drift_guard,
+                        "fn_opt_max_taker_drift_bps": engine.config.fn_opt_max_taker_drift_bps,
+                        "min_spread_pct": engine.config.min_spread_pct,
                     },
                     "ts": now,
                 }

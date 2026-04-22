@@ -14,6 +14,11 @@ const routes = [
     component: () => import('@/views/DashboardView.vue'),
   },
   {
+    path: '/bots',
+    name: 'bots',
+    component: () => import('@/views/BotsView.vue'),
+  },
+  {
     path: '/bot/:botId',
     name: 'bot-detail',
     component: () => import('@/views/BotDetailView.vue'),

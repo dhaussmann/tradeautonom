@@ -178,7 +178,7 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
         </div>
       </div>
 
-      <!-- Positions Table per Exchange -->
+      <!-- Positions: Desktop Table -->
       <div v-for="ex in exchangeList" :key="'t-' + ex.exchange" :class="$style.tableSection">
         <div v-if="ex.positions.length" :class="$style.tableSectionHeader">
           <Typography size="text-md" weight="semibold" :style="{ color: exchangeColor(ex.exchange) }">
@@ -187,6 +187,7 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
           <Typography size="text-xs" color="tertiary">{{ ex.positions.length }} position{{ ex.positions.length !== 1 ? 's' : '' }}</Typography>
         </div>
 
+        <!-- Desktop Table -->
         <div v-if="ex.positions.length" :class="$style.tableWrap">
           <table :class="$style.table">
             <thead>
@@ -236,7 +237,6 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
                 <td>
                   <Typography
                     size="text-sm"
-                    weight="medium"
                     :color="pos.realized_pnl > 0 ? 'success' : pos.realized_pnl < 0 ? 'error' : 'secondary'"
                   >{{ pos.realized_pnl ? formatUsd(pos.realized_pnl) : '—' }}</Typography>
                 </td>
@@ -266,6 +266,78 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
             </tbody>
           </table>
         </div>
+
+        <!-- Mobile Cards -->
+        <div v-if="ex.positions.length" :class="$style.mobileCards">
+          <div
+            v-for="(pos, i) in ex.positions"
+            :key="i"
+            :class="$style.positionCard"
+          >
+            <div :class="$style.cardHeader">
+              <div :class="$style.cardTitle">
+                <Typography size="text-md" weight="semibold">{{ pos.token }}</Typography>
+                <Chip :variant="pos.side === 'LONG' ? 'long' : 'short'" size="sm">
+                  {{ pos.side }}
+                </Chip>
+              </div>
+              <Typography size="text-xs" color="tertiary">{{ pos.instrument }}</Typography>
+            </div>
+
+            <div :class="$style.cardBody">
+              <div :class="$style.cardRow">
+                <span :class="$style.cardLabel">Size</span>
+                <Typography size="text-sm" weight="medium">{{ pos.size }}</Typography>
+              </div>
+              <div :class="$style.cardRow">
+                <span :class="$style.cardLabel">Entry</span>
+                <Typography size="text-sm" color="secondary">{{ formatPrice(pos.entry_price) }}</Typography>
+              </div>
+              <div :class="$style.cardRow">
+                <span :class="$style.cardLabel">Mark</span>
+                <Typography size="text-sm">{{ formatPrice(pos.mark_price) }}</Typography>
+              </div>
+              <div :class="$style.cardRow">
+                <span :class="$style.cardLabel">Leverage</span>
+                <Typography size="text-sm" color="secondary">{{ pos.leverage ? `${pos.leverage}x` : '—' }}</Typography>
+              </div>
+            </div>
+
+            <div :class="$style.cardFooter">
+              <div :class="$style.cardStat">
+                <span :class="$style.cardLabel">uPnL</span>
+                <Typography
+                  size="text-md"
+                  weight="bold"
+                  :color="pos.unrealized_pnl >= 0 ? 'success' : 'error'"
+                >{{ formatUsd(pos.unrealized_pnl) }}</Typography>
+              </div>
+              <div :class="$style.cardStat">
+                <span :class="$style.cardLabel">Total PnL</span>
+                <Typography
+                  size="text-md"
+                  weight="bold"
+                  :color="pos.total_pnl >= 0 ? 'success' : 'error'"
+                >{{ formatUsd(pos.total_pnl) }}</Typography>
+              </div>
+              <div :class="$style.cardStat">
+                <span :class="$style.cardLabel">Funding</span>
+                <Typography
+                  size="text-sm"
+                  :color="pos.cumulative_funding > 0 ? 'success' : pos.cumulative_funding < 0 ? 'error' : 'secondary'"
+                >{{ pos.cumulative_funding ? formatUsd(pos.cumulative_funding) : '—' }}</Typography>
+              </div>
+            </div>
+
+            <div v-if="pos.funding_rate" :class="$style.cardRate">
+              <Typography size="text-xs" color="tertiary">Funding Rate</Typography>
+              <Typography
+                size="text-sm"
+                :color="pos.funding_rate > 0 ? 'error' : 'success'"
+              >{{ formatFunding(pos.funding_rate) }}</Typography>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- Empty state -->
@@ -284,7 +356,7 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
         <Typography color="error">{{ pairsError }}</Typography>
       </div>
 
-      <!-- Matched Pairs -->
+      <!-- Matched Pairs: Desktop -->
       <div v-if="matchedPairs.length" :class="$style.pairsGrid">
         <div
           v-for="(pair, idx) in matchedPairs"
@@ -296,7 +368,7 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
             <Chip :variant="sourceVariant(pair.source)" size="sm">{{ sourceLabel(pair.source) }}</Chip>
           </div>
 
-          <!-- Pair positions table -->
+          <!-- Desktop Pair Table -->
           <div :class="$style.tableWrap">
             <table :class="$style.table">
               <thead>
@@ -339,6 +411,83 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
             </table>
           </div>
 
+          <!-- Mobile Pair Cards -->
+          <div :class="$style.mobilePairCards">
+            <!-- Long Position -->
+            <div v-if="pair.long" :class="$style.positionCard">
+              <div :class="$style.cardHeader">
+                <div :class="$style.cardTitle">
+                  <Typography size="text-md" weight="semibold">LONG</Typography>
+                  <Chip variant="long" size="sm">LONG</Chip>
+                </div>
+                <Typography size="text-xs" color="tertiary" :style="{ color: exchangeColor(pair.long.exchange) }">
+                  {{ pair.long.exchange.toUpperCase() }}
+                </Typography>
+              </div>
+              <div :class="$style.cardBody">
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Size</span>
+                  <Typography size="text-sm">{{ pair.long.size }}</Typography>
+                </div>
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Entry</span>
+                  <Typography size="text-sm" color="secondary">{{ formatPrice(pair.long.entry_price) }}</Typography>
+                </div>
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Mark</span>
+                  <Typography size="text-sm">{{ formatPrice(pair.long.mark_price) }}</Typography>
+                </div>
+              </div>
+              <div :class="$style.cardFooter">
+                <div :class="$style.cardStat">
+                  <span :class="$style.cardLabel">uPnL</span>
+                  <Typography size="text-sm" weight="bold" :color="pair.long.unrealized_pnl >= 0 ? 'success' : 'error'">{{ formatUsd(pair.long.unrealized_pnl) }}</Typography>
+                </div>
+                <div :class="$style.cardStat">
+                  <span :class="$style.cardLabel">Funding</span>
+                  <Typography size="text-xs" :color="pair.long.cumulative_funding > 0 ? 'success' : 'error'">{{ formatUsd(pair.long.cumulative_funding) }}</Typography>
+                </div>
+              </div>
+            </div>
+
+            <!-- Short Position -->
+            <div v-if="pair.short" :class="$style.positionCard">
+              <div :class="$style.cardHeader">
+                <div :class="$style.cardTitle">
+                  <Typography size="text-md" weight="semibold">SHORT</Typography>
+                  <Chip variant="short" size="sm">SHORT</Chip>
+                </div>
+                <Typography size="text-xs" color="tertiary" :style="{ color: exchangeColor(pair.short.exchange) }">
+                  {{ pair.short.exchange.toUpperCase() }}
+                </Typography>
+              </div>
+              <div :class="$style.cardBody">
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Size</span>
+                  <Typography size="text-sm">{{ pair.short.size }}</Typography>
+                </div>
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Entry</span>
+                  <Typography size="text-sm" color="secondary">{{ formatPrice(pair.short.entry_price) }}</Typography>
+                </div>
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Mark</span>
+                  <Typography size="text-sm">{{ formatPrice(pair.short.mark_price) }}</Typography>
+                </div>
+              </div>
+              <div :class="$style.cardFooter">
+                <div :class="$style.cardStat">
+                  <span :class="$style.cardLabel">uPnL</span>
+                  <Typography size="text-sm" weight="bold" :color="pair.short.unrealized_pnl >= 0 ? 'success' : 'error'">{{ formatUsd(pair.short.unrealized_pnl) }}</Typography>
+                </div>
+                <div :class="$style.cardStat">
+                  <span :class="$style.cardLabel">Funding</span>
+                  <Typography size="text-xs" :color="pair.short.cumulative_funding > 0 ? 'success' : 'error'">{{ formatUsd(pair.short.cumulative_funding) }}</Typography>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- Combined PnL footer -->
           <div :class="$style.pairFooter">
             <div :class="$style.pairStat">
@@ -361,7 +510,7 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
         </div>
       </div>
 
-      <!-- Unmatched positions -->
+      <!-- Unmatched positions: Desktop -->
       <div v-if="unmatchedPairs.length" :class="$style.tableSection">
         <div :class="$style.tableSectionHeader">
           <Typography size="text-md" weight="semibold">Unmatched Positions</Typography>
@@ -408,6 +557,57 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
               </tr>
             </tbody>
           </table>
+        </div>
+
+        <!-- Unmatched Mobile Cards -->
+        <div :class="$style.mobileCards">
+          <div
+            v-for="(pair, idx) in unmatchedPairs"
+            :key="'um-mobile-' + idx"
+            :class="$style.positionCard"
+          >
+            <div v-if="pair.long || pair.short" :class="$style.cardContent">
+              <div :class="$style.cardHeader">
+                <div :class="$style.cardTitle">
+                  <Typography size="text-md" weight="semibold">{{ pair.token }}</Typography>
+                  <Chip :variant="(pair.long || pair.short)!.side === 'LONG' ? 'long' : 'short'" size="sm">
+                    {{ (pair.long || pair.short)!.side }}
+                  </Chip>
+                </div>
+                <Typography size="text-xs" color="tertiary" :style="{ color: exchangeColor((pair.long || pair.short)!.exchange) }">
+                  {{ (pair.long || pair.short)!.exchange.toUpperCase() }}
+                </Typography>
+              </div>
+              <div :class="$style.cardBody">
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Size</span>
+                  <Typography size="text-sm">{{ (pair.long || pair.short)!.size }}</Typography>
+                </div>
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Entry</span>
+                  <Typography size="text-sm" color="secondary">{{ formatPrice((pair.long || pair.short)!.entry_price) }}</Typography>
+                </div>
+                <div :class="$style.cardRow">
+                  <span :class="$style.cardLabel">Mark</span>
+                  <Typography size="text-sm">{{ formatPrice((pair.long || pair.short)!.mark_price) }}</Typography>
+                </div>
+              </div>
+              <div :class="$style.cardFooter">
+                <div :class="$style.cardStat">
+                  <span :class="$style.cardLabel">uPnL</span>
+                  <Typography size="text-sm" weight="bold" :color="((pair.long || pair.short)!.unrealized_pnl || 0) >= 0 ? 'success' : 'error'">
+                    {{ formatUsd((pair.long || pair.short)!.unrealized_pnl) }}
+                  </Typography>
+                </div>
+                <div :class="$style.cardStat">
+                  <span :class="$style.cardLabel">Total</span>
+                  <Typography size="text-sm" weight="bold" :color="((pair.long || pair.short)!.unrealized_pnl + ((pair.long || pair.short)!.realized_pnl || 0)) >= 0 ? 'success' : 'error'">
+                    {{ formatUsd((pair.long || pair.short)!.unrealized_pnl + ((pair.long || pair.short)!.realized_pnl || 0)) }}
+                  </Typography>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Unmatched summary footer -->
@@ -507,6 +707,7 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
   font-weight: 500;
   cursor: pointer;
   transition: all 0.15s ease;
+  min-height: var(--touch-target-min);
 }
 
 .tab:hover {
@@ -522,10 +723,12 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
 .exchangeCards {
   display: flex;
   gap: var(--space-4);
+  flex-wrap: wrap;
 }
 
 .exchangeCard {
   flex: 1;
+  min-width: 200px;
   border-radius: var(--radius-xl);
   border: 1px solid var(--color-stroke-divider);
   background: var(--color-white-2);
@@ -646,11 +849,178 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
   padding: var(--space-4) var(--space-5);
   border-top: 1px solid var(--color-stroke-divider);
   background: var(--color-white-4);
+  flex-wrap: wrap;
 }
 
 .pairStat {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+/* ===== MOBILE POSITION CARDS ===== */
+.mobileCards {
+  display: none;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.positionCard {
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-2);
+  overflow: hidden;
+}
+
+.cardHeader {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-4);
+}
+
+.cardTitle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.cardBody {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-3);
+  padding: var(--space-4);
+}
+
+.cardRow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cardLabel {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.cardFooter {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-top: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-4);
+}
+
+.cardStat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cardRate {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-stroke-divider);
+}
+
+/* Mobile Pair Cards (hidden on desktop) */
+.mobilePairCards {
+  display: none;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+}
+
+/* ===== RESPONSIVE BREAKPOINTS ===== */
+
+/* Tablet */
+@media (max-width: 1024px) {
+  .page {
+    padding: 24px 20px;
+  }
+
+  .exchangeCards {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .exchangeCard {
+    min-width: auto;
+  }
+}
+
+/* Mobile */
+@media (max-width: 767px) {
+  .page {
+    padding: 16px;
+    gap: var(--space-4);
+  }
+
+  .header {
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .totalPnl {
+    text-align: left;
+  }
+
+  .tabs {
+    width: 100%;
+  }
+
+  .tab {
+    flex: 1;
+    text-align: center;
+    padding: var(--space-3) var(--space-2);
+  }
+
+  .exchangeCards {
+    grid-template-columns: 1fr;
+  }
+
+  /* Hide desktop table on mobile */
+  .tableWrap {
+    display: none;
+  }
+
+  /* Show mobile cards */
+  .mobileCards {
+    display: flex;
+  }
+
+  /* Show mobile pair cards */
+  .mobilePairCards {
+    display: flex;
+  }
+
+  .pairFooter {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-4);
+  }
+}
+
+/* Small mobile */
+@media (max-width: 480px) {
+  .cardBody {
+    grid-template-columns: 1fr;
+  }
+
+  .cardFooter {
+    grid-template-columns: 1fr;
+    gap: var(--space-3);
+  }
+
+  .pairFooter {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

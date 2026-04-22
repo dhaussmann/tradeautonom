@@ -116,4 +116,20 @@
   --ease-in-1:    cubic-bezier(0.88, -0.06, 0.80, 0.96);
   --ease-inout-1: cubic-bezier(0.88, 0.04, 0.12, 1.06);
   --ease-inout-2: cubic-bezier(0.77, 0.09, 0.23, 1.13);
+
+  /* ── Mobile Breakpoints ─────────────────────── */
+  --breakpoint-sm: 480px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+  --breakpoint-xl: 1400px;
+
+  /* ── Touch Targets ──────────────────────────── */
+  --touch-target-min: 44px;
+  --touch-target-comfortable: 48px;
+
+  /* ── Mobile Safe Areas ──────────────────────── */
+  --safe-area-inset-top: env(safe-area-inset-top, 0px);
+  --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-inset-left: env(safe-area-inset-left, 0px);
+  --safe-area-inset-right: env(safe-area-inset-right, 0px);
 }

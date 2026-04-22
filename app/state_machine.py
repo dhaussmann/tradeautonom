@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 from app.spread_analyzer import analyze_cross_venue_spread, SpreadAnalysis
 from app.execution_logger import ExecutionLogger, new_execution_id
+from app.safety import walk_book
 
 logger = logging.getLogger("tradeautonom.state_machine")
 
@@ -120,6 +121,10 @@ class MakerTakerConfig:
     max_slippage_bps: float = 10.0
     taker_drift_guard: bool = False
     max_taker_drift_bps: float = 3.0
+    ohi_monitoring: bool = False
+    min_ohi: float = 0.4
+    long_exchange: str = ""
+    short_exchange: str = ""
 
 
 class StateMachine:
@@ -177,6 +182,9 @@ class StateMachine:
         self._execution_logger = execution_logger
         self._funding_monitor = funding_monitor
 
+        # Last depth spread analysis (cached for status reporting)
+        self.last_depth_analysis: SpreadAnalysis | None = None
+
     # ── Public API ────────────────────────────────────────────────────────
 
     @property
@@ -218,8 +226,15 @@ class StateMachine:
 
         Triggered manually by the user.
         """
+        self._log("ENGINE", f"=== ENTRY STARTED ===")
+        self._log("ENGINE", f"Config: maker={config.maker_exchange}:{config.maker_symbol} side={config.maker_side}")
+        self._log("ENGINE", f"Config: taker={config.taker_exchange}:{config.taker_symbol} side={config.taker_side}")
+        self._log("ENGINE", f"Config: qty={config.total_qty}, chunks={config.num_chunks}, interval={config.chunk_interval_s}s")
+
         if self._state != JobState.IDLE:
-            raise RuntimeError(f"Cannot enter: state is {self._state.value}, expected IDLE")
+            err_msg = f"Cannot enter: state is {self._state.value}, expected IDLE"
+            self._log("ENGINE", err_msg, level="error")
+            raise RuntimeError(err_msg)
 
         self._transition(JobState.ENTERING)
         self._long_exchange = config.taker_exchange if config.maker_side == "sell" else config.maker_exchange
@@ -227,23 +242,33 @@ class StateMachine:
         self._long_symbol = config.taker_symbol if config.maker_side == "sell" else config.maker_symbol
         self._short_symbol = config.taker_symbol if config.maker_side == "buy" else config.maker_symbol
 
+        self._log("ENGINE", f"Long position: {self._long_exchange}:{self._long_symbol}")
+        self._log("ENGINE", f"Short position: {self._short_exchange}:{self._short_symbol}")
+
         result = await self._execute_maker_taker(config, action="ENTER")
 
         # Compute VWAP entry prices from chunk results
         self._compute_entry_prices(result, config)
 
         # Position qty already updated incrementally per chunk in _execute_maker_taker
+        entry_duration_sec = result.end_ts - result.start_ts if result.end_ts else 0
         if result.success:
+            self._log("ENGINE", f"=== ENTRY SUCCESS === Duration: {entry_duration_sec:.1f}s, Final state: HOLDING")
             self._transition(JobState.HOLDING)
         else:
+            self._log("ENGINE", f"=== ENTRY FAILED === Duration: {entry_duration_sec:.1f}s, Error: {result.error}")
+            self._log("ENGINE", f"Entry result: maker_qty={result.total_maker_qty:.6f}, taker_qty={result.total_taker_qty:.6f}, chunks={len(result.chunks)}")
             if result.total_maker_qty > 0 and result.total_taker_qty == 0:
+                self._log("ENGINE", "CRITICAL: Maker filled but taker did not — initiating emergency unwind", level="error")
                 logger.error("Entry failed: maker filled but taker did not — emergency unwind")
                 await self._emergency_unwind(config, result)
                 self._transition(JobState.IDLE)
             elif result.total_maker_qty == 0:
+                self._log("ENGINE", "Entry failed: No fills — returning to IDLE", level="warn")
                 logger.warning("Entry failed: no fills — returning to IDLE")
                 self._transition(JobState.IDLE)
             else:
+                self._log("ENGINE", f"Entry partial: maker={result.total_maker_qty:.6f} taker={result.total_taker_qty:.6f} — holding partial position", level="warn")
                 logger.warning("Entry partial: maker=%.6f taker=%.6f — holding partial position",
                                result.total_maker_qty, result.total_taker_qty)
                 self._transition(JobState.HOLDING)
@@ -442,22 +467,23 @@ class StateMachine:
             logger.warning("Failed to load fn position state: %s", exc)
             return False
 
-    async def sync_position_from_exchange(self) -> None:
+    async def sync_position_from_exchange(self) -> bool:
         """After restoring from disk, query actual exchange positions and overwrite
         _long_qty / _short_qty with real values. Disk values may be stale.
-        Uses WS position cache when fresh, REST as fallback."""
+        Uses WS position cache when fresh, REST as fallback.
+        Returns True on success, False on failure."""
         long_exch = self._long_exchange
         short_exch = self._short_exchange
         long_sym = self._long_symbol
         short_sym = self._short_symbol
         if not long_exch or not short_exch:
-            return
+            return True
 
         long_client = self._clients.get(long_exch)
         short_client = self._clients.get(short_exch)
         if not long_client or not short_client:
             logger.warning("sync_position_from_exchange: missing client for %s or %s", long_exch, short_exch)
-            return
+            return False
 
         try:
             long_size = float(await self._get_position_size(long_exch, long_sym, long_client))
@@ -477,8 +503,10 @@ class StateMachine:
                 self._long_entry_price = 0.0
                 self._short_entry_price = 0.0
             self.save_state()
+            return True
         except Exception as exc:
             logger.warning("sync_position_from_exchange failed: %s", exc)
+            return False
 
     def _compute_entry_prices(self, result: ExecutionResult, config: MakerTakerConfig) -> None:
         """Compute VWAP entry prices from chunk results and store on position."""
@@ -668,6 +696,55 @@ class StateMachine:
                 except Exception as exc:
                     self._log("RISK", f"Chunk {i}: pre-chunk balance check failed: {exc}", level="warn")
 
+            # ── OHI check per chunk (opt-in) ──
+            if config.ohi_monitoring and self._data_layer:
+                # Map each exchange to its symbol via maker/taker assignment — works for
+                # both entry and exit regardless of which side is maker.
+                _ohi_exch_sym = {
+                    config.maker_exchange: config.maker_symbol,
+                    config.taker_exchange: config.taker_symbol,
+                }
+                ohi_ok = True
+                for ohi_exch in [config.long_exchange, config.short_exchange]:
+                    ohi_sym = _ohi_exch_sym.get(ohi_exch)
+                    if not ohi_exch or not ohi_sym:
+                        continue
+                    try:
+                        ohi_data = self._data_layer.get_orderbook_health(ohi_exch, ohi_sym)
+                        ohi_val = ohi_data.get("ohi", 0) if ohi_data else 0
+                        parts = []
+                        if ohi_data:
+                            for k in ("spread_score", "depth_score", "symmetry_score"):
+                                if k in ohi_data:
+                                    parts.append(f"{k.replace('_score','')}={ohi_data[k]:.2f}")
+                        detail = f" ({', '.join(parts)})" if parts else ""
+                        passed = ohi_val >= config.min_ohi
+                        self._log("OHI", f"Chunk {i} {ohi_exch}:{ohi_sym} = {ohi_val:.2f}{detail} — {'OK' if passed else 'BELOW threshold'} (min {config.min_ohi})")
+                        if not passed:
+                            ohi_ok = False
+                    except Exception as ohi_exc:
+                        self._log("OHI", f"Chunk {i} {ohi_exch} — unavailable ({ohi_exc})", level="warn")
+                if not ohi_ok:
+                    self._log("OHI", f"Chunk {i}: OHI below threshold — waiting 5s before retry", level="warn")
+                    await asyncio.sleep(5.0)
+                    # Re-check after wait; if still below, skip chunk but continue TWAP
+                    skip_chunk = False
+                    for ohi_exch in [config.long_exchange, config.short_exchange]:
+                        ohi_sym = _ohi_exch_sym.get(ohi_exch)
+                        if not ohi_exch or not ohi_sym:
+                            continue
+                        try:
+                            ohi_data = self._data_layer.get_orderbook_health(ohi_exch, ohi_sym)
+                            ohi_val = ohi_data.get("ohi", 0) if ohi_data else 0
+                            if ohi_val < config.min_ohi:
+                                skip_chunk = True
+                                self._log("OHI", f"Chunk {i} {ohi_exch} still below threshold (OHI={ohi_val:.2f}) — skipping chunk", level="warn")
+                        except Exception:
+                            pass
+                    if skip_chunk:
+                        chunk_index += 1
+                        continue
+
             chunk = await self._execute_single_chunk(config, i, chunk_qty, execution_id=_exec_id, action=action, pair=_pair)
             self._chunk_results.append(chunk)
             result.chunks.append(chunk)
@@ -837,6 +914,16 @@ class StateMachine:
             and result.total_taker_qty > 0
         )
 
+        # Ensure result.error is always populated on failure so callers log meaningful detail
+        if not result.success and result.error is None:
+            chunk_errs = [c.error for c in result.chunks if c.error]
+            if chunk_errs:
+                result.error = f"Chunks failed: {'; '.join(chunk_errs[-3:])}"
+            elif result.total_maker_qty > 0 and result.total_taker_qty == 0:
+                result.error = f"Maker filled {result.total_maker_qty:.6f} but taker not filled"
+            else:
+                result.error = "No fills — spread gate or order placement failed"
+
         logger.info(
             "%s complete: %d chunks, maker=%.6f taker=%.6f success=%s (%.1fs)",
             action, len(result.chunks), result.total_maker_qty, result.total_taker_qty,
@@ -849,15 +936,25 @@ class StateMachine:
         execution_id: str = "", action: str = "", pair: str = "",
     ) -> ChunkResult:
         """Execute one chunk: maker post-only → wait for fill → taker IOC hedge."""
+        chunk_start_time = time.time()
         chunk = ChunkResult(
             chunk_index=chunk_index,
             maker_exchange=config.maker_exchange,
             taker_exchange=config.taker_exchange,
-            start_ts=time.time(),
+            start_ts=chunk_start_time,
         )
 
         maker_client = self._clients.get(config.maker_exchange)
         taker_client = self._clients.get(config.taker_exchange)
+
+        # ── Chunk startup logging ─────────────────────────────────────
+        self._log("CHUNK", f"=== STARTING CHUNK {chunk_index} ===")
+        self._log("CHUNK", f"Config: action={action}, pair={pair}, execution_id={execution_id}")
+        self._log("CHUNK", f"Maker: {config.maker_exchange} {config.maker_side} {config.maker_symbol}, qty={chunk_qty}")
+        self._log("CHUNK", f"Taker: {config.taker_exchange} {config.taker_side} {config.taker_symbol}, qty={chunk_qty}")
+        self._log("CHUNK", f"Settings: chunks={config.num_chunks}, timeout={config.maker_timeout_ms}ms, offset_ticks={config.maker_offset_ticks}")
+        self._log("CHUNK", f"Spread gate: min={config.min_spread_pct}%, max={config.max_spread_pct}%, depth_spread={config.use_depth_spread}")
+        self._log("CHUNK", f"Options: drift_guard={config.taker_drift_guard}, ohi_monitor={config.ohi_monitoring}")
 
         # ── AI training: capture orderbook snapshot at decision time ──
         _el_snapshot: dict = {}
@@ -876,7 +973,13 @@ class StateMachine:
                 logger.debug("ExecutionLogger snapshot error: %s", el_exc)
 
         if not maker_client or not taker_client:
-            chunk.error = f"Missing client: maker={config.maker_exchange} taker={config.taker_exchange}"
+            missing = []
+            if not maker_client:
+                missing.append(f"maker={config.maker_exchange}")
+            if not taker_client:
+                missing.append(f"taker={config.taker_exchange}")
+            chunk.error = f"Missing clients: {', '.join(missing)}"
+            self._log("CHUNK", f"Chunk {chunk_index}: ABORTED - Missing {len(missing)} client(s): {missing}", level="error")
             chunk.end_ts = time.time()
             return chunk
 
@@ -892,9 +995,9 @@ class StateMachine:
             return chunk
 
         # ── Step 1: Get best price for maker order ────────────────────
-        self._log("BOOK", f"Chunk {chunk_index}: fetching {config.maker_exchange} orderbook for {config.maker_symbol}")
+        self._log("BOOK", f"Chunk {chunk_index}: Step 1 - Getting orderbook for maker order placement")
         try:
-            book = await self._get_book(config.maker_exchange, config.maker_symbol, maker_client)
+            book = await self._get_book(config.maker_exchange, config.maker_symbol, maker_client, chunk_index)
         except Exception as exc:
             chunk.error = f"Failed to fetch maker orderbook: {exc}"
             self._log("BOOK", f"Chunk {chunk_index}: orderbook fetch FAILED: {exc}", level="error")
@@ -924,6 +1027,8 @@ class StateMachine:
         maker_order_id = None
         remaining_qty = chunk_qty
         chase_round = 0
+        # Taker sweep price computed in spread gate — reused at hedge time
+        taker_sweep_price: Decimal | None = None
         # Snapshot maker position at chunk start for late-fill detection
         chunk_start_maker_pos = await self._get_position_size(
             config.maker_exchange, config.maker_symbol, maker_client, force_rest=True)
@@ -945,11 +1050,13 @@ class StateMachine:
 
             # ── Depth-aware spread guard (opt-in) ──
             if config.use_depth_spread:
+                self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: Depth-aware spread guard ENABLED (max_slippage_bps={config.max_slippage_bps})")
                 depth_ok = False
+                depth_check_start = time.time()
                 while self._is_executing():
                     try:
-                        sg_m_book = await self._get_book(config.maker_exchange, config.maker_symbol, maker_client)
-                        sg_t_book = await self._get_book(config.taker_exchange, config.taker_symbol, taker_client)
+                        sg_m_book = await self._get_book(config.maker_exchange, config.maker_symbol, maker_client, chunk_index)
+                        sg_t_book = await self._get_book(config.taker_exchange, config.taker_symbol, taker_client, chunk_index)
                     except Exception as sg_exc:
                         self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: depth book fetch failed ({sg_exc}) — falling back to BBO", level="warn")
                         depth_ok = True
@@ -963,6 +1070,7 @@ class StateMachine:
                         self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: depth analysis unavailable — falling back to BBO", level="warn")
                         depth_ok = True
                         break
+                    self.last_depth_analysis = analysis
                     if analysis.is_acceptable:
                         self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: depth spread bbo={analysis.bbo_spread_pct:+.4f}% exec={analysis.exec_spread_pct:+.4f}% slip={analysis.slippage_bps:.1f}bps — OK (max {config.max_slippage_bps}bps)")
                         depth_ok = True
@@ -972,53 +1080,96 @@ class StateMachine:
                 if not depth_ok:
                     continue
 
-            # ── Per-round spread guard: check before every maker order ──
-            # Directional: compare ask prices on both exchanges.
-            # long_ask should be at most max_spread_pct% above short_ask.
-            # Negative spread (long cheaper than short) is favorable → always OK.
+            # ── Per-round spread gate: BBO + taker depth check ──────────
+            # Two conditions must both pass before placing a maker order:
+            #   1. BBO spread is within [min_spread_pct, max_spread_pct]
+            #   2. Taker orderbook has sufficient depth to fill remaining_qty
+            #      at a price that keeps the spread within bounds
+            # The worst taker fill price (sweep price) is stored and reused at
+            # hedge time — the IOC limit is set exactly at that level.
             if config.max_spread_pct > 0 or config.min_spread_pct < 0:
+                self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: Entering spread gate check (min={config.min_spread_pct}%, max={config.max_spread_pct}%)")
                 spread_ok = False
+                spread_check_iterations = 0
                 while self._is_executing():
+                    spread_check_iterations += 1
                     try:
-                        sg_m_book = await self._get_book(config.maker_exchange, config.maker_symbol, maker_client)
-                        sg_t_book = await self._get_book(config.taker_exchange, config.taker_symbol, taker_client)
+                        sg_m_book = await self._get_book(config.maker_exchange, config.maker_symbol, maker_client, chunk_index)
+                        sg_t_book = await self._get_book(config.taker_exchange, config.taker_symbol, taker_client, chunk_index)
                     except Exception as sg_exc:
                         self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: book fetch failed ({sg_exc}) — skipping spread check", level="warn")
                         spread_ok = True
                         break
-                    # Get execution prices: long_ask (what you pay) vs short_bid (what you receive)
+
+                    # Step 1: BBO spread check
                     long_ask: float | None = None
                     short_bid: float | None = None
                     if config.maker_side == "buy":
-                        # Maker is LONG side, taker is SHORT side
                         long_ask = float(sg_m_book["asks"][0][0]) if sg_m_book.get("asks") else None
                         short_bid = float(sg_t_book["bids"][0][0]) if sg_t_book.get("bids") else None
                     else:
-                        # Maker is SHORT side, taker is LONG side
                         long_ask = float(sg_t_book["asks"][0][0]) if sg_t_book.get("asks") else None
                         short_bid = float(sg_m_book["bids"][0][0]) if sg_m_book.get("bids") else None
                     if long_ask is None or short_bid is None or short_bid <= 0:
                         self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: incomplete books — skipping spread check", level="warn")
                         spread_ok = True
                         break
-                    # Directional: how much more expensive is long_ask vs short_bid (negative = long cheaper = good)
                     sg_pct = (long_ask - short_bid) / short_bid * 100
-                    if config.min_spread_pct <= sg_pct <= config.max_spread_pct:
-                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: long_ask={long_ask:.4f} short_bid={short_bid:.4f} spread {sg_pct:+.4f}% — OK (range [{config.min_spread_pct}, {config.max_spread_pct}])")
+                    if sg_pct < config.min_spread_pct:
+                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: BBO spread {sg_pct:+.4f}% below min {config.min_spread_pct}% — waiting 2s", level="warn")
+                        await asyncio.sleep(2.0)
+                        continue
+                    if sg_pct > config.max_spread_pct:
+                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: BBO spread {sg_pct:+.4f}% exceeds max {config.max_spread_pct}% — waiting 2s", level="warn")
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    # Step 2: taker depth check — can the taker book absorb remaining_qty
+                    # and what is the worst price (sweep level) we'd need to hit?
+                    taker_side_for_walk = config.taker_side  # "buy" or "sell"
+                    t_vwap, t_worst, t_unfilled = walk_book(sg_t_book, taker_side_for_walk, remaining_qty)
+
+                    if t_worst <= 0 or t_vwap <= 0:
+                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: taker book empty — skipping depth check", level="warn")
+                        taker_sweep_price = None
                         spread_ok = True
                         break
-                    if sg_pct < config.min_spread_pct:
-                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: long_ask={long_ask:.4f} short_bid={short_bid:.4f} spread {sg_pct:+.4f}% below min {config.min_spread_pct}% — waiting 2s", level="warn")
+
+                    if t_unfilled > float(remaining_qty) * 0.05:
+                        # Taker can fill < 95% of remaining_qty — wait for liquidity
+                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: taker depth insufficient — only {float(remaining_qty)-t_unfilled:.2f}/{float(remaining_qty):.2f} available at sweep={t_worst:.4f} — waiting 2s", level="warn")
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    # Verify spread holds at the VWAP fill price, not just BBO
+                    if config.maker_side == "buy":
+                        # maker buys (long_ask = maker best ask), taker sells at t_vwap
+                        depth_spread_pct = (long_ask - t_vwap) / t_vwap * 100
                     else:
-                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: long_ask={long_ask:.4f} short_bid={short_bid:.4f} spread {sg_pct:+.4f}% exceeds max {config.max_spread_pct}% — waiting 2s", level="warn")
-                    await asyncio.sleep(2.0)
+                        # maker sells (short_bid = maker best bid), taker buys at t_vwap
+                        depth_spread_pct = (t_vwap - short_bid) / short_bid * 100
+
+                    if depth_spread_pct > config.max_spread_pct:
+                        self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: depth-weighted spread {depth_spread_pct:+.4f}% exceeds max {config.max_spread_pct}% (taker VWAP={t_vwap:.4f}, unfilled={t_unfilled:.2f}) — waiting 2s", level="warn")
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    # Both checks pass — store sweep price for taker hedge
+                    taker_sweep_price = Decimal(str(t_worst))
+                    self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: BBO={sg_pct:+.4f}% depth={depth_spread_pct:+.4f}% — OK (taker VWAP={t_vwap:.4f} sweep={t_worst:.4f} unfilled={t_unfilled:.2f})")
+                    spread_ok = True
+                    break
+
                 if not spread_ok:
-                    # State changed (cancelled) — will be caught at top of next iteration
+                    self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: spread_ok is False, restarting loop", level="warn")
                     continue
 
+            # Spread gate passed - proceeding to place maker order
+            self._log("SPREAD", f"Chunk {chunk_index} round {chase_round}: Spread gate PASSED after {spread_check_iterations} iteration(s)")
             self._current_chunk_state = ChunkState.MAKER_PLACE
 
-            self._log("ORDER", f"Chunk {chunk_index} round {chase_round}: placing POST-ONLY {config.maker_side.upper()} {remaining_qty} {config.maker_symbol} @ {maker_price} on {config.maker_exchange}")
+            self._log("ORDER", f"Chunk {chunk_index} round {chase_round}: === PLACING MAKER ORDER ===")
+            self._log("ORDER", f"Chunk {chunk_index} round {chase_round}: Exchange={config.maker_exchange}, Side={config.maker_side.upper()}, Qty={remaining_qty}, Symbol={config.maker_symbol}, Price={maker_price}")
             try:
                 # Retry on transient connection/DNS errors
                 for _conn_attempt in range(1, _MAX_CONN_RETRIES + 1):
@@ -1125,6 +1276,8 @@ class StateMachine:
                         maker_filled_qty = final_qty
                 except Exception as exc:
                     self._log("ORDER", f"Chunk {chunk_index}: post-cancel recheck failed: {exc}", level="warn")
+                # Market moved since sweep price was computed — force fresh walk_book for taker
+                taker_sweep_price = None
                 break
             else:
                 # No fill — cancel and reprice
@@ -1196,9 +1349,17 @@ class StateMachine:
                                     t_price = t_best - t_tick * 50 if t_best else None
                                 if t_price is not None:
                                     self._log("FILL", f"Chunk {chunk_index}: mid-loop hedge IOC {config.taker_side.upper()} {unhedged} {config.taker_symbol} @ {t_price} (best={t_best})")
-                                    t_resp = await taker_client.async_create_ioc_order(
-                                        symbol=config.taker_symbol, side=config.taker_side,
-                                        amount=unhedged, price=t_price, reduce_only=config.reduce_only)
+                                    for _ml_attempt in range(1, 3):
+                                        try:
+                                            t_resp = await taker_client.async_create_ioc_order(
+                                                symbol=config.taker_symbol, side=config.taker_side,
+                                                amount=unhedged, price=t_price, reduce_only=config.reduce_only)
+                                            break
+                                        except Exception as _ml_exc:
+                                            if self._is_transient(_ml_exc) and _ml_attempt < 2:
+                                                await asyncio.sleep(0.5)
+                                                continue
+                                            raise
                                     t_id = t_resp.get("id") or t_resp.get("order_id") or t_resp.get("digest")
                                     t_filled = await self._check_taker_fill(taker_client, t_id, t_resp)
                                     if t_filled > 0:
@@ -1238,6 +1399,7 @@ class StateMachine:
                     self._log("ORDER", f"Chunk {chunk_index}: book fetch failed ({exc}), keeping {maker_price}")
 
                 chase_round += 1
+                taker_sweep_price = None  # invalidate — spread gate will recompute next round
 
         _el_chase_rounds = chase_round  # capture for AI training data
 
@@ -1260,6 +1422,15 @@ class StateMachine:
             self._log("BOOK", f"Chunk {chunk_index}: fetching {config.taker_exchange} orderbook for taker hedge (remaining={taker_hedge_qty}, mid-loop={mid_loop_hedged})")
 
             try:
+                # Snapshot taker position before IOC — best-effort cache read only.
+                # Do NOT fall through to REST here: this snapshot runs on the critical
+                # path between maker fill and taker IOC placement. A stale/missing
+                # snapshot is fine (position delta check just skips).
+                taker_pos_before = Decimal("0")
+                if self._data_layer:
+                    _pos_snap = self._data_layer.get_position(config.taker_exchange, config.taker_symbol)
+                    taker_pos_before = Decimal(str(abs(_pos_snap.size)))
+
                 taker_book = await self._get_book(config.taker_exchange, config.taker_symbol, taker_client)
                 taker_tick = await taker_client.async_get_tick_size(config.taker_symbol)
 
@@ -1267,17 +1438,22 @@ class StateMachine:
                     if not taker_book.get("asks"):
                         raise RuntimeError("No asks in taker orderbook")
                     taker_best = Decimal(str(taker_book["asks"][0][0]))
-                    # IOC price: aggressive — best ask + buffer
-                    taker_price = taker_best + taker_tick * 50
+                    # Always walk the freshly-fetched book — taker_sweep_price from spread gate
+                    # may be stale (book can move significantly during maker fill wait).
+                    _, t_worst, _ = walk_book(taker_book, "buy", taker_hedge_qty)
+                    taker_price = Decimal(str(t_worst)) + taker_tick * 50 if t_worst > 0 else taker_best + taker_tick * 50
                 else:
                     if not taker_book.get("bids"):
                         raise RuntimeError("No bids in taker orderbook")
                     taker_best = Decimal(str(taker_book["bids"][0][0]))
-                    taker_price = taker_best - taker_tick * 50
+                    _, t_worst, _ = walk_book(taker_book, "sell", taker_hedge_qty)
+                    taker_price = Decimal(str(t_worst)) - taker_tick * 50 if t_worst > 0 else taker_best - taker_tick * 50
 
-                self._log("ORDER", f"Chunk {chunk_index}: placing IOC {config.taker_side.upper()} {taker_hedge_qty} {config.taker_symbol} @ {taker_price} (best={taker_best}) on {config.taker_exchange}")
-                # Retry on transient connection/DNS errors
-                for _conn_attempt in range(1, _MAX_CONN_RETRIES + 1):
+                self._log("ORDER", f"Chunk {chunk_index}: placing IOC {config.taker_side.upper()} {taker_hedge_qty} {config.taker_symbol} @ {taker_price} (best={taker_best} book_worst={t_worst:.4f}) on {config.taker_exchange}")
+                # Retry on transient connection/DNS errors — short delay for IOC (time-critical)
+                _TAKER_CONN_RETRIES = 2
+                _TAKER_RETRY_DELAY = 0.5
+                for _conn_attempt in range(1, _TAKER_CONN_RETRIES + 1):
                     try:
                         taker_resp = await taker_client.async_create_ioc_order(
                             symbol=config.taker_symbol,
@@ -1288,9 +1464,9 @@ class StateMachine:
                         )
                         break  # success
                     except Exception as conn_exc:
-                        if self._is_transient(conn_exc) and _conn_attempt < _MAX_CONN_RETRIES:
-                            self._log("ORDER", f"Chunk {chunk_index}: taker connection error (attempt {_conn_attempt}/{_MAX_CONN_RETRIES}): {conn_exc} — retrying in {_CONN_RETRY_DELAY}s", level="warn")
-                            await asyncio.sleep(_CONN_RETRY_DELAY)
+                        if self._is_transient(conn_exc) and _conn_attempt < _TAKER_CONN_RETRIES:
+                            self._log("ORDER", f"Chunk {chunk_index}: taker connection error (attempt {_conn_attempt}/{_TAKER_CONN_RETRIES}): {conn_exc} — retrying in {_TAKER_RETRY_DELAY}s", level="warn")
+                            await asyncio.sleep(_TAKER_RETRY_DELAY)
                             continue
                         raise  # non-transient or retries exhausted
 
@@ -1299,8 +1475,24 @@ class StateMachine:
                 chunk.taker_price = float(taker_price)
                 self._log("ORDER", f"Chunk {chunk_index}: taker IOC placed → id={taker_order_id}")
 
-                # Check taker fill
+                # Check taker fill (WS fill-event path)
                 taker_filled = await self._check_taker_fill(taker_client, taker_order_id, taker_resp)
+
+                # ── Position-delta fallback: if WS fill events missed the fill,
+                # verify via position size change (works for all exchanges: Extended/GRVT/Nado
+                # via live WS cache; Variational via REST polling cache refreshed every 2s).
+                if taker_filled <= 0 and self._data_layer:
+                    pos_after = await self._get_position_size(
+                        config.taker_exchange, config.taker_symbol, taker_client, force_rest=False)
+                    delta = abs(pos_after - taker_pos_before)
+                    if delta >= float(taker_hedge_qty) * 0.95:
+                        taker_filled = float(delta)
+                        self._log("FILL", f"Chunk {chunk_index}: taker fill confirmed via position delta: {taker_pos_before:.6f}→{pos_after:.6f} Δ={delta:.6f}")
+                    elif delta > 0:
+                        # Partial position change — credit what the exchange confirms
+                        taker_filled = float(delta)
+                        self._log("FILL", f"Chunk {chunk_index}: taker partial fill via position delta: Δ={delta:.6f} of {float(taker_hedge_qty):.6f}", level="warn")
+
                 chunk.taker_filled_qty += taker_filled  # add to mid-loop hedged amount
 
                 if taker_filled > 0:
@@ -1369,10 +1561,12 @@ class StateMachine:
 
         # REST fallback
         if client:
-            # Only VariationalClient supports max_retries; other clients don't
+            # Only VariationalClient supports max_retries; other clients don't.
+            # Use max_retries=2 (not None) — infinite retries are for order placement
+            # only; a position read that takes >20s blocks the IOC critical path.
             from app.variational_client import VariationalClient
             if isinstance(client, VariationalClient):
-                positions = await client.async_fetch_positions([symbol], max_retries=None)
+                positions = await client.async_fetch_positions([symbol], max_retries=2)
             else:
                 positions = await client.async_fetch_positions([symbol])
             logger.info("Position REST query %s:%s returned %d positions", exchange, symbol, len(positions))
@@ -1449,26 +1643,21 @@ class StateMachine:
                 maker_size = await self._get_position_size(config.maker_exchange, config.maker_symbol, maker_client, force_rest=True)
                 taker_size = await self._get_position_size(config.taker_exchange, config.taker_symbol, taker_client, force_rest=True)
 
-                # Suspicious result: position expected non-zero but API returned 0
+                # Calculate position deltas from baseline
                 maker_delta_raw = maker_size - self._baseline_maker_size
                 taker_delta_raw = taker_size - self._baseline_taker_size
-                maker_suspect = expected_maker_delta > 0.5 and maker_delta_raw < Decimal("0.5")
-                taker_suspect = expected_taker_delta > 0.5 and taker_delta_raw < Decimal("0.5")
-
-                if (maker_suspect or taker_suspect) and attempt < max_retries:
-                    which = []
-                    if maker_suspect:
-                        which.append(f"{config.maker_exchange}={maker_size}")
-                    if taker_suspect:
-                        which.append(f"{config.taker_exchange}={taker_size}")
-                    self._log("RISK", f"Chunk {chunk_index}: position returned 0 but expected non-zero ({', '.join(which)}) — retry {attempt+1}/{max_retries} in 3s", level="warn")
-                    await asyncio.sleep(3.0)
-                    continue
 
                 # Compare only the delta from baseline (Decimal arithmetic — no float rounding)
                 maker_delta = maker_delta_raw
                 taker_delta = taker_delta_raw
                 gap = abs(maker_delta - taker_delta)
+
+                # Only retry if there's a real imbalance (gap > 0.5)
+                # Gap = 0 means positions are balanced, even if API shows 0 for both sides
+                if gap > Decimal("0.5") and attempt < max_retries:
+                    self._log("RISK", f"Chunk {chunk_index}: Position imbalance detected (maker_delta={maker_delta}, taker_delta={taker_delta}, gap={gap}) — retry {attempt+1}/{max_retries} in 3s", level="warn")
+                    await asyncio.sleep(3.0)
+                    continue
                 logger.info("Verify chunk %d: maker=%s(base=%s delta=%s) taker=%s(base=%s delta=%s) gap=%s",
                             chunk_index, maker_size, self._baseline_maker_size, maker_delta,
                             taker_size, self._baseline_taker_size, taker_delta, gap)
@@ -1657,7 +1846,7 @@ class StateMachine:
 
     # ── Orderbook helper ─────────────────────────────────────────────
 
-    async def _get_book(self, exchange: str, symbol: str, client) -> dict:
+    async def _get_book(self, exchange: str, symbol: str, client, chunk_index: int = -1) -> dict:
         """Read orderbook from WS-based DataLayer cache. Falls back to REST if empty.
 
         Returns dict with 'bids' and 'asks' as [[price, qty], ...].
@@ -1668,10 +1857,24 @@ class StateMachine:
         if self._data_layer:
             snap = self._data_layer.get_orderbook(exchange, symbol)
             if snap.bids and snap.asks:
+                cache_age_ms = (time.time() * 1000) - snap.timestamp_ms if snap.timestamp_ms else 0
+                self._log("BOOK", f"Chunk {chunk_index}: OMS cache hit for {exchange}:{symbol} (age={cache_age_ms:.0f}ms, updates={snap.update_count})")
                 return {"bids": snap.bids, "asks": snap.asks}
-            logger.debug("WS book empty for %s:%s — REST fallback", exchange, symbol)
+            # OMS cache miss - will fall back to REST
+            self._log("BOOK", f"Chunk {chunk_index}: OMS cache empty for {exchange}:{symbol} — falling back to REST", level="warn")
         # Fallback to REST (only when WS has no data at all)
-        return await client.async_fetch_order_book(symbol, limit=5)
+        self._log("BOOK", f"Chunk {chunk_index}: fetching {exchange} orderbook via REST for {symbol}")
+        try:
+            start_ts = time.time()
+            book = await client.async_fetch_order_book(symbol, limit=5)
+            elapsed_ms = (time.time() - start_ts) * 1000
+            bid_count = len(book.get("bids", []))
+            ask_count = len(book.get("asks", []))
+            self._log("BOOK", f"Chunk {chunk_index}: REST orderbook received for {exchange}:{symbol} (elapsed={elapsed_ms:.0f}ms, bids={bid_count}, asks={ask_count})")
+            return book
+        except Exception as exc:
+            self._log("BOOK", f"Chunk {chunk_index}: REST orderbook FAILED for {exchange}:{symbol}: {exc}", level="error")
+            raise
 
     # ── WS fill subscriptions ──────────────────────────────────────────
 
@@ -1794,6 +1997,18 @@ class StateMachine:
                 # Check WS fill events first (instant)
                 ws_qty = self._get_ws_filled_qty(oid)
                 if ws_qty > 0:
+                    # Settle window: exchanges like Extended deliver fills in rapid batches;
+                    # wait 300ms for in-flight events, then REST-confirm final qty.
+                    await asyncio.sleep(0.3)
+                    ws_qty = self._get_ws_filled_qty(oid)
+                    try:
+                        rest_result = await client.async_check_order_fill(oid)
+                        rest_qty = float(rest_result.get("traded_qty", 0))
+                        if rest_qty > ws_qty:
+                            self._log("FILL", f"WS settle REST correction: {ws_qty:.6f} → {rest_qty:.6f}")
+                            ws_qty = rest_qty
+                    except Exception as _exc:
+                        self._log("WAIT", f"WS settle REST check failed: {_exc}", level="warn")
                     self._log("FILL", f"Maker fill via WS: qty={ws_qty:.6f} ({elapsed:.1f}s/{timeout_s:.1f}s)")
                     logger.info("Maker fill detected via WS: order=%s qty=%.6f", oid, ws_qty)
                     return {"filled": True, "traded_qty": ws_qty}
@@ -1838,9 +2053,19 @@ class StateMachine:
                 self._log("DRIFT", f"Drift guard triggered at timeout — maker order {oid} cancelled ({total_wait:.1f}s)")
                 return {"filled": False, "traded_qty": 0, "drift_cancelled": True}
 
-            # Final check: WS then REST
+            # Final check: WS then REST (same settle logic as in-loop path)
             ws_qty = self._get_ws_filled_qty(oid)
             if ws_qty > 0:
+                await asyncio.sleep(0.3)
+                ws_qty = self._get_ws_filled_qty(oid)
+                try:
+                    rest_result = await client.async_check_order_fill(oid)
+                    rest_qty = float(rest_result.get("traded_qty", 0))
+                    if rest_qty > ws_qty:
+                        self._log("FILL", f"WS settle REST correction (final): {ws_qty:.6f} → {rest_qty:.6f}")
+                        ws_qty = rest_qty
+                except Exception:
+                    pass
                 self._log("FILL", f"Maker fill via WS (final check): qty={ws_qty:.6f} ({total_wait:.1f}s)")
                 return {"filled": True, "traded_qty": ws_qty}
             try:
@@ -1939,14 +2164,21 @@ class StateMachine:
         oid = str(order_id) if order_id else None
 
         # For exchanges where IOC success = filled (e.g. NADO)
+        # Retry up to 5× with 500ms delay — matching engine may not update traded_qty instantly
         if resp.get("status") in ("success", "FILLED", "CLOSED"):
             if oid:
-                try:
-                    fill = await client.async_check_order_fill(oid)
-                    return float(fill.get("traded_qty", 0))
-                except Exception:
-                    pass
-            return float(resp.get("limit_price", 0)) > 0 and float(self._current_config.total_qty / self._current_config.num_chunks) or 0.0
+                for attempt in range(5):
+                    try:
+                        fill = await client.async_check_order_fill(oid)
+                        fill_qty = float(fill.get("traded_qty", 0))
+                        if fill_qty > 0:
+                            logger.info("Taker fill (Nado) attempt=%d order=%s qty=%.6f", attempt, oid, fill_qty)
+                            return fill_qty
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.5)
+                logger.warning("Taker fill (Nado) order=%s: traded_qty still 0 after 5 attempts", oid)
+            return 0.0
 
         if not oid:
             return 0.0

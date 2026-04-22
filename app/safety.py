@@ -90,23 +90,40 @@ def estimate_fill_price(
     quantity: Decimal,
 ) -> float:
     """Walk the book and return the volume-weighted average fill price."""
+    vwap, _, _ = walk_book(order_book, side, quantity)
+    return vwap
+
+
+def walk_book(
+    order_book: dict,
+    side: str,
+    quantity: Decimal,
+) -> tuple[float, float, float]:
+    """Walk the orderbook for a given qty.
+
+    Returns (vwap, worst_price, unfilled_qty):
+      - vwap: volume-weighted average fill price (0 if nothing available)
+      - worst_price: deepest price level touched (= sweep limit for IOC)
+      - unfilled_qty: qty that could not be filled (> 0 means insufficient depth)
+    """
     levels = order_book.get("asks" if side == "buy" else "bids", [])
     remaining = float(quantity)
     total_cost = 0.0
+    worst_price = 0.0
 
     for price_str, size_str in levels:
         price = float(price_str)
         size = float(size_str)
         fill = min(remaining, size)
         total_cost += fill * price
+        worst_price = price
         remaining -= fill
         if remaining <= 0:
             break
 
     filled_qty = float(quantity) - remaining
-    if filled_qty == 0:
-        return 0.0
-    return total_cost / filled_qty
+    vwap = total_cost / filled_qty if filled_qty > 0 else 0.0
+    return vwap, worst_price, remaining
 
 
 def check_slippage(

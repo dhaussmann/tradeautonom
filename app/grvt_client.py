@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import urllib3
 from decimal import Decimal
@@ -51,6 +52,10 @@ class GrvtClient:
 
         self._min_size_cache: dict[str, Decimal] = {}
         self._tick_size_cache: dict[str, Decimal] = {}
+
+        # Shared fill WS state — one connection per client, multiple symbol callbacks
+        self._fill_callbacks: list[tuple[str, object]] = []
+        self._fill_ws_task: object = None
         self._api = GrvtCcxt(
             self._env,
             logger,
@@ -636,33 +641,49 @@ class GrvtClient:
         }
 
     async def async_subscribe_fills(self, symbol: str, callback) -> None:
-        """Subscribe to GRVT fill WS stream (v1.fill).
+        """Register a per-symbol fill callback on the shared GRVT account WS.
 
-        Requires authenticated WS connection with cookie + account ID.
+        GRVT enforces per-account connection limits. All bots share one WS
+        connection using an account-level selector; fills are fanned out by symbol.
         """
+        self._fill_callbacks.append((symbol, callback))
+        if self._fill_ws_task is None or self._fill_ws_task.done():
+            self._fill_ws_task = asyncio.create_task(
+                self._run_shared_fill_ws(), name="grvt-fill-ws-shared"
+            )
+        try:
+            await asyncio.get_event_loop().create_future()
+        except asyncio.CancelledError:
+            self._fill_callbacks = [(s, cb) for s, cb in self._fill_callbacks if cb is not callback]
+            raise
+
+    async def _run_shared_fill_ws(self) -> None:
+        """Single shared WS connection to the GRVT account fill stream."""
         import ssl as _ssl
         import websockets
         import json
 
-        # Derive WS URL from trade endpoint
         trade_base = self._trade_base_url()
         ws_url = trade_base.replace("https://", "wss://") + "/ws/full"
-
         sub_account_id = self.settings.grvt_trading_account_id
-        selector = f"{sub_account_id}-{symbol}" if symbol else str(sub_account_id)
-
-        logger.info("GRVT fill WS connecting: %s selector=%s", ws_url, selector)
-
+        # Account-level selector (no symbol) delivers fills for all instruments
+        selector = str(sub_account_id)
+        sub_msg = json.dumps({
+            "jsonrpc": "2.0", "method": "subscribe",
+            "params": {"stream": "v1.fill", "selectors": [selector]}, "id": 1,
+        })
         ssl_ctx = _ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = _ssl.CERT_NONE
+        reconnect_delay = 5.0
 
+        logger.info("GRVT fill WS connecting (shared): %s selector=%s", ws_url, selector)
         while True:
-            # Refresh cookie before each connect attempt
             try:
                 self._api.refresh_cookie()
             except Exception as exc:
                 logger.warning("GRVT fill WS: cookie refresh failed: %s", exc)
+
             cookie = getattr(self._api, "_cookie", None)
             headers = {}
             if isinstance(cookie, dict):
@@ -677,47 +698,52 @@ class GrvtClient:
             else:
                 headers["X-Grvt-Account-Id"] = sub_account_id
 
-            try:
-                async for ws in websockets.connect(ws_url, ssl=ssl_ctx, extra_headers=headers):
-                    try:
-                        # Subscribe to fill stream
-                        sub_msg = json.dumps({
-                            "jsonrpc": "2.0",
-                            "method": "subscribe",
-                            "params": {"stream": "v1.fill", "selectors": [selector]},
-                            "id": 1,
-                        })
-                        await ws.send(sub_msg)
-                        logger.info("GRVT fill WS subscribed: %s", selector)
+            if "Cookie" not in headers:
+                logger.warning("GRVT fill WS: no cookie — retry in %.0fs", reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60.0)
+                continue
 
-                        async for raw in ws:
-                            msg = json.loads(raw)
-                            # v1.fill: feed is a single Fill object with fields:
-                            # order_id (hex), client_order_id, size, price, is_taker, instrument, ...
-                            f = msg.get("feed")
-                            if not isinstance(f, dict):
-                                continue
-                            oid = f.get("order_id", "")
-                            client_oid = f.get("client_order_id", "")
-                            fill = {
-                                "order_id": client_oid or oid,
-                                "order_id_hex": oid,
-                                "filled_qty": float(f.get("size", 0)),
-                                "remaining_qty": 0.0,
-                                "price": float(f.get("price", 0)),
-                                "is_taker": f.get("is_taker", False),
-                                "symbol": f.get("instrument", symbol),
-                            }
-                            logger.info("GRVT fill WS parsed: order=%s client=%s qty=%.6f price=%.4f taker=%s",
-                                        oid, client_oid, fill["filled_qty"], fill["price"], fill["is_taker"])
-                            await callback(fill)
-                    except websockets.ConnectionClosed:
-                        logger.warning("GRVT fill WS disconnected, reconnecting…")
-                        continue
+            try:
+                async with websockets.connect(ws_url, ssl=ssl_ctx, extra_headers=headers) as ws:
+                    reconnect_delay = 5.0
+                    await ws.send(sub_msg)
+                    logger.info("GRVT fill WS connected (serving %d callbacks, selector=%s)", len(self._fill_callbacks), selector)
+
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        f = msg.get("feed")
+                        if not isinstance(f, dict):
+                            continue
+                        oid = f.get("order_id", "")
+                        client_oid = f.get("client_order_id", "")
+                        fill_symbol = f.get("instrument", "")
+                        fill = {
+                            "order_id": client_oid or oid,
+                            "order_id_hex": oid,
+                            "filled_qty": float(f.get("size", 0)),
+                            "remaining_qty": 0.0,
+                            "price": float(f.get("price", 0)),
+                            "is_taker": f.get("is_taker", False),
+                            "symbol": fill_symbol,
+                        }
+                        logger.info("GRVT fill WS: order=%s client=%s qty=%.6f price=%.4f taker=%s symbol=%s",
+                                    oid, client_oid, fill["filled_qty"], fill["price"], fill["is_taker"], fill_symbol)
+                        for sym, cb in list(self._fill_callbacks):
+                            if not sym or sym == fill_symbol:
+                                try:
+                                    await cb(fill)
+                                except Exception:
+                                    pass
+
+            except websockets.ConnectionClosed:
+                logger.warning("GRVT fill WS disconnected — reconnecting")
+            except asyncio.CancelledError:
+                break
             except Exception as exc:
-                logger.warning("GRVT fill WS connect error: %s — retrying in 5s", exc)
-                import asyncio
-                await asyncio.sleep(5)
+                logger.warning("GRVT fill WS error: %s — retry in %.0fs", exc, reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60.0)
 
     # ══════════════════════════════════════════════════════════════════
     # Journal — history fetching for Trading Journal / PnL tracking

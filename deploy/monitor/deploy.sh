@@ -51,8 +51,11 @@ ssh_nas() { ssh ${SSH_OPTS} "$SSH_TARGET" "$@"; }
 cmd_sync() {
     info "Syncing OMS to ${SSH_TARGET}:${OMS_DEPLOY_PATH}"
     ssh_nas "mkdir -p '${OMS_DEPLOY_PATH}'"
-    # Only sync the monitor directory (Dockerfile, requirements.txt, monitor_service.py)
-    tar -C "$SCRIPT_DIR" -czf - Dockerfile requirements.txt monitor_service.py \
+    # Sync all OMS files including new Nado watchdog modules
+    tar -C "$SCRIPT_DIR" -czf - \
+        Dockerfile requirements.txt monitor_service.py \
+        nado_watchdog.py nado_persistence.py nado_discovery.py nado_websocket.py \
+        nado_config.yaml \
     | ssh_nas "tar -C '${OMS_DEPLOY_PATH}' -xzf -"
     ok "OMS code synced"
 }

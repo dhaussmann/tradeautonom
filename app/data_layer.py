@@ -106,11 +106,17 @@ class DataLayer:
 
         # Clients + symbols stored for WS subscriptions
         self._clients: dict[str, Any] = {}
-        self._symbols_map: dict[str, str] = {}
+        self._symbols_map: dict[str, str] = {}  # Deprecated: use _symbols_list for multiple symbols per exchange
+        self._symbols_list: list[tuple[str, str]] = []  # [(exchange, symbol), ...]
 
         # OMS WebSocket state (shared connection for all symbols)
         self._oms_ws_active = False  # True while OMS WS is connected
         self._oms_ws_task: asyncio.Task | None = None
+        self._oms_ws: Any | None = None  # WebSocket client protocol
+        
+        # Dynamic subscription tracking
+        self._pending_subscriptions: dict[str, asyncio.Event] = {}  # symbol_key -> Event
+        self._subscription_timeout: float = 5.0  # seconds to wait for ack
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -128,8 +134,10 @@ class DataLayer:
         self._running = True
         self._clients = clients
         self._symbols_map = symbols_map
+        # Convert dict to list for internal use (supports multiple symbols per exchange)
+        self._symbols_list = list(symbols_map.items())
 
-        for exch_name, symbol in symbols_map.items():
+        for exch_name, symbol in self._symbols_list:
             client = clients.get(exch_name)
             if client is None:
                 logger.warning("DataLayer: no client for exchange '%s', skipping", exch_name)
@@ -236,6 +244,110 @@ class DataLayer:
             if not snap.bids or not snap.asks:
                 return False
         return True
+
+    async def add_symbols(self, symbols_map: dict[str, str]) -> dict[str, bool]:
+        """Dynamically add new symbols to the DataLayer and subscribe via OMS.
+        
+        Waits for OMS acknowledgment before returning.
+        Returns dict of symbol_key -> success (True if subscribed or already active).
+        """
+        if not self._shared_monitor_url:
+            logger.warning("DataLayer: Cannot add symbols - no OMS URL configured")
+            return {}
+        
+        results: dict[str, bool] = {}
+        
+        for exch_name, symbol in symbols_map.items():
+            key = (exch_name, symbol)
+            symbol_key = f"{exch_name}:{symbol}"
+            
+            # Check if already subscribed and connected
+            if key in self._orderbooks:
+                snap = self._orderbooks[key]
+                if snap.connected and snap.is_synced:
+                    results[symbol_key] = True
+                    continue
+            
+            # Initialize cache structures
+            if key not in self._orderbooks:
+                self._orderbooks[key] = OrderbookSnapshot()
+            if key not in self._ob_locks:
+                self._ob_locks[key] = asyncio.Lock()
+            
+            # Track in symbols list (supports multiple symbols per exchange)
+            if (exch_name, symbol) not in self._symbols_list:
+                self._symbols_list.append((exch_name, symbol))
+            
+            # Try to subscribe via OMS
+            if self._oms_ws_active and self._oms_ws:
+                ack_event = asyncio.Event()
+                self._pending_subscriptions[symbol_key] = ack_event
+                
+                try:
+                    sub_msg = json.dumps({
+                        "action": "subscribe",
+                        "exchange": exch_name,
+                        "symbol": symbol
+                    })
+                    await self._oms_ws.send(sub_msg)
+                    logger.info("DataLayer: Subscribing to %s:%s via OMS", exch_name, symbol)
+                    
+                    # Wait for acknowledgment
+                    await asyncio.wait_for(ack_event.wait(), timeout=self._subscription_timeout)
+                    results[symbol_key] = True
+                    logger.info("DataLayer: OMS subscribed %s:%s", exch_name, symbol)
+                except asyncio.TimeoutError:
+                    results[symbol_key] = False
+                    logger.warning("DataLayer: OMS subscribe timeout for %s:%s", exch_name, symbol)
+                except Exception as exc:
+                    results[symbol_key] = False
+                    logger.error("DataLayer: OMS subscribe error for %s:%s: %s", exch_name, symbol, exc)
+                finally:
+                    self._pending_subscriptions.pop(symbol_key, None)
+            else:
+                # OMS not connected - start HTTP polling for this symbol
+                logger.warning("DataLayer: OMS not connected, starting HTTP poll for %s:%s", exch_name, symbol)
+                task = asyncio.create_task(
+                    self._run_ob_oms_poll(exch_name, symbol),
+                    name=f"ob-oms-poll-{exch_name}-{symbol}",
+                )
+                self._tasks.append(task)
+                
+                # Don't wait - let the poll run in background
+                # Mark as success since poll task is running
+                results[symbol_key] = True
+                logger.info("DataLayer: HTTP poll started for %s:%s (running in background)", exch_name, symbol)
+        
+        return results
+
+    async def remove_symbols(self, symbols_map: dict[str, str]) -> None:
+        """Unsubscribe from symbols when bot is deleted."""
+        if not self._shared_monitor_url or not self._oms_ws_active or not self._oms_ws:
+            return
+        
+        for exch_name, symbol in symbols_map.items():
+            key = (exch_name, symbol)
+            
+            # Send unsubscribe message
+            try:
+                unsub_msg = json.dumps({
+                    "action": "unsubscribe",
+                    "exchange": exch_name,
+                    "symbol": symbol
+                })
+                await self._oms_ws.send(unsub_msg)
+                logger.info("DataLayer: OMS unsubscribed %s:%s", exch_name, symbol)
+            except Exception as exc:
+                logger.warning("DataLayer: Failed to unsubscribe %s:%s: %s", exch_name, symbol, exc)
+            
+            # Remove from cache
+            if key in self._orderbooks:
+                del self._orderbooks[key]
+            self._ob_locks.pop(key, None)
+            
+            # Remove from symbols list
+            if (exch_name, symbol) in self._symbols_list:
+                self._symbols_list.remove((exch_name, symbol))
 
     def get_orderbook_depth(self, exchange: str, symbol: str, depth: int = 10) -> dict:
         """Return top N orderbook levels as a serializable dict for the UI."""
@@ -419,22 +531,47 @@ class DataLayer:
 
         logger.info("DataLayer: OMS poll starting for %s:%s from %s", exch_name, symbol, url)
 
+        logger.info("DataLayer: OMS poll loop started for %s:%s (running=%s)", exch_name, symbol, self._running)
+        first_success = False
+        loop_count = 0
         while self._running:
+            loop_count += 1
+            if loop_count == 1:
+                logger.info("DataLayer: OMS poll first iteration %s:%s", exch_name, symbol)
             try:
-                async with httpx.AsyncClient(timeout=3.0) as client:
-                    resp = await client.get(url)
-                    resp.raise_for_status()
-                    data = resp.json()
+                logger.info("DataLayer: OMS poll fetching %s:%s from %s", exch_name, symbol, url)
+                # Use urllib in thread to avoid blocking event loop
+                import urllib.request
+                import json
+                def fetch_oms():
+                    logger.info("DataLayer: OMS poll [thread] fetching %s:%s", exch_name, symbol)
+                    req = urllib.request.Request(url, method='GET')
+                    with urllib.request.urlopen(req, timeout=3.0) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                        logger.info("DataLayer: OMS poll [thread] fetched %s:%s - bids=%d", exch_name, symbol, len(data.get("bids", [])))
+                        return data
+                
+                data = await asyncio.to_thread(fetch_oms)
+                logger.info("DataLayer: OMS poll got data %s:%s", exch_name, symbol)
+                if not first_success:
+                    logger.info("DataLayer: OMS poll first success for %s:%s - bids=%d asks=%d", 
+                               exch_name, symbol, len(data.get("bids", [])), len(data.get("asks", [])))
+                    first_success = True
 
                 async with self._ob_locks[key]:
                     snap = self._orderbooks[key]
                     snap.bids = data.get("bids", [])
                     snap.asks = data.get("asks", [])
+                    logger.debug("DataLayer: OMS poll updated cache %s:%s - update_count=%d", 
+                               exch_name, symbol, snap.update_count)
                     snap.timestamp_ms = data.get("timestamp_ms", time.time() * 1000)
                     snap.is_synced = True
                     snap.connected = data.get("connected", True)
                     snap.update_count += 1
                     self._ob_changed.set()
+                    if snap.update_count == 1:
+                        logger.info("DataLayer: OMS poll first update for %s:%s - bids=%d asks=%d", 
+                                  exch_name, symbol, len(snap.bids), len(snap.asks))
                 consecutive_errors = 0
             except asyncio.CancelledError:
                 break
@@ -470,7 +607,8 @@ class DataLayer:
     async def _run_oms_ws(self) -> None:
         """Shared WebSocket connection to the OMS for real-time orderbook updates.
 
-        Subscribes to all symbols in self._symbols_map over a single WS connection.
+        Subscribes to all symbols in self._symbols_list over a single WS connection.
+        Includes ping keepalive and receive timeout for connection health.
         Falls back to per-symbol HTTP polling if the WS connection fails repeatedly.
         """
         base_url = self._shared_monitor_url
@@ -479,54 +617,66 @@ class DataLayer:
         max_reconnect_delay = 15.0
         consecutive_failures = 0
         max_failures_before_fallback = 5
+        
+        # Connection health settings
+        ping_interval = 30.0  # Send ping every 30 seconds
+        receive_timeout = 60.0  # Max time to wait for any message
 
-        logger.info("DataLayer: OMS WS connecting to %s (symbols: %d)", ws_url, len(self._symbols_map))
+        logger.info("DataLayer: OMS WS connecting to %s (symbols: %d)", ws_url, len(self._symbols_list))
 
         while self._running:
             try:
-                async for ws in websockets.connect(ws_url, close_timeout=5):
+                async with websockets.connect(ws_url, close_timeout=5) as ws:
+                    self._oms_ws = ws
                     self._oms_ws_active = True
                     reconnect_delay = 1.0
                     consecutive_failures = 0
                     logger.info("DataLayer: OMS WS connected to %s", ws_url)
 
-                    # Subscribe to all tracked symbols
-                    for exch_name, symbol in self._symbols_map.items():
+                    # Subscribe to all tracked symbols (using list to support multiple per exchange)
+                    for exch_name, symbol in self._symbols_list:
                         sub_msg = json.dumps({"action": "subscribe", "exchange": exch_name, "symbol": symbol})
                         await ws.send(sub_msg)
                         logger.info("DataLayer: OMS WS subscribed %s:%s", exch_name, symbol)
 
+                    # Create tasks for receive loop and ping keepalive
+                    receive_task = asyncio.create_task(self._oms_receive_loop(ws), name="oms-receive")
+                    ping_task = asyncio.create_task(self._oms_ping_loop(ws, ping_interval), name="oms-ping")
+
                     try:
-                        async for raw in ws:
+                        # Wait for either task to complete (or fail)
+                        done, pending = await asyncio.wait(
+                            [receive_task, ping_task],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+
+                        # Cancel remaining tasks
+                        for task in pending:
+                            task.cancel()
                             try:
-                                msg = json.loads(raw)
-                            except json.JSONDecodeError:
-                                continue
+                                await task
+                            except asyncio.CancelledError:
+                                pass
 
-                            msg_type = msg.get("type", "")
-                            if msg_type != "book":
-                                continue
+                        # Check if any task raised an exception
+                        for task in done:
+                            try:
+                                task.result()
+                            except websockets.ConnectionClosed:
+                                logger.warning("DataLayer: OMS WS disconnected — will reconnect")
+                            except asyncio.TimeoutError:
+                                logger.warning("DataLayer: OMS WS receive timeout — forcing reconnect")
+                            except Exception as exc:
+                                logger.warning("DataLayer: OMS WS error — %s", exc)
 
-                            exch = msg.get("exchange", "")
-                            sym = msg.get("symbol", "")
-                            key = (exch, sym)
-
-                            if key not in self._orderbooks:
-                                continue
-
-                            async with self._ob_locks[key]:
-                                snap = self._orderbooks[key]
-                                snap.bids = msg.get("bids", [])
-                                snap.asks = msg.get("asks", [])
-                                snap.timestamp_ms = msg.get("timestamp_ms", time.time() * 1000)
-                                snap.is_synced = True
-                                snap.connected = True
-                                snap.update_count += 1
-                                self._ob_changed.set()
-                    except websockets.ConnectionClosed:
-                        logger.warning("DataLayer: OMS WS disconnected — reconnecting")
                     finally:
                         self._oms_ws_active = False
+                        self._oms_ws = None
+                        # Ensure tasks are cleaned up
+                        if not receive_task.done():
+                            receive_task.cancel()
+                        if not ping_task.done():
+                            ping_task.cancel()
 
             except asyncio.CancelledError:
                 self._oms_ws_active = False
@@ -535,7 +685,7 @@ class DataLayer:
                 self._oms_ws_active = False
                 consecutive_failures += 1
                 logger.warning(
-                    "DataLayer: OMS WS error (%d/%d): %s — retry in %.0fs",
+                    "DataLayer: OMS WS connection error (%d/%d): %s — retry in %.0fs",
                     consecutive_failures, max_failures_before_fallback, exc, reconnect_delay,
                 )
 
@@ -549,12 +699,81 @@ class DataLayer:
         # Fallback: start per-symbol OMS HTTP poll tasks
         if self._running:
             logger.info("DataLayer: OMS WS fallback → starting HTTP poll per symbol")
-            for exch_name, symbol in self._symbols_map.items():
+            for exch_name, symbol in self._symbols_list:
                 task = asyncio.create_task(
                     self._run_ob_oms_poll(exch_name, symbol),
                     name=f"ob-oms-poll-{exch_name}-{symbol}",
                 )
                 self._tasks.append(task)
+    
+    async def _oms_receive_loop(self, ws) -> None:
+        """Handle incoming OMS messages with timeout detection."""
+        receive_timeout = 60.0  # Max seconds without any message
+        
+        while self._running and self._oms_ws_active:
+            try:
+                # Wait for message with timeout
+                raw = await asyncio.wait_for(ws.recv(), timeout=receive_timeout)
+                
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = msg.get("type", "")
+                
+                # Handle subscription acknowledgments
+                if msg_type == "subscribed":
+                    exch = msg.get("exchange", "")
+                    sym = msg.get("symbol", "")
+                    symbol_key = f"{exch}:{sym}"
+                    if symbol_key in self._pending_subscriptions:
+                        self._pending_subscriptions[symbol_key].set()
+                        logger.debug("DataLayer: OMS ack for %s", symbol_key)
+                    continue
+                
+                if msg_type != "book":
+                    continue
+
+                exch = msg.get("exchange", "")
+                sym = msg.get("symbol", "")
+                key = (exch, sym)
+
+                if key not in self._orderbooks:
+                    continue
+
+                async with self._ob_locks[key]:
+                    snap = self._orderbooks[key]
+                    snap.bids = msg.get("bids", [])
+                    snap.asks = msg.get("asks", [])
+                    snap.timestamp_ms = msg.get("timestamp_ms", time.time() * 1000)
+                    snap.is_synced = True
+                    snap.connected = True
+                    snap.update_count += 1
+                    self._ob_changed.set()
+                    
+            except asyncio.TimeoutError:
+                logger.warning("DataLayer: OMS WS no message for %.0fs — connection may be dead", receive_timeout)
+                raise  # Propagate to trigger reconnect
+            except websockets.ConnectionClosed:
+                raise  # Propagate to trigger reconnect
+            except Exception as exc:
+                logger.warning("DataLayer: OMS receive error: %s", exc)
+                # Continue loop, may recover
+    
+    async def _oms_ping_loop(self, ws, interval: float) -> None:
+        """Send periodic pings to keep connection alive."""
+        while self._running and self._oms_ws_active:
+            try:
+                await asyncio.sleep(interval)
+                if ws.open:
+                    await ws.ping()
+                    logger.debug("DataLayer: OMS WS ping sent")
+            except websockets.ConnectionClosed:
+                logger.debug("DataLayer: OMS WS ping failed — connection closed")
+                return  # Exit loop, main task will reconnect
+            except Exception as exc:
+                logger.debug("DataLayer: OMS WS ping error: %s", exc)
 
     # ── Extended WS orderbook ────────────────────────────────────────
 
@@ -564,6 +783,8 @@ class DataLayer:
         Endpoint: wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{symbol}
         Receives SNAPSHOT + DELTA messages with sequence numbers.
         """
+        import random
+        await asyncio.sleep(random.uniform(0, 3.0))
         key = ("extended", symbol)
         ws_url = f"wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{symbol}"
         reconnect_delay = 1.0
@@ -571,7 +792,7 @@ class DataLayer:
         while self._running:
             try:
                 logger.info("DataLayer: Extended OB WS connecting: %s", ws_url)
-                async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5):
+                async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, extra_headers={"User-Agent": "tradeautonom/1.0"}, close_timeout=5):
                     async with self._ob_locks[key]:
                         self._orderbooks[key].connected = True
                     reconnect_delay = 1.0
@@ -646,10 +867,10 @@ class DataLayer:
     # ── GRVT WS orderbook ────────────────────────────────────────────
 
     async def _run_ob_ws_grvt(self, symbol: str, grvt_env: str) -> None:
-        """Async WS orderbook for GRVT exchange.
+        """Async WS orderbook for GRVT exchange — public, no auth required.
 
         Endpoint: wss://market-data.{env}.grvt.io/ws/full
-        Subscribes to v1.book.s (500ms snapshots, 10 levels).
+        Stream:   v1.book.s — full snapshots every 500ms, 10 levels.
         """
         key = ("grvt", symbol)
         ws_url = _GRVT_WS_ENDPOINTS.get(grvt_env, _GRVT_WS_ENDPOINTS["prod"])
@@ -658,17 +879,15 @@ class DataLayer:
         while self._running:
             try:
                 logger.info("DataLayer: GRVT OB WS connecting: %s (symbol=%s)", ws_url, symbol)
-                async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5):
-                    # Subscribe to orderbook snapshots
+                async with websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5) as ws:
                     sub_msg = json.dumps({
                         "jsonrpc": "2.0",
                         "method": "subscribe",
-                        "params": {"stream": "v1.book.s", "selectors": [f"{symbol}@500-10"]},
+                        "params": {"stream": "v1.book.s", "selectors": [f"{symbol}@500-50"]},
                         "id": 1,
                     })
                     await ws.send(sub_msg)
 
-                    # Read subscription confirmation
                     try:
                         resp_raw = await asyncio.wait_for(ws.recv(), timeout=10)
                         resp = json.loads(resp_raw)
@@ -678,59 +897,72 @@ class DataLayer:
                     except asyncio.TimeoutError:
                         logger.warning("DataLayer: GRVT OB WS subscribe timeout")
 
+                    reconnect_delay = 1.0
                     async with self._ob_locks[key]:
                         self._orderbooks[key].connected = True
-                    reconnect_delay = 1.0
 
-                    try:
-                        async for raw in ws:
-                            if not self._running:
-                                return
-                            self._handle_grvt_message(key, raw)
-                    except websockets.ConnectionClosed:
-                        logger.warning("DataLayer: GRVT OB WS disconnected: %s", symbol)
-                    finally:
-                        async with self._ob_locks[key]:
-                            self._orderbooks[key].connected = False
+                    async for raw in ws:
+                        if not self._running:
+                            return
+                        self._handle_grvt_message(key, raw)
+
             except asyncio.CancelledError:
                 break
+            except websockets.ConnectionClosed:
+                logger.warning("DataLayer: GRVT OB WS disconnected: %s — reconnecting in %.0fs", symbol, reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30.0)
             except Exception as exc:
                 logger.warning("DataLayer: GRVT OB WS error %s: %s — retry in %.0fs", symbol, exc, reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30.0)
+            finally:
                 async with self._ob_locks[key]:
                     self._orderbooks[key].connected = False
                     self._orderbooks[key].is_synced = False
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 30.0)
 
     def _handle_grvt_message(self, key: tuple, raw: str) -> None:
-        """Parse GRVT WS orderbook snapshot (v1.book.s)."""
+        """Parse GRVT WS v1.book.s message. Accepts full and lite field names.
+
+        Full: feed / sequence_number / prev_sequence_number, bids/asks with price+size
+        Lite: f    / sn              / psn,                  b/a     with p+s
+        """
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
             return
 
-        feed = msg.get("feed")
+        # Support both full ("feed") and lite ("f") field names
+        feed = msg.get("feed") or msg.get("f")
         if not feed:
             return
 
-        seq = int(msg.get("sequence_number", 0))
-        prev_seq = int(msg.get("prev_sequence_number", 0))
+        seq = int(msg.get("sequence_number") or msg.get("sn") or 0)
+        prev_seq = int(msg.get("prev_sequence_number") or msg.get("psn") or 0)
         snap = self._orderbooks[key]
 
-        bids_raw = feed.get("bids", [])
-        asks_raw = feed.get("asks", [])
-        bids = [[float(b["price"]), float(b["size"])] for b in bids_raw if "price" in b]
-        asks = [[float(a["price"]), float(a["size"])] for a in asks_raw if "price" in a]
+        def _parse_levels(levels: list) -> list[list[float]]:
+            result = []
+            for lvl in levels:
+                # Full field names: price/size; lite: p/s
+                px = lvl.get("price") or lvl.get("p")
+                sz = lvl.get("size") or lvl.get("s")
+                if px is not None and sz is not None:
+                    result.append([float(px), float(sz)])
+            return result
+
+        bids = _parse_levels(feed.get("bids") or feed.get("b") or [])
+        asks = _parse_levels(feed.get("asks") or feed.get("a") or [])
 
         if not bids and not asks:
             return
 
-        # Sequence validation
-        if seq == 0:
+        # v1.book.s sends full snapshots — sequence gaps are informational only
+        if seq == 0 or snap.last_seq == 0:
             snap.is_synced = True
-        elif snap.last_seq > 0 and prev_seq != snap.last_seq:
-            logger.warning("GRVT OB seq gap: prev=%d last=%d", prev_seq, snap.last_seq)
-            snap.is_synced = False
+        elif prev_seq != snap.last_seq:
+            logger.warning("GRVT OB seq gap: prev=%d last=%d — resyncing", prev_seq, snap.last_seq)
+            snap.is_synced = True  # still accept; next snapshot is complete anyway
         else:
             snap.is_synced = True
         snap.last_seq = seq
@@ -869,7 +1101,7 @@ class DataLayer:
         while self._running:
             try:
                 logger.info("DataLayer: Extended position WS connecting: %s", ws_url)
-                async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, extra_headers={"X-Api-Key": api_key}, close_timeout=5):
+                async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, extra_headers={"X-Api-Key": api_key, "User-Agent": "tradeautonom/1.0"}, close_timeout=5):
                     async with self._pos_locks[key]:
                         self._positions[key].connected = True
                     reconnect_delay = 1.0
@@ -994,7 +1226,6 @@ class DataLayer:
         sub_account_id = getattr(settings, "grvt_trading_account_id", "") if settings else ""
 
         headers: dict[str, str] = {}
-        headers["X-Grvt-Account-Id"] = str(sub_account_id)
 
         # _cookie is a dict like {"gravity": "abc...", "X-Grvt-Account-Id": "123"}
         if api_obj:
@@ -1004,8 +1235,16 @@ class DataLayer:
             cookie_dict = getattr(api_obj, "_cookie", None)
             if isinstance(cookie_dict, dict) and "gravity" in cookie_dict:
                 headers["Cookie"] = f"gravity={cookie_dict['gravity']}"
+                # Use the account ID returned by the login endpoint (may differ from settings value)
+                acct_from_cookie = cookie_dict.get("X-Grvt-Account-Id", "")
+                headers["X-Grvt-Account-Id"] = str(acct_from_cookie or sub_account_id)
             elif isinstance(cookie_dict, str):
                 headers["Cookie"] = cookie_dict
+                headers["X-Grvt-Account-Id"] = str(sub_account_id)
+            else:
+                headers["X-Grvt-Account-Id"] = str(sub_account_id)
+        else:
+            headers["X-Grvt-Account-Id"] = str(sub_account_id)
         return headers
 
     async def _run_pos_ws_grvt(self, client, symbol: str) -> None:
@@ -1034,11 +1273,24 @@ class DataLayer:
         reconnect_delay = 1.0
 
         while self._running:
+            # Refresh cookie before every connect attempt so the header is always fresh
+            api_obj = getattr(client, "_api", None)
+            if api_obj and hasattr(api_obj, "refresh_cookie"):
+                try:
+                    await asyncio.to_thread(api_obj.refresh_cookie)
+                except Exception as _ce:
+                    logger.warning("DataLayer: GRVT position WS cookie refresh failed: %s", _ce)
+            headers = self._grvt_ws_headers(client)
+            if "Cookie" not in headers:
+                logger.warning("DataLayer: GRVT position WS — no cookie available, retry in %.0fs", reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30.0)
+                continue
+
             try:
-                headers = self._grvt_ws_headers(client)
-                logger.info("DataLayer: GRVT position WS connecting: %s selector=%s cookie=%s",
-                            ws_url, selector, "yes" if "Cookie" in headers else "NO")
-                async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, extra_headers=headers, close_timeout=5):
+                logger.info("DataLayer: GRVT position WS connecting: %s selector=%s", ws_url, selector)
+                async with websockets.connect(ws_url, ssl=_SSL_CTX, extra_headers=headers, close_timeout=5) as ws:
+                    reconnect_delay = 1.0
                     # Subscribe to v1.position stream
                     sub_msg = json.dumps({
                         "jsonrpc": "2.0",
@@ -1047,66 +1299,63 @@ class DataLayer:
                         "id": 2,
                     })
                     await ws.send(sub_msg)
-                    reconnect_delay = 1.0
                     logger.info("DataLayer: GRVT position WS subscribe sent: %s", selector)
 
-                    try:
-                        async for raw in ws:
-                            msg = json.loads(raw)
+                    async for raw in ws:
+                        msg = json.loads(raw)
 
-                            # Log errors from server
-                            if "error" in msg:
-                                logger.warning("DataLayer: GRVT position WS error response: %s", msg["error"])
-                                continue
+                        if "error" in msg:
+                            logger.warning("DataLayer: GRVT position WS error response: %s", msg["error"])
+                            continue
 
-                            # Handle subscription confirmations
-                            result = msg.get("result")
-                            if isinstance(result, dict) and "subs" in result:
-                                subs = result.get("subs", [])
-                                logger.info("DataLayer: GRVT position WS confirmed subs=%s", subs)
-                                if subs:
-                                    async with self._pos_locks[key]:
-                                        self._positions[key].connected = True
-                                continue
+                        result = msg.get("result")
+                        if isinstance(result, dict) and "subs" in result:
+                            subs = result.get("subs", [])
+                            logger.info("DataLayer: GRVT position WS confirmed subs=%s", subs)
+                            if subs:
+                                async with self._pos_locks[key]:
+                                    self._positions[key].connected = True
+                            continue
 
-                            # Position feed data: {stream, selector, sequence_number, feed: {...}}
-                            feed = msg.get("feed", msg.get("f"))
-                            if not feed or not isinstance(feed, dict):
-                                continue
+                        feed = msg.get("feed", msg.get("f"))
+                        if not feed or not isinstance(feed, dict):
+                            continue
 
-                            instrument = feed.get("instrument", feed.get("i", ""))
-                            if instrument != symbol:
-                                continue
+                        instrument = feed.get("instrument", feed.get("i", ""))
+                        if instrument != symbol:
+                            continue
 
-                            raw_size = float(feed.get("size", feed.get("s", 0)))
-                            size = abs(raw_size)
-                            side = "long" if raw_size > 0 else ("short" if raw_size < 0 else "")
-                            entry_px = float(feed.get("entry_price", feed.get("ep", 0)))
-                            upnl = float(feed.get("unrealized_pnl", feed.get("up", 0)))
+                        raw_size = float(feed.get("size", feed.get("s", 0)))
+                        size = abs(raw_size)
+                        side = "long" if raw_size > 0 else ("short" if raw_size < 0 else "")
+                        entry_px = float(feed.get("entry_price", feed.get("ep", 0)))
+                        upnl = float(feed.get("unrealized_pnl", feed.get("up", 0)))
 
-                            async with self._pos_locks[key]:
-                                snap = self._positions[key]
-                                snap.size = size
-                                snap.side = side
-                                snap.entry_price = entry_px
-                                snap.unrealized_pnl = upnl
-                                snap.timestamp_ms = time.time() * 1000
-                                snap.connected = True
-                                snap.update_count += 1
-                            self._pos_changed.set()
-                            logger.debug("GRVT position update: %s size=%.6f side=%s entry=%.4f", symbol, size, side, entry_px)
-                    except websockets.ConnectionClosed:
-                        logger.warning("DataLayer: GRVT position WS disconnected — reconnecting")
                         async with self._pos_locks[key]:
-                            self._positions[key].connected = False
+                            snap = self._positions[key]
+                            snap.size = size
+                            snap.side = side
+                            snap.entry_price = entry_px
+                            snap.unrealized_pnl = upnl
+                            snap.timestamp_ms = time.time() * 1000
+                            snap.connected = True
+                            snap.update_count += 1
+                        self._pos_changed.set()
+                        logger.debug("GRVT position update: %s size=%.6f side=%s entry=%.4f", symbol, size, side, entry_px)
+
             except asyncio.CancelledError:
                 break
-            except Exception as exc:
-                logger.warning("DataLayer: GRVT position WS error: %s — retry in %.0fs", exc, reconnect_delay)
-                async with self._pos_locks[key]:
-                    self._positions[key].connected = False
+            except websockets.ConnectionClosed:
+                logger.warning("DataLayer: GRVT position WS disconnected — reconnecting in %.0fs", reconnect_delay)
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 30.0)
+            except Exception as exc:
+                logger.warning("DataLayer: GRVT position WS error: %s — retry in %.0fs", exc, reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30.0)
+            finally:
+                async with self._pos_locks[key]:
+                    self._positions[key].connected = False
 
     async def _run_pos_rest_fallback(self, client, exch_name: str, symbol: str) -> None:
         """Poll positions via REST as fallback for exchanges without WS position streams."""

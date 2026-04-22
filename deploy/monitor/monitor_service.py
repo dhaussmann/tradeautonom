@@ -9,6 +9,7 @@ Endpoints:
   GET /health                    — service health check
   GET /status                    — overview of all tracked feeds
   GET /tracked                   — auto-discovered pairs grouped by base token
+  GET /nado/symbols              — Nado symbol status (active/inactive)
 """
 
 from __future__ import annotations
@@ -19,11 +20,25 @@ import logging
 import ssl
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import httpx
 import websockets
+import yaml
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from websockets.extensions.permessage_deflate import ClientPerMessageDeflateFactory
+
+# Import Nado watchdog modules
+try:
+    from nado_watchdog import NadoWatchdog, SymbolState, get_watchdog
+    from nado_persistence import NadoPersistence, get_persistence
+    from nado_discovery import NadoDiscovery, get_discovery
+    from nado_websocket import NadoWebSocketManager, get_websocket_manager, handle_nado_book_message
+    NADO_WATCHDOG_AVAILABLE = True
+except ImportError as e:
+    NADO_WATCHDOG_AVAILABLE = False
+    print(f"Warning: Nado watchdog modules not available: {e}")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("oms")
@@ -57,7 +72,7 @@ _ws_alias_map: dict[WebSocket, dict[tuple[str, str], tuple[str, str]]] = {}
 
 # ── Exchange WS configs ──────────────────────────────────────────────
 
-_EXTENDED_WS_TPL = "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{symbol}"
+_EXTENDED_WS_ALL = "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks"
 
 _GRVT_WS_ENDPOINTS = {
     "dev": "wss://market-data.dev.gravitymarkets.io/ws/full",
@@ -91,6 +106,58 @@ _ARB_EXCHANGES = set(os.environ.get("OMS_ARB_EXCHANGES", "grvt,extended,nado").s
 _ARB_EXCLUDED_TOKENS = set(os.environ.get("OMS_ARB_EXCLUDED_TOKENS", "WTI,MEGA,AMZN,AAPL,TSLA,HOOD,META,USDJPY").split(","))
 _TAKER_FEE_PCT = {"extended": 0.0225, "nado": 0.035, "grvt": 0.039}
 _ARB_FEE_BUFFER_BPS = float(os.environ.get("OMS_ARB_FEE_BUFFER_BPS", "1.0"))
+
+# ── Nado Watchdog Configuration ───────────────────────────────────────
+_nado_config: dict = {}
+_nado_watchdog: Any = None
+_nado_persistence: Any = None
+_nado_discovery: Any = None
+_nado_ws_manager: Any = None
+
+
+def _load_nado_config() -> dict:
+    """Load Nado watchdog configuration from YAML file."""
+    config_path = "/app/nado_config.yaml"
+    try:
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        logger.warning(f"Nado config not found at {config_path}, using defaults")
+        return {
+            "default_active_symbols": [],
+            "watchdog": {
+                "suspect_threshold_seconds": 120,
+                "retry_max_attempts": 10,
+                "retry_base_delay_seconds": 10,
+                "retry_max_delay_seconds": 7200,
+                "reactivation_check_interval_hours": 24,
+                "state_persistence_path": "/app/data/nado_watchdog_state.json",
+            },
+            "discovery": {
+                "interval_hours": 24,
+                "test_duration_seconds": 30,
+                "nado_api_url": "https://gateway.prod.nado.xyz",
+            },
+            "websocket": {
+                "endpoint": "wss://gateway.prod.nado.xyz/v1/subscribe",
+                "subscription_delay_ms": 50,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Failed to load Nado config: {e}")
+        return {}
+
+
+# ── Concurrency control for Nado WS connections ───────────────────────
+# Nado uses separate WS per symbol; limit concurrent connection attempts
+# to avoid overwhelming the server and hitting rate limits.
+# Reduced to 2 due to Nado server capacity constraints.
+_NADO_WS_SEMAPHORE = asyncio.Semaphore(2)
+
+# ── Concurrency control for GRVT WS connections ───────────────────────
+# GRVT also uses separate WS per symbol; limit concurrent connections
+# to avoid rate limiting (90 symbols, limit to 10 concurrent).
+_GRVT_WS_SEMAPHORE = asyncio.Semaphore(10)
 
 
 def _min_profit_bps(buy_exch: str, sell_exch: str) -> float:
@@ -173,6 +240,152 @@ def status():
             "ask_levels": len(snap.asks),
         }
     return result
+
+
+# ── Nado Watchdog API Endpoints ───────────────────────────────────────
+
+@app.get("/nado/symbols")
+async def nado_symbols():
+    """Get status of all Nado symbols managed by watchdog."""
+    if not NADO_WATCHDOG_AVAILABLE or _nado_watchdog is None:
+        raise HTTPException(status_code=503, detail="Nado watchdog not available")
+    
+    stats = _nado_watchdog.get_statistics()
+    now = time.time()
+    
+    result = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "summary": stats,
+        "symbols": {},
+    }
+    
+    # Group symbols by state
+    for state in SymbolState:
+        symbols = _nado_watchdog.get_symbols_by_state(state)
+        result["symbols"][state.value] = []
+        
+        for symbol in symbols:
+            info = _nado_watchdog.get_symbol(symbol)
+            if info:
+                symbol_data = {
+                    "symbol": symbol,
+                    "product_id": info.product_id,
+                    "state": info.state.value,
+                    "update_count": info.update_count,
+                }
+                
+                # Add timing info if available
+                if info.last_update:
+                    seconds_since = now - info.last_update.timestamp()
+                    symbol_data["seconds_since_update"] = round(seconds_since, 1)
+                
+                if info.retry_attempt > 0:
+                    symbol_data["retry_attempt"] = info.retry_attempt
+                
+                result["symbols"][state.value].append(symbol_data)
+    
+    return result
+
+
+@app.get("/nado/symbol/{symbol}")
+async def nado_symbol_detail(symbol: str):
+    """Get detailed information about a specific Nado symbol."""
+    if not NADO_WATCHDOG_AVAILABLE or _nado_watchdog is None:
+        raise HTTPException(status_code=503, detail="Nado watchdog not available")
+    
+    info = _nado_watchdog.get_symbol(symbol)
+    if not info:
+        raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
+    
+    now = time.time()
+    
+    result = {
+        "symbol": symbol,
+        "product_id": info.product_id,
+        "state": info.state.value,
+        "added_at": info.added_at.isoformat() if info.added_at else None,
+        "update_count": info.update_count,
+    }
+    
+    # Timing info
+    if info.last_update:
+        seconds_since = now - info.last_update.timestamp()
+        result["last_update"] = info.last_update.isoformat()
+        result["seconds_since_update"] = round(seconds_since, 1)
+    
+    # Retry info
+    if info.retry_attempt > 0:
+        result["retry"] = {
+            "attempt": info.retry_attempt,
+            "max_attempts": _nado_watchdog.retry_max_attempts,
+        }
+        if info.retry_next_at:
+            result["retry"]["next_at"] = info.retry_next_at.isoformat()
+    
+    # Inactive info
+    if info.inactive_since:
+        result["inactive_since"] = info.inactive_since.isoformat()
+    
+    # Book data
+    key = ("nado", symbol)
+    if key in _books:
+        book = _books[key]
+        result["book"] = {
+            "bid_levels": len(book.bids),
+            "ask_levels": len(book.asks),
+            "has_data": bool(book.bids and book.asks),
+            "connected": book.connected,
+        }
+    
+    return result
+
+
+@app.post("/nado/force-discovery")
+async def nado_force_discovery():
+    """Manually trigger symbol discovery and testing."""
+    if not NADO_WATCHDOG_AVAILABLE or _nado_discovery is None:
+        raise HTTPException(status_code=503, detail="Nado discovery not available")
+    
+    logger.info("Manual discovery triggered via API")
+    result = await _nado_discovery.run_full_cycle()
+    
+    return {
+        "success": True,
+        "timestamp": datetime.utcnow().isoformat(),
+        "result": result,
+    }
+
+
+@app.get("/nado/health")
+async def nado_health():
+    """Get Nado watchdog system health status."""
+    if not NADO_WATCHDOG_AVAILABLE:
+        return {
+            "available": False,
+            "message": "Nado watchdog modules not loaded",
+        }
+    
+    if _nado_watchdog is None:
+        return {
+            "available": False,
+            "message": "Nado watchdog not initialized",
+        }
+    
+    ws_stats = {}
+    if _nado_ws_manager:
+        ws_stats = _nado_ws_manager.get_connection_stats()
+    
+    persistence_info = {}
+    if _nado_persistence:
+        persistence_info = _nado_persistence.get_state_file_info()
+    
+    return {
+        "available": True,
+        "timestamp": datetime.utcnow().isoformat(),
+        "statistics": _nado_watchdog.get_statistics(),
+        "websocket": ws_stats,
+        "persistence": persistence_info,
+    }
 
 
 def _resolve_variational_alias(exchange: str, symbol: str) -> tuple[str, str]:
@@ -966,17 +1179,28 @@ async def startup():
 
     # Group variational symbols for single shared poll
     variational_symbols: list[str] = []
+    grvt_symbols: list[str] = []
+    nado_symbols: list[str] = []
+    extended_started = False
 
     for exch, sym in pairs:
         key = (exch, sym)
         _books[key] = BookSnapshot()
 
         if exch == "extended":
-            task = asyncio.create_task(_run_extended_ws(sym), name=f"ws-{exch}-{sym}")
+            if not extended_started:
+                # Single shared WS connection for all Extended markets
+                task = asyncio.create_task(_run_extended_ws_all(), name="ws-extended-all")
+                _tasks.append(task)
+                logger.info("OMS: started single shared Extended WS feed")
+                extended_started = True
+            continue  # book entry already created above
         elif exch == "grvt":
-            task = asyncio.create_task(_run_grvt_ws(sym), name=f"ws-{exch}-{sym}")
+            grvt_symbols.append(sym)
+            continue  # started as single shared task below
         elif exch == "nado":
-            task = asyncio.create_task(_run_nado_ws(sym), name=f"ws-{exch}-{sym}")
+            nado_symbols.append(sym)
+            continue  # started as single shared task below
         elif exch == "variational":
             variational_symbols.append(sym)
             continue  # started as single shared task below
@@ -984,8 +1208,19 @@ async def startup():
             logger.warning("OMS: unknown exchange '%s', skipping", exch)
             continue
 
+    # Single shared GRVT WS connection for all symbols
+    if grvt_symbols:
+        task = asyncio.create_task(_run_grvt_ws_all(grvt_symbols), name="ws-grvt-all")
         _tasks.append(task)
-        logger.info("OMS: started feed for %s:%s", exch, sym)
+        logger.info("OMS: started single shared GRVT WS feed for %d symbols", len(grvt_symbols))
+
+    # Single shared Nado WS connection for all symbols
+    # NOTE: New watchdog-based implementation - see below
+    # Legacy implementation kept for fallback
+    if nado_symbols and not NADO_WATCHDOG_AVAILABLE:
+        task = asyncio.create_task(_run_nado_ws_all(nado_symbols), name="ws-nado-all")
+        _tasks.append(task)
+        logger.info("OMS: started single shared Nado WS feed for %d symbols", len(nado_symbols))
 
     # Single shared Variational poll for all symbols
     if variational_symbols:
@@ -996,6 +1231,10 @@ async def startup():
         _tasks.append(task)
         logger.info("OMS: started shared Variational poll for %d symbols", len(variational_symbols))
 
+    # Initialize Nado Watchdog System
+    if NADO_WATCHDOG_AVAILABLE:
+        await _init_nado_watchdog()
+
     # Start arbitrage scanner (delay 10s to let feeds connect first)
     async def _delayed_arb_start():
         await asyncio.sleep(10)
@@ -1005,8 +1244,133 @@ async def startup():
     logger.info("OMS: arbitrage scanner scheduled (starts in 10s)")
 
 
+async def _init_nado_watchdog() -> None:
+    """Initialize Nado watchdog system with dynamic symbol management."""
+    global _nado_config, _nado_watchdog, _nado_persistence, _nado_discovery, _nado_ws_manager
+    
+    logger.info("OMS: Initializing Nado Watchdog System")
+    
+    # Load configuration
+    _nado_config = _load_nado_config()
+    wd_config = _nado_config.get("watchdog", {})
+    disc_config = _nado_config.get("discovery", {})
+    ws_config = _nado_config.get("websocket", {})
+    
+    # Initialize watchdog directly (not via singleton getter to allow config)
+    from nado_watchdog import NadoWatchdog
+    _nado_watchdog = NadoWatchdog(
+        suspect_threshold_seconds=wd_config.get("suspect_threshold_seconds", 120),
+        retry_max_attempts=wd_config.get("retry_max_attempts", 10),
+        retry_base_delay_seconds=wd_config.get("retry_base_delay_seconds", 10),
+        retry_max_delay_seconds=wd_config.get("retry_max_delay_seconds", 7200),
+        reactivation_check_interval_hours=wd_config.get("reactivation_check_interval_hours", 24),
+    )
+    
+    # Initialize persistence directly
+    from nado_persistence import NadoPersistence
+    state_path = wd_config.get("state_persistence_path", "/app/data/nado_watchdog_state.json")
+    _nado_persistence = NadoPersistence(state_path)
+    _nado_persistence.initialize(_nado_watchdog)
+    
+    # Try to load persisted state
+    loaded = await _nado_persistence.load_state()
+    
+    if not loaded or not _nado_watchdog.get_all_symbols():
+        # No persisted state, initialize with default symbols
+        default_symbols = _nado_config.get("default_active_symbols", [])
+        logger.info(f"OMS: Initializing watchdog with {len(default_symbols)} default symbols")
+        
+        # We need to fetch product IDs for the default symbols
+        # For now, use hardcoded mapping from our earlier test
+        product_map = {
+            "BTC-PERP": 2, "ETH-PERP": 4, "SOL-PERP": 8, "XRP-PERP": 10,
+            "BNB-PERP": 14, "HYPE-PERP": 16, "ZEC-PERP": 18, "FARTCOIN-PERP": 22,
+            "SUI-PERP": 24, "XAUT-PERP": 28, "PUMP-PERP": 30, "TAO-PERP": 32,
+            "XMR-PERP": 34, "LIT-PERP": 36, "kPEPE-PERP": 38, "PENGU-PERP": 40,
+            "USELESS-PERP": 42, "SKR-PERP": 44, "UNI-PERP": 46, "ASTER-PERP": 48,
+            "XPL-PERP": 50, "DOGE-PERP": 52, "WLFI-PERP": 54, "kBONK-PERP": 56,
+            "ZRO-PERP": 58, "ADA-PERP": 60, "ARB-PERP": 62, "AVAX-PERP": 64,
+            "AXS-PERP": 66, "BCH-PERP": 68, "BERA-PERP": 70, "ENA-PERP": 72,
+            "LINK-PERP": 74, "LTC-PERP": 76, "NEAR-PERP": 78, "ONDO-PERP": 80,
+            "SKY-PERP": 82, "VIRTUAL-PERP": 84, "JUP-PERP": 86, "XAG-PERP": 88,
+            "WTI-PERP": 90, "EURUSD-PERP": 92, "GBPUSD-PERP": 94, "USDJPY-PERP": 96,
+            "QQQ-PERP": 98, "SPY-PERP": 100, "AAPL-PERP": 102, "AMZN-PERP": 104,
+            "GOOGL-PERP": 106, "META-PERP": 108, "MSFT-PERP": 110, "NVDA-PERP": 112,
+            "TSLA-PERP": 114, "AAVE-PERP": 26,
+        }
+        
+        for symbol in default_symbols:
+            if symbol in product_map:
+                _nado_watchdog.add_symbol(symbol, product_map[symbol], SymbolState.ACTIVE)
+                # Initialize book snapshot
+                _books[("nado", symbol)] = BookSnapshot()
+    else:
+        logger.info(f"OMS: Loaded {_nado_watchdog.get_statistics()['total']} symbols from persisted state")
+        # Initialize book snapshots for loaded symbols
+        for symbol in _nado_watchdog.get_all_symbols():
+            _books[("nado", symbol)] = BookSnapshot()
+    
+    # Start auto-persistence
+    await _nado_persistence.start_auto_persist(interval_seconds=60.0)
+    logger.info("OMS: Nado auto-persistence started")
+    
+    # Initialize WebSocket manager directly
+    from nado_websocket import NadoWebSocketManager
+    _nado_ws_manager = NadoWebSocketManager(
+        endpoint=ws_config.get("endpoint", "wss://gateway.prod.nado.xyz/v1/subscribe"),
+        subscription_delay_ms=ws_config.get("subscription_delay_ms", 50),
+        watchdog=_nado_watchdog,
+    )
+    
+    # Register message handler (pass watchdog for update tracking)
+    _nado_ws_manager.register_message_handler(
+        lambda symbol, msg: handle_nado_book_message(symbol, msg, _books, _nado_watchdog)
+    )
+    
+    # Start WebSocket manager
+    await _nado_ws_manager.start()
+    logger.info("OMS: Nado WebSocket manager started")
+    
+    # Initialize discovery directly
+    from nado_discovery import NadoDiscovery
+    _nado_discovery = NadoDiscovery(
+        api_url=disc_config.get("nado_api_url", "https://gateway.prod.nado.xyz"),
+        test_duration_seconds=disc_config.get("test_duration_seconds", 30),
+        watchdog=_nado_watchdog,
+    )
+    
+    # Run initial discovery in background (non-blocking)
+    async def _background_discovery():
+        await asyncio.sleep(30)  # Wait for initial connections
+        logger.info("OMS: Running initial Nado discovery")
+        await _nado_discovery.run_full_cycle()
+    
+    discovery_task = asyncio.create_task(_background_discovery(), name="nado-discovery-initial")
+    _tasks.append(discovery_task)
+    
+    # Start scheduled discovery
+    async def _scheduled_discovery():
+        await _nado_discovery.start_scheduled_discovery(
+            interval_hours=disc_config.get("interval_hours", 24)
+        )
+    
+    scheduled_task = asyncio.create_task(_scheduled_discovery(), name="nado-discovery-scheduled")
+    _tasks.append(scheduled_task)
+    
+    logger.info("OMS: Nado Watchdog System initialized successfully")
+
+
 @app.on_event("shutdown")
 async def shutdown():
+    # Stop Nado watchdog system first
+    if NADO_WATCHDOG_AVAILABLE:
+        logger.info("OMS: Shutting down Nado watchdog system")
+        if _nado_ws_manager:
+            await _nado_ws_manager.stop()
+        if _nado_persistence:
+            await _nado_persistence.stop_auto_persist()
+    
+    # Cancel all tasks
     for task in _tasks:
         task.cancel()
     if _tasks:
@@ -1015,37 +1379,44 @@ async def shutdown():
     logger.info("OMS: shutdown complete")
 
 
-# ── Extended WS ──────────────────────────────────────────────────────
+# ── Extended WS — single shared connection for all markets ───────────
 
-async def _run_extended_ws(symbol: str) -> None:
-    key = ("extended", symbol)
-    ws_url = _EXTENDED_WS_TPL.format(symbol=symbol)
+async def _run_extended_ws_all() -> None:
+    """Single WS connection to Extended that receives all tracked markets."""
     reconnect_delay = 1.0
 
     while True:
         try:
-            logger.info("OMS: Extended WS connecting: %s", ws_url)
-            async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5):
-                _books[key].connected = True
-                reconnect_delay = 1.0
-                logger.info("OMS: Extended WS connected: %s", symbol)
-                try:
-                    async for raw in ws:
-                        _handle_extended_msg(key, raw)
-                except websockets.ConnectionClosed:
-                    logger.warning("OMS: Extended WS disconnected: %s", symbol)
-                finally:
-                    _books[key].connected = False
+            logger.info("OMS: Extended WS connecting (all markets): %s", _EXTENDED_WS_ALL)
+            ws = await websockets.connect(_EXTENDED_WS_ALL, ssl=_SSL_CTX, close_timeout=5, open_timeout=15)
+            reconnect_delay = 1.0
+            logger.info("OMS: Extended WS connected (all markets)")
+            # Mark all tracked Extended books as connected
+            for key in list(_books):
+                if key[0] == "extended":
+                    _books[key].connected = True
+            try:
+                async for raw in ws:
+                    _handle_extended_msg(raw)
+            except websockets.ConnectionClosed:
+                logger.warning("OMS: Extended WS disconnected")
+            finally:
+                for key in list(_books):
+                    if key[0] == "extended":
+                        _books[key].connected = False
+                await ws.close()
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.warning("OMS: Extended WS error %s: %s — retry in %.0fs", symbol, exc, reconnect_delay)
-            _books[key].connected = False
+            logger.warning("OMS: Extended WS error: %s — retry in %.0fs", exc, reconnect_delay)
+            for key in list(_books):
+                if key[0] == "extended":
+                    _books[key].connected = False
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 30.0)
 
 
-def _handle_extended_msg(key: tuple, raw: str) -> None:
+def _handle_extended_msg(raw: str) -> None:
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
@@ -1054,9 +1425,15 @@ def _handle_extended_msg(key: tuple, raw: str) -> None:
     if not data:
         return
 
-    msg_type = msg.get("type", "SNAPSHOT")
-    snap = _books[key]
+    symbol = data.get("m")
+    if not symbol:
+        return
+    key = ("extended", symbol)
+    snap = _books.get(key)
+    if snap is None:
+        return
 
+    msg_type = msg.get("type", "SNAPSHOT")
     bids_raw = data.get("b", [])
     asks_raw = data.get("a", [])
 
@@ -1105,60 +1482,103 @@ def _apply_delta(levels: list, deltas: list, reverse: bool) -> None:
 
 _X18_FLOAT = 1e18
 
-async def _run_grvt_ws(symbol: str) -> None:
-    key = ("grvt", symbol)
+# Cache for GRVT symbol to selector mapping
+_grvt_symbol_to_selector: dict[str, str] = {}
+
+async def _run_grvt_ws_all(symbols: list[str]) -> None:
+    """Single WS connection to GRVT for all tracked symbols.
+    
+    GRVT supports subscribing to multiple selectors in one connection.
+    Format: SYMBOL@INTERVAL-DEPTH (e.g., BTC_USDT_Perp@500-10)
+    """
     ws_url = _GRVT_WS_ENDPOINTS.get(_GRVT_ENV, _GRVT_WS_ENDPOINTS["prod"])
     reconnect_delay = 1.0
-
+    
+    # Build selector list for all symbols
+    selectors = [f"{sym}@500-10" for sym in symbols]
+    for sym in symbols:
+        _grvt_symbol_to_selector[sym.lower()] = f"{sym}@500-10"
+    
     while True:
         try:
-            logger.info("OMS: GRVT WS connecting: %s (symbol=%s)", ws_url, symbol)
-            async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5):
-                sub_msg = json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "subscribe",
-                    "params": {"stream": "v1.book.s", "selectors": [f"{symbol}@500-10"]},
-                    "id": 1,
-                })
-                await ws.send(sub_msg)
-                try:
-                    resp_raw = await asyncio.wait_for(ws.recv(), timeout=10)
-                    resp = json.loads(resp_raw)
-                    if "error" in resp:
-                        raise RuntimeError(f"GRVT subscribe error: {resp['error']}")
-                    logger.info("OMS: GRVT WS subscribed: %s", symbol)
-                except asyncio.TimeoutError:
-                    logger.warning("OMS: GRVT WS subscribe timeout")
-
-                _books[key].connected = True
-                reconnect_delay = 1.0
-
-                try:
-                    async for raw in ws:
-                        _handle_grvt_msg(key, raw)
-                except websockets.ConnectionClosed:
-                    logger.warning("OMS: GRVT WS disconnected: %s", symbol)
-                finally:
-                    _books[key].connected = False
+            logger.info("OMS: GRVT WS connecting (all %d markets): %s", len(symbols), ws_url)
+            ws = await websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5)
+            
+            # Subscribe to all symbols at once
+            sub_msg = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "subscribe",
+                "params": {"stream": "v1.book.s", "selectors": selectors},
+                "id": 1,
+            })
+            await ws.send(sub_msg)
+            
+            try:
+                resp_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                resp = json.loads(resp_raw)
+                if "error" in resp:
+                    raise RuntimeError(f"GRVT subscribe error: {resp['error']}")
+                logger.info("OMS: GRVT WS subscribed to %d symbols", len(symbols))
+            except asyncio.TimeoutError:
+                logger.warning("OMS: GRVT WS subscribe timeout")
+                await ws.close()
+                raise
+            
+            reconnect_delay = 1.0
+            # Mark all GRVT books as connected
+            for sym in symbols:
+                key = ("grvt", sym)
+                if key in _books:
+                    _books[key].connected = True
+            
+            try:
+                async for raw in ws:
+                    _handle_grvt_msg(raw)
+            except websockets.ConnectionClosed:
+                logger.warning("OMS: GRVT WS disconnected")
+            finally:
+                for sym in symbols:
+                    key = ("grvt", sym)
+                    if key in _books:
+                        _books[key].connected = False
+                await ws.close()
+                
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.warning("OMS: GRVT WS error %s: %s — retry in %.0fs", symbol, exc, reconnect_delay)
-            _books[key].connected = False
+            logger.warning("OMS: GRVT WS error: %s — retry in %.0fs", exc, reconnect_delay)
+            for sym in symbols:
+                key = ("grvt", sym)
+                if key in _books:
+                    _books[key].connected = False
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 30.0)
 
 
-def _handle_grvt_msg(key: tuple, raw: str) -> None:
+def _handle_grvt_msg(raw: str) -> None:
+    """Handle GRVT message and route to correct symbol book."""
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
         return
+    
     feed = msg.get("feed")
     if not feed:
         return
-
-    snap = _books[key]
+    
+    # Extract symbol from feed (GRVT format: symbol in the feed object)
+    # The selector format is SYMBOL@INTERVAL-DEPTH, we need to extract symbol
+    # GRVT messages include the symbol in the instrument field
+    instrument = feed.get("instrument")
+    if not instrument:
+        return
+    
+    symbol = instrument
+    key = ("grvt", symbol)
+    snap = _books.get(key)
+    if snap is None:
+        return
+    
     bids_raw = feed.get("bids", [])
     asks_raw = feed.get("asks", [])
     bids = [[float(b["price"]), float(b["size"])] for b in bids_raw if "price" in b]
@@ -1173,80 +1593,216 @@ def _handle_grvt_msg(key: tuple, raw: str) -> None:
         snap.asks = sorted(asks, key=lambda x: x[0])
     snap.timestamp_ms = time.time() * 1000
     snap.update_count += 1
+    snap.has_data = True
     _notify_subscribers(key)
 
 
 # ── Nado WS ──────────────────────────────────────────────────────────
 
-async def _resolve_nado_product_id(symbol: str) -> int | None:
-    """Resolve symbol → product_id via Nado REST /symbols endpoint."""
-    if symbol in _nado_product_ids:
-        return _nado_product_ids[symbol]
-
-    gateway = _NADO_GATEWAY or _NADO_GATEWAYS.get(_NADO_ENV, _NADO_GATEWAYS["mainnet"])
-    url = f"{gateway}/symbols"
-    try:
-        headers = {"Accept-Encoding": "gzip"}
-        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            symbols = resp.json()
-        for s in symbols:
-            _nado_product_ids[s["symbol"]] = s["product_id"]
-        logger.info("OMS: Nado symbols loaded: %d products", len(symbols))
-    except Exception as exc:
-        logger.error("OMS: Nado symbol resolution failed: %s", exc)
-        return None
-
-    return _nado_product_ids.get(symbol)
-
-
-async def _run_nado_ws(symbol: str) -> None:
-    """Subscribe to Nado book_depth WS for a given symbol."""
-    key = ("nado", symbol)
-    product_id = await _resolve_nado_product_id(symbol)
-    if product_id is None:
-        logger.error("OMS: Nado product_id not found for '%s' — feed disabled", symbol)
-        return
-
-    ws_url = _NADO_WS_ENDPOINTS.get(_NADO_ENV, _NADO_WS_ENDPOINTS["mainnet"])
-    reconnect_delay = 1.0
-
-    while True:
+async def _resolve_nado_product_ids(symbols: list[str]) -> dict[str, int]:
+    """Resolve symbols → product_ids via Nado REST /symbols endpoint."""
+    # Check cache first
+    result = {}
+    missing = []
+    for sym in symbols:
+        if sym in _nado_product_ids:
+            result[sym] = _nado_product_ids[sym]
+        else:
+            missing.append(sym)
+    
+    if missing:
+        gateway = _NADO_GATEWAY or _NADO_GATEWAYS.get(_NADO_ENV, _NADO_GATEWAYS["mainnet"])
+        url = f"{gateway}/symbols"
         try:
-            logger.info("OMS: Nado WS connecting: %s (product=%d)", ws_url, product_id)
-            async for ws in websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5):
+            headers = {"Accept-Encoding": "gzip"}
+            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                symbols_data = resp.json()
+            for s in symbols_data:
+                _nado_product_ids[s["symbol"]] = s["product_id"]
+            logger.info("OMS: Nado symbols loaded: %d products", len(symbols_data))
+            # Fill in missing symbols
+            for sym in missing:
+                if sym in _nado_product_ids:
+                    result[sym] = _nado_product_ids[sym]
+        except Exception as exc:
+            logger.error("OMS: Nado symbol resolution failed: %s", exc)
+    
+    return result
+
+
+async def _run_nado_ws_all(symbols: list[str]) -> None:
+    """Single WS connection to Nado for all tracked symbols.
+    
+    Nado supports subscribing to multiple products on one connection.
+    We subscribe to all products and route messages based on product_id.
+    """
+    ws_url = _NADO_WS_ENDPOINTS.get(_NADO_ENV, _NADO_WS_ENDPOINTS["mainnet"])
+    rest_base = _NADO_GATEWAY or _NADO_GATEWAYS.get(_NADO_ENV, _NADO_GATEWAYS["mainnet"])
+    reconnect_delay = 1.0
+    
+    # Resolve product IDs for all symbols
+    symbol_to_product = await _resolve_nado_product_ids(symbols)
+    logger.info("OMS: Nado symbol_to_product mapping: %d entries", len(symbol_to_product))
+    if not symbol_to_product:
+        logger.error("OMS: Nado could not resolve any product IDs — feed disabled")
+        return
+    
+    # Build reverse mapping: product_id -> symbol
+    product_to_symbol = {pid: sym for sym, pid in symbol_to_product.items()}
+    logger.debug("OMS: Nado product_to_symbol: %s", product_to_symbol)
+    
+    # Nado requires permessage-deflate compression
+    _nado_extensions = [ClientPerMessageDeflateFactory()]
+    
+    while True:
+        ws = None
+        try:
+            logger.info("OMS: Nado WS connecting (all %d markets): %s", len(symbols), ws_url)
+            ws = await websockets.connect(ws_url, ssl=_SSL_CTX, extensions=_nado_extensions, close_timeout=5)
+            
+            # Subscribe to each product individually (Nado format)
+            # Nado doesn't support batch subscribe, so we send multiple subscribe messages
+            subscribed_count = 0
+            for sym, product_id in symbol_to_product.items():
                 sub_msg = json.dumps({
                     "method": "subscribe",
                     "stream": {"type": "book_depth", "product_id": product_id},
                     "id": product_id,
                 })
                 await ws.send(sub_msg)
-
+                subscribed_count += 1
+                # Small delay between subscriptions to avoid overwhelming server
+                if subscribed_count < len(symbol_to_product):
+                    await asyncio.sleep(0.05)
+            
+            logger.info("OMS: Nado WS subscribed to %d products", subscribed_count)
+            
+            # Fetch REST snapshots for all symbols
+            logger.info("OMS: Nado starting REST snapshot fetch for %d symbols", len(symbol_to_product))
+            snapshot_ts_map: dict[int, str] = {}
+            last_max_ts_map: dict[int, str] = {}
+            snap_count = 0
+            
+            for sym, product_id in symbol_to_product.items():
+                key = ("nado", sym)
+                snap_count += 1
+                if snap_count % 10 == 0:
+                    logger.info("OMS: Nado fetched %d/%d snapshots", snap_count, len(symbol_to_product))
                 try:
-                    resp_raw = await asyncio.wait_for(ws.recv(), timeout=10)
-                    resp = json.loads(resp_raw)
-                    if resp.get("error"):
-                        raise RuntimeError(f"Nado subscribe error: {resp}")
-                    logger.info("OMS: Nado WS subscribed: product=%d (%s)", product_id, symbol)
-                except asyncio.TimeoutError:
-                    logger.warning("OMS: Nado WS subscribe timeout")
-
-                _books[key].connected = True
-                reconnect_delay = 1.0
-
-                try:
-                    async for raw in ws:
-                        _handle_nado_msg(key, raw)
-                except websockets.ConnectionClosed:
-                    logger.warning("OMS: Nado WS disconnected: %s", symbol)
-                finally:
-                    _books[key].connected = False
+                    async with httpx.AsyncClient(timeout=10.0, verify=False) as hclient:
+                        r = await hclient.post(
+                            f"{rest_base}/query",
+                            json={"type": "market_liquidity", "product_id": product_id, "depth": 100},
+                            headers={"Accept-Encoding": "gzip"},
+                        )
+                        r.raise_for_status()
+                        snap_data = r.json().get("data", {})
+                    snapshot_ts = snap_data.get("timestamp", "0")
+                    snapshot_ts_map[product_id] = snapshot_ts
+                    last_max_ts_map[product_id] = "0"  # Don't set to snapshot_ts
+                    
+                    book = _books[key]
+                    book.bids.clear()
+                    book.asks.clear()
+                    for p, q in snap_data.get("bids", []):
+                        sz = float(q) / _X18_FLOAT
+                        if sz > 0:
+                            book.bids.append([float(p) / _X18_FLOAT, sz])
+                    for p, q in snap_data.get("asks", []):
+                        sz = float(q) / _X18_FLOAT
+                        if sz > 0:
+                            book.asks.append([float(p) / _X18_FLOAT, sz])
+                    book.bids.sort(key=lambda x: -x[0])
+                    book.asks.sort(key=lambda x: x[0])
+                except Exception as exc:
+                    logger.warning("OMS: Nado snapshot failed for %s: %s — using empty book", sym, exc)
+                    snapshot_ts_map[product_id] = "0"
+                    last_max_ts_map[product_id] = "0"
+            
+            reconnect_delay = 1.0
+            # Mark all Nado books as connected
+            connected_count = 0
+            for sym in symbols:
+                key = ("nado", sym)
+                if key in _books:
+                    _books[key].connected = True
+                    connected_count += 1
+            logger.info("OMS: Nado marked %d books as connected, entering message loop", connected_count)
+            
+            msg_count = 0
+            try:
+                logger.info("OMS: Nado starting message loop...")
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    if "bids" not in msg and "asks" not in msg:
+                        continue
+                    
+                    msg_count += 1
+                    if msg_count <= 10:
+                        logger.info("OMS: Nado received book message %d: product_id=%s", msg_count, msg.get("product_id"))
+                    
+                    # Extract product_id from message and route to correct book
+                    msg_product_id = msg.get("product_id")
+                    if msg_product_id is None:
+                        continue
+                    
+                    # Look up symbol for this product_id
+                    sym = product_to_symbol.get(msg_product_id)
+                    if sym is None:
+                        if msg_count <= 5:
+                            logger.warning("OMS: Nado unknown product_id: %s", msg_product_id)
+                        continue
+                    
+                    key = ("nado", sym)
+                    if key not in _books:
+                        continue
+                    
+                    msg_max_ts = msg.get("max_timestamp", "0")
+                    msg_last_max_ts = msg.get("last_max_timestamp", "0")
+                    snapshot_ts = snapshot_ts_map.get(msg_product_id, "0")
+                    last_max_ts = last_max_ts_map.get(msg_product_id, "0")
+                    
+                    # Skip events at or before snapshot timestamp
+                    if msg_max_ts <= snapshot_ts:
+                        continue
+                    
+                    # Check sequence gap
+                    if last_max_ts != "0" and msg_last_max_ts != last_max_ts:
+                        # Sequence gap detected - need to reconnect
+                        logger.warning("OMS: Nado seq gap detected for %s — reconnecting", sym)
+                        raise RuntimeError("Sequence gap")
+                    
+                    _handle_nado_msg(key, raw)
+                    last_max_ts_map[msg_product_id] = msg_max_ts
+                        
+            except websockets.ConnectionClosed:
+                logger.warning("OMS: Nado WS disconnected")
+            except RuntimeError as exc:
+                if "Sequence gap" in str(exc):
+                    logger.warning("OMS: Nado sequence gap — reconnecting")
+                else:
+                    raise
+            finally:
+                for sym in symbols:
+                    key = ("nado", sym)
+                    if key in _books:
+                        _books[key].connected = False
+                if ws:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.warning("OMS: Nado WS error %s: %s — retry in %.0fs", symbol, exc, reconnect_delay)
-            _books[key].connected = False
+            logger.warning("OMS: Nado WS error: %s — retry in %.0fs", exc, reconnect_delay)
+            for sym in symbols:
+                key = ("nado", sym)
+                if key in _books:
+                    _books[key].connected = False
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 30.0)
 
@@ -1267,18 +1823,30 @@ def _handle_nado_msg(key: tuple, raw: str) -> None:
     if not bids_raw and not asks_raw:
         return
 
-    snap = _books[key]
+    if key not in _books:
+        logger.warning("OMS: Nado message for unknown key: %s", key)
+        return
 
+    snap = _books[key]
+    old_update_count = snap.update_count
+    
+    # Apply deltas
     if bids_raw:
         _apply_nado_delta(snap.bids, bids_raw, reverse=True)
     if asks_raw:
         _apply_nado_delta(snap.asks, asks_raw, reverse=False)
 
+    # Update metadata
     snap.timestamp_ms = time.time() * 1000
-    snap.update_count += 1
+    snap.update_count = old_update_count + 1
+    snap.has_data = True
+    snap.connected = True
+    
     _notify_subscribers(key)
-    if not snap.connected:
-        snap.connected = True
+    
+    if snap.update_count <= 3:
+        logger.info("OMS: Nado updated %s: update #%d, bids=%d, asks=%d", 
+                    key[1], snap.update_count, len(snap.bids), len(snap.asks))
 
 
 def _apply_nado_delta(book: list, updates: list, reverse: bool) -> None:

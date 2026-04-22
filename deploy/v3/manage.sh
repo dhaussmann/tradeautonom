@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+    #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
 # manage.sh — Manage per-user TradeAutonom Docker instances
 #
@@ -37,6 +37,9 @@ CONTAINER_PREFIX="ta-"
 BASE_DEPLOY="${NAS_DEPLOY_PATH}-v3"
 BASE_PORT=9001
 REGISTRY_FILE="${BASE_DEPLOY}/users.json"
+# Single shared code directory mounted read-only into every user container.
+# Updating this path pushes code to all containers (uvicorn --reload picks it up).
+SHARED_CODE_PATH="/opt/tradeautonom-v3/app"
 
 SSH_TARGET="${NAS_USER}@${NAS_HOST}"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
@@ -167,9 +170,10 @@ ENVEOF"
         --hostname ${container_name} \
         --restart unless-stopped \
         -p ${port}:${port} \
+        --ulimit nofile=65536:65536 \
         --env-file '${data_dir}/.env' \
         -v '${data_dir}/app-data:/app/data' \
-        -v '${NAS_DEPLOY_PATH}/app:/app/app' \
+        -v '${SHARED_CODE_PATH}:/app/app:ro' \
         ${IMAGE_NAME}:${IMAGE_TAG}"
 
     # Register user
@@ -269,6 +273,14 @@ cmd_status() {
     curl -s --connect-timeout 3 "http://${NAS_HOST}:${port}/auth/status" | python3 -m json.tool 2>/dev/null || err "Cannot reach auth endpoint"
 }
 
+cmd_deploy_code() {
+    info "Deploying app code to ${SSH_TARGET}:${SHARED_CODE_PATH}"
+    rsync -avz --exclude='__pycache__' --exclude='*.pyc' --exclude='.env' \
+        "${PROJECT_ROOT}/app/" \
+        "${SSH_TARGET}:${SHARED_CODE_PATH}/"
+    ok "Code deployed — all user containers will hot-reload in ~3s"
+}
+
 cmd_update() {
     info "Syncing code to ${SSH_TARGET}:${BASE_DEPLOY}"
     tar -C "$PROJECT_ROOT" \
@@ -312,9 +324,10 @@ for uid in sorted(d): print(uid)
             --hostname ${container_name} \
             --restart unless-stopped \
             -p ${port}:${port} \
+            --ulimit nofile=65536:65536 \
             --env-file '${data_dir}/.env' \
             -v '${data_dir}/app-data:/app/data' \
-            -v '${NAS_DEPLOY_PATH}/app:/app/app' \
+            -v '${SHARED_CODE_PATH}:/app/app:ro' \
             ${IMAGE_NAME}:${IMAGE_TAG}"
         ok "  ${container_name} restarted on port ${port}"
     done
@@ -325,21 +338,23 @@ for uid in sorted(d): print(uid)
 # ── Main ──────────────────────────────────────────────────────
 
 case "${1:-help}" in
-    create)     shift; cmd_create "$@" ;;
-    list|ls)    cmd_list ;;
-    start)      shift; cmd_start "$@" ;;
-    stop)       shift; cmd_stop "$@" ;;
-    destroy)    shift; cmd_destroy "$@" ;;
-    logs)       shift; cmd_logs "$@" ;;
-    status)     shift; cmd_status "$@" ;;
-    update)     cmd_update ;;
+    create)          shift; cmd_create "$@" ;;
+    list|ls)         cmd_list ;;
+    start)           shift; cmd_start "$@" ;;
+    stop)            shift; cmd_stop "$@" ;;
+    destroy)         shift; cmd_destroy "$@" ;;
+    logs)            shift; cmd_logs "$@" ;;
+    status)          shift; cmd_status "$@" ;;
+    deploy-code|dc)  cmd_deploy_code ;;
+    update)          cmd_update ;;
     *)
         echo "TradeAutonom User Manager"
         echo ""
         echo "Usage: $0 <command> [args]"
         echo ""
         echo "Commands:"
-        echo "  create <user_id> [--port PORT]  Create a new user container"
+        echo "  deploy-code (dc)                 Push app/ to shared folder — all containers hot-reload"
+        echo "  create <user_id> [--port PORT]   Create a new user container"
         echo "  list                             List all users + status"
         echo "  start <user_id>                  Start user's container"
         echo "  stop <user_id>                   Stop user's container"
