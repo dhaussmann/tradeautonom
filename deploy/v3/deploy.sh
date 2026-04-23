@@ -95,10 +95,13 @@ HISTORY_INGEST_TOKEN=qW3b6n2uDwZg6krrEbdqcpgihIgLzRc6mkF9dnjnTcw
 HISTORY_INGEST_INTERVAL_S=300
 FN_OPT_SHARED_MONITOR_URL=http://192.168.133.100:8099
 ENVEOF"
+    # --init: reaps HEALTHCHECK zombies (image also sets tini ENTRYPOINT,
+    # this is defense-in-depth for when someone runs an older image).
     ssh_nas "${P}/docker run -d \
         --name ${CONTAINER_NAME} \
         --hostname ${CONTAINER_NAME} \
         --restart unless-stopped \
+        --init \
         -p ${APP_PORT}:${APP_PORT} \
         --env-file '${V3_DEPLOY_PATH}/.env.container' \
         -v '${V3_DEPLOY_PATH}/data:/app/data' \

@@ -79,9 +79,12 @@ cmd_up() {
     ssh_nas "${P}/docker rm -f ${CONTAINER_NAME} 2>/dev/null || true"
     # Copy .env from production deploy path if not present in v2
     ssh_nas "test -f '${V2_DEPLOY_PATH}/.env' || cp '${NAS_DEPLOY_PATH}/.env' '${V2_DEPLOY_PATH}/.env'"
+    # --init: reaps HEALTHCHECK zombies (image also sets tini ENTRYPOINT,
+    # this is defense-in-depth for when someone runs an older image).
     ssh_nas "${P}/docker run -d \
         --name ${CONTAINER_NAME} \
         --restart unless-stopped \
+        --init \
         -p ${APP_PORT}:${APP_PORT} \
         -e APP_HOST=0.0.0.0 \
         -e APP_PORT=${APP_PORT} \

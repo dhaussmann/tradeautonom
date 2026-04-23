@@ -6,6 +6,10 @@ services:
     image: tradeautonom:latest
     container_name: tradeautonom
     restart: unless-stopped
+    # init: true enables Docker's built-in tini as PID 1 (defense-in-depth;
+    # the Dockerfile also sets its own tini ENTRYPOINT). Prevents HEALTHCHECK
+    # zombie accumulation.
+    init: true
     ports:
       - "${APP_PORT:-8002}:${APP_PORT:-8002}"
     env_file:

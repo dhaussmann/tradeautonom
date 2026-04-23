@@ -164,11 +164,17 @@ GRVT_ENV=prod
 ENVEOF"
     fi
 
-    # Start container
+    # Start container.
+    # --init enables Docker's built-in tini as PID 1 to reap HEALTHCHECK
+    #   zombie forks (defense-in-depth; image also sets its own tini ENTRYPOINT).
+    # --memory 1g cap matches production sizing; 512 MiB was too tight for
+    #   users running 5+ bots.
     ssh_nas "${P}/docker run -d \
         --name ${container_name} \
         --hostname ${container_name} \
         --restart unless-stopped \
+        --init \
+        --memory 1g --memory-swap 1g \
         -p ${port}:${port} \
         --ulimit nofile=65536:65536 \
         --env-file '${data_dir}/.env' \
@@ -319,10 +325,13 @@ for uid in sorted(d): print(uid)
         local port
         port=$(_get_user_port "$uid")
         local data_dir="${BASE_DEPLOY}/data-${uid}"
+        # --init + --memory 1g: see cmd_create for rationale.
         ssh_nas "${P}/docker run -d \
             --name ${container_name} \
             --hostname ${container_name} \
             --restart unless-stopped \
+            --init \
+            --memory 1g --memory-swap 1g \
             -p ${port}:${port} \
             --ulimit nofile=65536:65536 \
             --env-file '${data_dir}/.env' \

@@ -8,9 +8,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system dependencies (gcc needed for some pip packages)
+# Install system dependencies.
+# - gcc needed for some pip packages.
+# - tini is a lightweight init process that properly reaps child processes.
+#   Without it, Docker HEALTHCHECK-spawned Python forks become zombies
+#   (PID 1 is main.py, which has no SIGCHLD handler).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc && \
+    apt-get install -y --no-install-recommends gcc tini && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies (only layer that triggers rebuild)
@@ -23,4 +27,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 8000
 
+# tini as PID 1 — reaps HEALTHCHECK zombies and forwards signals correctly.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "main.py"]

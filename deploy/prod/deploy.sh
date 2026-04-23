@@ -70,9 +70,12 @@ cmd_up() {
     info "Starting container on NAS"
     # Stop and remove existing container if present
     ssh_nas "${P}/docker rm -f ${CONTAINER_NAME} 2>/dev/null || true"
+    # --init: reaps HEALTHCHECK zombies (image also sets tini ENTRYPOINT,
+    # this is defense-in-depth for when someone runs an older image).
     ssh_nas "${P}/docker run -d \
         --name ${CONTAINER_NAME} \
         --restart unless-stopped \
+        --init \
         -p ${APP_PORT}:${APP_PORT} \
         -e APP_HOST=0.0.0.0 \
         --env-file '${NAS_DEPLOY_PATH}/.env' \
