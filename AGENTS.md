@@ -18,6 +18,7 @@ Multi-exchange arbitrage trading bot (FastAPI backend, Vue 3 SPA frontend, Cloud
 | Nado OMS watchdog | `docs/NADO_WATCHDOG_WEBSOCKET.md` |
 | GRVT endpoints | `.claude/rules/grvt_api.md` |
 | Recent fixes to avoid regressing | `docs/WEBSOCKET_REFACTOR_FIXES.md`, `RELEASENOTES.md` |
+| V2 on Cloudflare (planning + PoC, parallel to V1) | `docs/v2-cf-containers-architecture.md`, `docs/v2-oms-cloudflare-native.md`, `deploy/cf-containers/proof-of-concept/` |
 | **Do not treat as current reference** | `docs/delta-neutral-algorithm.docx.md` (design spec), `docs/tradeautonom-integrationsplan-v2.docx.md` (plan), `docs/FIX_USER_CONTAINERS.md` (proposal), `docs/V4_WEB_DEVELOPER_GUIDE.md` (external API doc) |
 
 ## 2. Entry points (not obvious from filenames)

@@ -1,0 +1,17 @@
+{
+  "name": "oms-v2-poc",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Proof-of-concept: Cloudflare-native OMS-v2 Durable Objects. See docs/v2-oms-cloudflare-native.md.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260401.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.20.0"
+  }
+}

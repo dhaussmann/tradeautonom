@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "oms-v2-poc",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-23",
+  "compatibility_flags": ["nodejs_compat"],
+  // Observability: enable logs in the Cloudflare dashboard.
+  // Retention = 7 days on Workers Paid.
+  "observability": {
+    "enabled": true
+  },
+  // One Durable Object class: ExtendedOms.
+  // We'll access it as a singleton via idFromName("singleton").
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EXTENDED_OMS",
+        "class_name": "ExtendedOms"
+      }
+    ]
+  },
+  // SQLite-backed DO storage (required for hibernation + cheaper).
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ExtendedOms"]
+    }
+  ]
+  // EXTENDED_API_KEY is set via `wrangler secret put EXTENDED_API_KEY`
+}
