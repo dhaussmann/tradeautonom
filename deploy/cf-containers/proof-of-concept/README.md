@@ -1,7 +1,7 @@
 # OMS-v2 Proof of Concept
 
 Minimal TypeScript implementation of a Cloudflare-native `ExtendedOms` Durable Object.
-Goal: validate the **five open technical questions** from `docs/v2-oms-cloudflare-native.md`
+Goal: validate the **open technical questions** from `docs/v2-oms-cloudflare-native.md`
 before committing to the full OMS-v2 rewrite.
 
 **This is a research artifact, not a production path.** Do not deploy to a route that real
@@ -10,46 +10,51 @@ bot clients point at.
 ## What this PoC does
 
 - Spins up a single `ExtendedOms` DO singleton.
-- Opens an outbound WebSocket to `wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks`
-  with an `X-Api-Key` header.
-- Parses incoming SNAPSHOT/DELTA messages for a single market (`BTC-USD`).
+- Opens an outbound WebSocket to the **public** Extended order book stream:
+  `wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/BTC-USD`.
+  Per the [Extended docs](https://api.docs.extended.exchange/#order-book-stream), this
+  stream requires no authentication — only a `User-Agent` header.
+- Parses incoming `SNAPSHOT` and `DELTA` messages following the documented schema
+  (envelope `{ts, type, data: {m, b, a}, seq}`, per-level `{p, q, c}` where `c` is the
+  absolute size).
+- Tracks sequence numbers. On a gap, closes and reconnects.
 - Stores the top-20 bid/ask levels in memory.
-- Exposes one HTTP endpoint:
-  - `GET /book/BTC-USD` → JSON with current bids/asks + lag metrics
-  - `GET /health` → `{ status, reconnect_attempts, last_message_ms, ws_state }`
+- Exposes two HTTP endpoints:
+  - `GET /book/BTC-USD` → current bids/asks + lag metrics
+  - `GET /health` → `{ status, ws_state, last_message_ms, last_seq, reconnect_attempts, ... }`
 
 ## What this PoC answers
 
 | Question | How this PoC answers it |
 |---|---|
-| Does `fetch(url, { headers: { Upgrade: "websocket", "X-Api-Key": ... }})` work? | `ensureWs()` constructs exactly that request. If it doesn't, the DO logs `upgrade_failed` with the status code. |
-| Does the DO actually stay alive with an outbound WS and no inbound requests? | Observation: after 10 min of no HTTP calls, does `/book/BTC-USD` still return fresh data? |
+| Does outbound WebSocket from a DO (`fetch(url, { headers: { Upgrade: "websocket" } })`) work? | `ensureWs()` constructs exactly that request. If it doesn't, the DO logs `WS upgrade failed` with the status code. |
+| Does the DO actually stay alive with an outbound WS and no inbound HTTP requests? | Observation: after 10 min of no HTTP calls, does `/book/BTC-USD` still return fresh data? |
 | How much GB-s does a 24/7 outbound-WS DO accumulate? | Check Cloudflare dashboard → Workers & Pages → Durable Objects → billing for this script. |
 | Does `state.storage.setAlarm()` reliably fire every 30s? | `/health` shows `last_alarm_ms`. |
 | What's end-to-end latency Exchange → DO → `GET /book`? | `age_ms` in `/book` response. |
 
 ## How to deploy
 
-Requires: Workers Paid plan, Wrangler 4+, an Extended API key.
+Requires: Workers Paid plan, Wrangler 4+.
 
 ```bash
 cd deploy/cf-containers/proof-of-concept
 npm install
-npx wrangler secret put EXTENDED_API_KEY
-# paste your Extended API key
 npx wrangler deploy
 ```
+
+**No secrets required.** The Extended order book stream is a public endpoint.
 
 The Worker will be deployed to `<project>.<account>.workers.dev`. Visit `/health` and
 `/book/BTC-USD` to inspect state. Use `npx wrangler tail` for live logs.
 
 ## What this PoC does NOT do
 
-- Does not handle reconnection beyond a 30s alarm retry.
-- Does not parse delta sequence numbers or emit gap warnings.
-- Does not implement the bot-client `/ws` subscriber API.
-- Does not persist anything — all state is in-memory and lost on DO eviction.
-- Does not support more than one market.
+- Reconnection is a 30s alarm retry; no exponential backoff.
+- Only one market (BTC-USD). Real OMS-v2 uses the market-less shared stream
+  that pushes all markets at once — or one stream per market with parallel DOs.
+- No bot-client `/ws` subscriber API yet; that lives in `AggregatorDO` (Phase 3).
+- No persistence — all state is in-memory and lost on DO eviction.
 
 ## Expected next steps after PoC verification
 

@@ -121,12 +121,14 @@ export class ExtendedOms extends DurableObject<Env> {
   private async ensureWs() {
     if (this.ws?.readyState === WebSocket.OPEN) return;
 
+    // Public stream — no auth. `User-Agent` is the only required header.
+    // https://api.docs.extended.exchange/#order-book-stream
     const resp = await fetch(
       "https://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks",
       {
         headers: {
           Upgrade: "websocket",
-          "X-Api-Key": this.env.EXTENDED_API_KEY,
+          "User-Agent": "tradeautonom-oms-v2/0.1",
         },
       },
     );
@@ -276,12 +278,14 @@ We keep exact wire compatibility with the V1 Python OMS so that `app/data_layer.
 
 ## Secrets
 
-OMS-v2 needs the same credentials as V1 OMS:
+OMS-v2 needs credentials where the exchange stream actually requires auth.
+Extended's **order book stream is public** — no secret required.
 
-- Extended API key (for WS auth)
-- Nado private key / linked signer key (for EIP-712 signing)
-- GRVT credentials (if using auth WS)
-- `PROXY_AUTH_TOKEN` for `proxy.defitool.de`
+- Extended: no secret (public order book stream). If we later add the private
+  account/fill WS, an `X-Api-Key` would be needed for that stream only.
+- Nado: private key / linked signer key for EIP-712 signing of the subscribe frame.
+- GRVT: credentials for the authenticated trades WS if/when used.
+- `PROXY_AUTH_TOKEN` for `proxy.defitool.de` (Variational).
 
 Stored as Worker secrets via `wrangler secret put`, accessed in DO constructors.
 
@@ -297,7 +301,7 @@ Stored as Worker secrets via `wrangler secret put`, accessed in DO constructors.
 
 Resolved by PoC (Phase 0):
 
-1. **Outbound WS with custom headers.** Does `fetch(url, { headers: { Upgrade: "websocket", "X-Api-Key": "..." } })` accept arbitrary custom headers? If not, need different auth path for Extended.
+1. **Outbound WS from a DO.** Does `fetch(url, { headers: { Upgrade: "websocket" } })` actually deliver a usable `WebSocket` back? (Extended's order book stream is public, so no auth-header question for Extended. For Nado, subscribe frames are EIP-712-signed after connect, not via headers.)
 2. **Outbound WS lifetime.** How long does a DO live with an open outbound WS but no inbound requests? Cloudflare docs say "outbound WebSockets do not hibernate" — verify this is honored in practice.
 3. **RPC cost.** GB-s billing per RPC call vs. internal fetch()? Determines whether to batch updates.
 4. **Hibernation with partial state.** Does `acceptWebSocket` still work if we have per-connection attachments > 2 KB? (Subscription lists could grow.)

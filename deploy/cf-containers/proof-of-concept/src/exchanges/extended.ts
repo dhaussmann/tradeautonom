@@ -2,10 +2,16 @@
  * ExtendedOms — proof-of-concept Durable Object that maintains a live
  * orderbook for a single Extended market via outbound WebSocket.
  *
+ * Spec: https://api.docs.extended.exchange/#order-book-stream
+ *
+ * The order book stream is **public** — no authentication, no `X-Api-Key`.
+ * The URL is per-market:
+ *   wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{market}
+ *
  * Goal: answer these questions (see README.md):
- *  - Does `fetch(url, { headers: { Upgrade: "websocket", "X-Api-Key": ... }})` work?
- *  - Does the DO stay alive with an outbound WS and no inbound requests?
- *  - What's end-to-end latency Exchange → DO → /book caller?
+ *  - Does outbound WebSocket from a DO actually deliver messages?
+ *  - Does the DO stay alive with an outbound WS and no inbound HTTP requests?
+ *  - What's end-to-end latency Exchange → DO → GET /book caller?
  *
  * NOT production-ready. See the OMS-v2 design in docs/v2-oms-cloudflare-native.md.
  */
@@ -15,11 +21,11 @@ import {
   emptyBook,
   applyExtendedMessage,
   Orderbook,
+  ExtendedMessage,
 } from "../lib/orderbook";
 
-interface Env {
+export interface Env {
   EXTENDED_OMS: DurableObjectNamespace<ExtendedOms>;
-  EXTENDED_API_KEY: string;
 }
 
 // Minimal shape of the health snapshot we return on /health.
@@ -31,12 +37,13 @@ interface HealthSnapshot {
   last_message_ms: number | null;
   last_alarm_ms: number | null;
   updates: number;
+  last_seq: number;
   uptime_ms: number;
 }
 
 const MARKET = "BTC-USD"; // single-market PoC
 const ALARM_INTERVAL_MS = 30_000;
-const WS_URL =
+const STREAM_BASE =
   "https://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks";
 
 export class ExtendedOms extends DurableObject<Env> {
@@ -50,8 +57,8 @@ export class ExtendedOms extends DurableObject<Env> {
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    // Block concurrency while we ensure the WS is connected and the alarm is set.
-    // Without this, the first incoming request could race with the WS setup.
+    // Block concurrency while we open the WS and set the alarm.
+    // Without this, the first incoming HTTP request could race with WS setup.
     state.blockConcurrencyWhile(async () => {
       await this.ensureWs();
       const current = await state.storage.getAlarm();
@@ -82,7 +89,7 @@ export class ExtendedOms extends DurableObject<Env> {
     return this.jsonResponse({ error: "not found", path }, 404);
   }
 
-  // Alarm fires at ALARM_INTERVAL_MS. We use it to:
+  // Alarm fires at ALARM_INTERVAL_MS. Use it to:
   // 1. Reconnect the WS if closed
   // 2. Record the timestamp for visibility in /health
   async alarm(): Promise<void> {
@@ -90,6 +97,7 @@ export class ExtendedOms extends DurableObject<Env> {
     console.log("alarm fired", {
       ws_state: this.wsState,
       updates: this.book.updates,
+      last_seq: this.book.last_seq,
       age_ms: this.lastMessageMs ? Date.now() - this.lastMessageMs : null,
     });
     await this.ensureWs();
@@ -99,7 +107,7 @@ export class ExtendedOms extends DurableObject<Env> {
   private async ensureWs(): Promise<void> {
     if (this.wsState === "connecting") return;
     if (this.ws && this.wsState === "connected") {
-      // Readiness check: if we have had no messages in > 90s, assume broken.
+      // Staleness check: no messages in > 90s → assume broken.
       if (this.lastMessageMs && Date.now() - this.lastMessageMs > 90_000) {
         console.warn("WS stale, closing");
         try {
@@ -116,13 +124,18 @@ export class ExtendedOms extends DurableObject<Env> {
 
     this.wsState = "connecting";
     this.reconnectAttempts += 1;
-    console.log("opening WS", { attempt: this.reconnectAttempts });
+    const wsUrl = `${STREAM_BASE}/${encodeURIComponent(MARKET)}`;
+    console.log("opening WS", {
+      attempt: this.reconnectAttempts,
+      url: wsUrl,
+    });
 
     try {
-      const resp = await fetch(WS_URL, {
+      const resp = await fetch(wsUrl, {
         headers: {
           Upgrade: "websocket",
-          "X-Api-Key": this.env.EXTENDED_API_KEY,
+          // Extended docs require `User-Agent` on REST + WS.
+          "User-Agent": "tradeautonom-oms-v2-poc/0.0.1",
         },
       });
 
@@ -139,6 +152,8 @@ export class ExtendedOms extends DurableObject<Env> {
       ws.accept();
       this.ws = ws;
       this.wsState = "connected";
+      // Reset book state on each reconnect; spec says seq=1 arrives as SNAPSHOT.
+      this.book = emptyBook();
       console.log("WS connected");
 
       ws.addEventListener("message", (event) => this.onMessage(event));
@@ -157,26 +172,40 @@ export class ExtendedOms extends DurableObject<Env> {
         ? event.data
         : new TextDecoder().decode(event.data as ArrayBuffer);
 
-    let msg: any;
+    let msg: ExtendedMessage;
     try {
-      msg = JSON.parse(raw);
+      msg = JSON.parse(raw) as ExtendedMessage;
     } catch {
       console.warn("non-JSON message", raw.slice(0, 120));
       return;
     }
 
-    // Extended sometimes sends envelope objects; real orderbook messages have `m` + `type`.
-    if (msg.m === MARKET && (msg.type === "SNAPSHOT" || msg.type === "DELTA")) {
-      applyExtendedMessage(this.book, msg);
+    // Only handle orderbook messages for our market.
+    if (!msg.data || msg.data.m !== MARKET) return;
+    if (msg.type !== "SNAPSHOT" && msg.type !== "DELTA") return;
+
+    const applied = applyExtendedMessage(this.book, msg);
+    if (!applied && msg.type === "DELTA") {
+      // Sequence gap — spec says reconnect.
+      console.warn("seq gap detected; reconnecting", {
+        expected: this.book.last_seq + 1,
+        got: msg.seq,
+      });
+      try {
+        this.ws?.close();
+      } catch {
+        /* ignore */
+      }
+      this.ws = null;
+      this.wsState = "disconnected";
     }
-    // Other markets are ignored in the PoC (Extended pushes every market on the shared WS).
   }
 
   private onClose(event: CloseEvent): void {
     console.warn("WS closed", { code: event.code, reason: event.reason });
     this.ws = null;
     this.wsState = "disconnected";
-    // Reconnect will happen on next alarm (<= 30s).
+    // Reconnect happens on next alarm (<= 30s).
   }
 
   private onError(event: Event): void {
@@ -192,6 +221,7 @@ export class ExtendedOms extends DurableObject<Env> {
       last_message_ms: this.lastMessageMs,
       last_alarm_ms: this.lastAlarmMs,
       updates: this.book.updates,
+      last_seq: this.book.last_seq,
       uptime_ms: Date.now() - this.startedAt,
     };
   }
@@ -204,9 +234,11 @@ export class ExtendedOms extends DurableObject<Env> {
       bids: this.book.bids,
       asks: this.book.asks,
       timestamp_ms: this.book.ts_ms,
+      received_ms: this.book.received_ms,
       age_ms: ageMs,
-      connected: this.book.connected || this.wsState === "connected",
+      connected: this.wsState === "connected" && this.book.updates > 0,
       updates: this.book.updates,
+      last_seq: this.book.last_seq,
     };
   }
 

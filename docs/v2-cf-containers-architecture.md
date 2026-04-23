@@ -188,7 +188,7 @@ Nothing in V2 should compromise V1 behavior:
 | Python engine under CF Containers runtime | Uvicorn + FastAPI + httpx all untested on CF Containers runtime (rootless, no iptables) | Phase 0 PoC secondary test: run minimal FastAPI container; verify request routing |
 | `curl_cffi` for Variational | Required for Cloudflare TLS-bypass; unavailable in Workers/DOs | Variational-v2 DO calls `proxy.defitool.de` (existing production workaround) |
 | Outgoing WebSocket in DO prevents hibernation | Exchange-WS DOs never hibernate → billed 24/7 as GB-s | Accepted; DO GB-s is cheap. Cost comparison vs container must be run. |
-| Custom headers in outbound WebSocket upgrade | Need `X-Api-Key` for Extended WS | Verified in PoC |
+| Custom headers in outbound WebSocket upgrade | Nado requires post-connect signed subscribe frames (not headers); Extended order book stream is public (no auth). Verified against Extended API docs. | PoC confirms `fetch(url, { headers: { Upgrade: "websocket", "User-Agent": ... } })` as the outbound-WS pattern |
 | Nado EIP-712 signing in TypeScript | Python uses `eth_account`; TS equivalent is `ethers.js` | `ethers` dependency in Worker, signing in NadoOms DO |
 | DO SQLite 128 MB limit | Bot history could exceed | Only "latest state" in DO, history externalized to D1 / R2 |
 | RPC costs between DOs | Each delta triggers AggregatorDO fan-out | Batching + edge-cached subscriber lists |

@@ -11,7 +11,6 @@ export { ExtendedOms };
 
 interface Env {
   EXTENDED_OMS: DurableObjectNamespace<ExtendedOms>;
-  EXTENDED_API_KEY: string;
 }
 
 export default {

@@ -26,5 +26,6 @@
       "new_sqlite_classes": ["ExtendedOms"]
     }
   ]
-  // EXTENDED_API_KEY is set via `wrangler secret put EXTENDED_API_KEY`
+  // No secrets required: the Extended order book stream is public.
+  // See https://api.docs.extended.exchange/#order-book-stream
 }
