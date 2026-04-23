@@ -176,9 +176,15 @@ class BotRegistry:
                 config.short_exchange: config.instrument_b,
             }
             results = await self._oms_data_layer.add_symbols(oms_symbols)
+            expected = {f"{e}:{s}" for e, s in oms_symbols.items()}
+            missing = expected - set(results.keys())
             failed = [sym for sym, success in results.items() if not success]
-            if failed:
-                logger.warning("BotRegistry: Some OMS subscriptions failed for %s: %s", bot_id, failed)
+            if missing or failed:
+                logger.warning(
+                    "BotRegistry: OMS subscription problems for %s — missing=%s failed=%s "
+                    "(bot will fail pre-trade check until resolved)",
+                    bot_id, sorted(missing), failed,
+                )
             else:
                 logger.info("BotRegistry: All OMS subscriptions successful for %s", bot_id)
 
@@ -286,17 +292,26 @@ class BotRegistry:
         for bot_id, config in configs:
             await self._subscribe_bot_symbols(bot_id, config)
 
-        # Add all symbols to OMS DataLayer
+        # Add all symbols to OMS DataLayer.
+        # NOTE: `add_symbols` takes a dict keyed by exchange, so stacking all
+        # bots into a single dict collapses entries when multiple bots share
+        # an exchange with different symbols. Call it per-bot to preserve
+        # every (exchange, symbol) pair.
         if self._oms_data_layer and hasattr(self._oms_data_layer, 'add_symbols'):
-            all_oms_symbols = {}
             for bot_id, config in configs:
-                all_oms_symbols[config.long_exchange] = config.instrument_a
-                all_oms_symbols[config.short_exchange] = config.instrument_b
-            
-            results = await self._oms_data_layer.add_symbols(all_oms_symbols)
-            failed = [sym for sym, success in results.items() if not success]
-            if failed:
-                logger.warning("BotRegistry: Some OMS subscriptions failed during restore: %s", failed)
+                oms_symbols = {
+                    config.long_exchange: config.instrument_a,
+                    config.short_exchange: config.instrument_b,
+                }
+                results = await self._oms_data_layer.add_symbols(oms_symbols)
+                expected = {f"{e}:{s}" for e, s in oms_symbols.items()}
+                missing = expected - set(results.keys())
+                failed = [sym for sym, success in results.items() if not success]
+                if missing or failed:
+                    logger.warning(
+                        "BotRegistry: OMS subscription problems during restore for %s — missing=%s failed=%s",
+                        bot_id, sorted(missing), failed,
+                    )
 
         # Start all bots with shared resources
         restored = 0

@@ -592,15 +592,21 @@ class DataLayer:
 
             await asyncio.sleep(0.5)
 
-        # Fallback to direct WS (re-enter the routing without OMS)
+        # Fallback to direct WS for THIS symbol only.
+        # Do NOT mutate self._shared_monitor_url — it is a DataLayer-wide
+        # configuration flag. Clearing it here breaks every subsequent
+        # add_symbols() call on the shared OMS DataLayer (new bots silently
+        # fail to subscribe). _run_orderbook_ws / _run_ob_ws_* / _run_ob_rest_fallback
+        # do NOT consult _shared_monitor_url, so no recursion guard is needed.
         if self._running:
-            logger.info("DataLayer: OMS fallback → starting direct WS for %s:%s", exch_name, symbol)
-            old_url = self._shared_monitor_url
-            self._shared_monitor_url = ""  # temporarily disable to avoid recursion
+            logger.info(
+                "DataLayer: OMS fallback → starting direct WS for %s:%s "
+                "(OMS remains enabled for other symbols)",
+                exch_name, symbol,
+            )
             client = self._clients.get(exch_name)
             if client:
                 await self._run_orderbook_ws(client, exch_name, symbol)
-            self._shared_monitor_url = old_url
 
     # ── OMS WebSocket (shared real-time connection) ─────────────────
 
