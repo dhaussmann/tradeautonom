@@ -118,7 +118,23 @@ BTC-USD                   78,151.0000    78,152.0000    10    10   1045  211ms
 
 ## Evaluation test plan
 
-Five questions, each observable from the running PoC.
+Three ready-to-use Python scripts under `test/` automate all of this. See
+`test/README.md` for the full usage guide. Short recap:
+
+```bash
+cd deploy/cf-containers/proof-of-concept/test
+
+# Long-running stability probe (every 30 s, writes CSV + log, flags anomalies)
+python3 watchdog.py --resolve-via 1.1.1.1
+
+# Side-by-side V1 Photon vs V2 PoC for a set of markets
+python3 compare_v1_v2.py --resolve-via 1.1.1.1
+
+# Latency histogram (min/median/p90/p99/ASCII bars)
+python3 latency_histogram.py --resolve-via 1.1.1.1 --samples 200 --interval 0.5
+```
+
+The five questions below are what the scripts above answer.
 
 ### 1. Does outbound WebSocket from a DO deliver messages?
 
