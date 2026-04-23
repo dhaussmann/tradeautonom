@@ -1,19 +1,24 @@
 /**
- * ExtendedOms — proof-of-concept Durable Object that maintains a live
- * orderbook for a single Extended market via outbound WebSocket.
+ * ExtendedOms — proof-of-concept Durable Object that maintains live orderbooks
+ * for all Extended markets on a single shared outbound WebSocket.
  *
  * Spec: https://api.docs.extended.exchange/#order-book-stream
+ * Photon OMS reference: deploy/monitor/monitor_service.py::_run_extended_ws_all
  *
- * The order book stream is **public** — no authentication, no `X-Api-Key`.
- * The URL is per-market:
- *   wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/{market}
+ * The Extended order book stream is public — no authentication, no X-Api-Key.
+ * The URL without a market path segment is Extended's convention for a shared
+ * stream that pushes every active market over a single connection. Photon OMS
+ * has been running this pattern in production for months; we mirror it here.
  *
- * Goal: answer these questions (see README.md):
- *  - Does outbound WebSocket from a DO actually deliver messages?
- *  - Does the DO stay alive with an outbound WS and no inbound HTTP requests?
- *  - What's end-to-end latency Exchange → DO → GET /book caller?
+ * Book sizes are capped to TOP_N (10) per side to reduce memory per market.
  *
- * NOT production-ready. See the OMS-v2 design in docs/v2-oms-cloudflare-native.md.
+ * Goals answered by this PoC:
+ *  - outbound WebSocket from a DO works reliably?
+ *  - DO stays alive with an outbound WS and no inbound HTTP requests?
+ *  - freshness Exchange → DO → /book caller?
+ *  - cost (GB-s) of a 24/7 outbound-WS DO?
+ *
+ * Not production-ready. See docs/v2-oms-cloudflare-native.md.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -28,26 +33,24 @@ export interface Env {
   EXTENDED_OMS: DurableObjectNamespace<ExtendedOms>;
 }
 
-// Minimal shape of the health snapshot we return on /health.
 interface HealthSnapshot {
   status: string;
-  market: string;
   ws_state: "connected" | "disconnected" | "connecting";
   reconnect_attempts: number;
   last_message_ms: number | null;
   last_alarm_ms: number | null;
-  updates: number;
-  last_seq: number;
+  markets_tracked: number;
+  total_updates: number;
   uptime_ms: number;
 }
 
-const MARKET = "BTC-USD"; // single-market PoC
 const ALARM_INTERVAL_MS = 30_000;
-const STREAM_BASE =
+// Shared stream URL (no `{market}` segment) — pushes every active market.
+const WS_URL =
   "https://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks";
 
 export class ExtendedOms extends DurableObject<Env> {
-  private book: Orderbook = emptyBook();
+  private books: Map<string, Orderbook> = new Map();
   private ws: WebSocket | null = null;
   private wsState: "connected" | "disconnected" | "connecting" = "disconnected";
   private reconnectAttempts = 0;
@@ -57,8 +60,6 @@ export class ExtendedOms extends DurableObject<Env> {
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    // Block concurrency while we open the WS and set the alarm.
-    // Without this, the first incoming HTTP request could race with WS setup.
     state.blockConcurrencyWhile(async () => {
       await this.ensureWs();
       const current = await state.storage.getAlarm();
@@ -76,28 +77,37 @@ export class ExtendedOms extends DurableObject<Env> {
       return this.jsonResponse(this.healthSnapshot());
     }
 
-    // /book/<market> — only BTC-USD supported in PoC
-    const bookMatch = path.match(/^\/book\/([A-Z0-9-]+)$/i);
+    if (path === "/markets") {
+      return this.jsonResponse(this.marketsSnapshot());
+    }
+
+    // /book/<market> — any active Extended market
+    const bookMatch = path.match(/^\/book\/([A-Z0-9._-]+)$/i);
     if (bookMatch) {
       const market = bookMatch[1].toUpperCase();
-      if (market !== MARKET) {
-        return this.jsonResponse({ error: `PoC only supports ${MARKET}` }, 400);
+      const snap = this.bookSnapshot(market);
+      if (!snap) {
+        return this.jsonResponse(
+          { error: "market not tracked yet", market, hint: "check /markets for known symbols" },
+          404,
+        );
       }
-      return this.jsonResponse(this.bookSnapshot());
+      return this.jsonResponse(snap);
     }
 
     return this.jsonResponse({ error: "not found", path }, 404);
   }
 
-  // Alarm fires at ALARM_INTERVAL_MS. Use it to:
-  // 1. Reconnect the WS if closed
-  // 2. Record the timestamp for visibility in /health
   async alarm(): Promise<void> {
     this.lastAlarmMs = Date.now();
+    const totalUpdates = Array.from(this.books.values()).reduce(
+      (sum, b) => sum + b.updates,
+      0,
+    );
     console.log("alarm fired", {
       ws_state: this.wsState,
-      updates: this.book.updates,
-      last_seq: this.book.last_seq,
+      markets: this.books.size,
+      total_updates: totalUpdates,
       age_ms: this.lastMessageMs ? Date.now() - this.lastMessageMs : null,
     });
     await this.ensureWs();
@@ -107,7 +117,6 @@ export class ExtendedOms extends DurableObject<Env> {
   private async ensureWs(): Promise<void> {
     if (this.wsState === "connecting") return;
     if (this.ws && this.wsState === "connected") {
-      // Staleness check: no messages in > 90s → assume broken.
       if (this.lastMessageMs && Date.now() - this.lastMessageMs > 90_000) {
         console.warn("WS stale, closing");
         try {
@@ -124,17 +133,15 @@ export class ExtendedOms extends DurableObject<Env> {
 
     this.wsState = "connecting";
     this.reconnectAttempts += 1;
-    const wsUrl = `${STREAM_BASE}/${encodeURIComponent(MARKET)}`;
     console.log("opening WS", {
       attempt: this.reconnectAttempts,
-      url: wsUrl,
+      url: WS_URL,
     });
 
     try {
-      const resp = await fetch(wsUrl, {
+      const resp = await fetch(WS_URL, {
         headers: {
           Upgrade: "websocket",
-          // Extended docs require `User-Agent` on REST + WS.
           "User-Agent": "tradeautonom-oms-v2-poc/0.0.1",
         },
       });
@@ -152,9 +159,9 @@ export class ExtendedOms extends DurableObject<Env> {
       ws.accept();
       this.ws = ws;
       this.wsState = "connected";
-      // Reset book state on each reconnect; spec says seq=1 arrives as SNAPSHOT.
-      this.book = emptyBook();
-      console.log("WS connected");
+      // Reset all tracked books on reconnect — snapshots will re-seed them.
+      this.books.clear();
+      console.log("WS connected (all-markets shared stream)");
 
       ws.addEventListener("message", (event) => this.onMessage(event));
       ws.addEventListener("close", (event) => this.onClose(event));
@@ -180,32 +187,32 @@ export class ExtendedOms extends DurableObject<Env> {
       return;
     }
 
-    // Only handle orderbook messages for our market.
-    if (!msg.data || msg.data.m !== MARKET) return;
+    if (!msg.data || !msg.data.m) return;
     if (msg.type !== "SNAPSHOT" && msg.type !== "DELTA") return;
 
-    const applied = applyExtendedMessage(this.book, msg);
-    if (!applied && msg.type === "DELTA") {
-      // Sequence gap — spec says reconnect.
-      console.warn("seq gap detected; reconnecting", {
-        expected: this.book.last_seq + 1,
-        got: msg.seq,
-      });
-      try {
-        this.ws?.close();
-      } catch {
-        /* ignore */
-      }
-      this.ws = null;
-      this.wsState = "disconnected";
+    const market = msg.data.m;
+    let book = this.books.get(market);
+    if (!book) {
+      book = emptyBook();
+      book.connected = true;
+      this.books.set(market, book);
     }
+
+    applyExtendedMessage(book, msg);
+    // Note: we don't enforce per-market seq continuity on the shared stream
+    // because Extended interleaves seq numbers across all markets. The
+    // one-per-minute SNAPSHOT self-heals any drift. Photon OMS takes the
+    // same approach in production.
   }
 
   private onClose(event: CloseEvent): void {
     console.warn("WS closed", { code: event.code, reason: event.reason });
     this.ws = null;
     this.wsState = "disconnected";
-    // Reconnect happens on next alarm (<= 30s).
+    // Mark all books as disconnected until the next reconnect repopulates them.
+    for (const book of this.books.values()) {
+      book.connected = false;
+    }
   }
 
   private onError(event: Event): void {
@@ -213,32 +220,70 @@ export class ExtendedOms extends DurableObject<Env> {
   }
 
   private healthSnapshot(): HealthSnapshot {
+    let total = 0;
+    for (const b of this.books.values()) total += b.updates;
     return {
       status: "ok",
-      market: MARKET,
       ws_state: this.wsState,
       reconnect_attempts: this.reconnectAttempts,
       last_message_ms: this.lastMessageMs,
       last_alarm_ms: this.lastAlarmMs,
-      updates: this.book.updates,
-      last_seq: this.book.last_seq,
+      markets_tracked: this.books.size,
+      total_updates: total,
       uptime_ms: Date.now() - this.startedAt,
     };
   }
 
-  private bookSnapshot() {
-    const ageMs = this.book.ts_ms ? Date.now() - this.book.ts_ms : null;
+  private marketsSnapshot() {
+    const now = Date.now();
+    const markets: Array<{
+      symbol: string;
+      connected: boolean;
+      updates: number;
+      last_seq: number;
+      age_ms: number | null;
+      bid: number | null;
+      ask: number | null;
+      bid_levels: number;
+      ask_levels: number;
+    }> = [];
+
+    for (const [symbol, book] of this.books) {
+      markets.push({
+        symbol,
+        connected: book.connected,
+        updates: book.updates,
+        last_seq: book.last_seq,
+        age_ms: book.ts_ms ? now - book.ts_ms : null,
+        bid: book.bids[0]?.[0] ?? null,
+        ask: book.asks[0]?.[0] ?? null,
+        bid_levels: book.bids.length,
+        ask_levels: book.asks.length,
+      });
+    }
+
+    markets.sort((a, b) => a.symbol.localeCompare(b.symbol));
+    return {
+      total: markets.length,
+      markets,
+    };
+  }
+
+  private bookSnapshot(market: string) {
+    const book = this.books.get(market);
+    if (!book) return null;
+    const ageMs = book.ts_ms ? Date.now() - book.ts_ms : null;
     return {
       exchange: "extended",
-      symbol: MARKET,
-      bids: this.book.bids,
-      asks: this.book.asks,
-      timestamp_ms: this.book.ts_ms,
-      received_ms: this.book.received_ms,
+      symbol: market,
+      bids: book.bids,
+      asks: book.asks,
+      timestamp_ms: book.ts_ms,
+      received_ms: book.received_ms,
       age_ms: ageMs,
-      connected: this.wsState === "connected" && this.book.updates > 0,
-      updates: this.book.updates,
-      last_seq: this.book.last_seq,
+      connected: book.connected && this.wsState === "connected",
+      updates: book.updates,
+      last_seq: book.last_seq,
     };
   }
 

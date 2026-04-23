@@ -1,7 +1,7 @@
 /**
  * OMS-v2 PoC — Worker entrypoint.
  *
- * Routes all /book/* and /health requests to the ExtendedOms singleton DO.
+ * Routes all ExtendedOms endpoints through the singleton DO.
  * Nothing else is wired up. This is intentionally minimal.
  */
 
@@ -16,25 +16,31 @@ interface Env {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const path = url.pathname;
 
-    // Any route handled by the ExtendedOms DO goes through the singleton instance.
-    if (url.pathname === "/health" || url.pathname.startsWith("/book/")) {
+    // All state lives inside the ExtendedOms singleton DO.
+    if (
+      path === "/health" ||
+      path === "/markets" ||
+      path.startsWith("/book/")
+    ) {
       const id = env.EXTENDED_OMS.idFromName("singleton");
       const stub = env.EXTENDED_OMS.get(id);
       return stub.fetch(request);
     }
 
-    // Root: give a tiny hint.
-    if (url.pathname === "/" || url.pathname === "") {
+    if (path === "/" || path === "") {
       return new Response(
         [
-          "OMS-v2 Proof of Concept",
+          "OMS-v2 Proof of Concept — Extended all-markets shared stream",
           "",
           "Endpoints:",
-          "  GET /health         — DO health snapshot",
-          "  GET /book/BTC-USD   — top-20 orderbook for BTC-USD",
+          "  GET /health          — DO health snapshot",
+          "  GET /markets         — list all tracked markets (top-of-book + stats)",
+          "  GET /book/{market}   — top-10 orderbook for a specific market",
           "",
-          "See deploy/cf-containers/proof-of-concept/README.md",
+          "Data is held in memory only (no persistence). See",
+          "  deploy/cf-containers/proof-of-concept/README.md",
         ].join("\n"),
         { headers: { "content-type": "text/plain" } },
       );

@@ -2,9 +2,9 @@
  * Minimal orderbook delta application for Extended's public order book stream.
  *
  * Spec reference: https://api.docs.extended.exchange/#order-book-stream
+ * Photon OMS reference: deploy/monitor/monitor_service.py::_handle_extended_msg
  *
- * Extended sends either a SNAPSHOT or DELTA payload. Envelope shape:
- *
+ * Message envelope:
  *   {
  *     ts: 1701563440000,
  *     type: "SNAPSHOT" | "DELTA",
@@ -16,25 +16,25 @@
  *     seq: 1
  *   }
  *
- * Per-level fields:
- *   p — price (string)
- *   q — for a SNAPSHOT the absolute size; for a DELTA the CHANGE in size
- *   c — absolute size in both SNAPSHOT and DELTA (this is what we actually want to store)
+ * Per-level fields (per spec):
+ *   p — price
+ *   q — for SNAPSHOT the absolute size; for DELTA the CHANGE in size
+ *   c — absolute size for both SNAPSHOT and DELTA
  *
- * Because `c` is always absolute, applying a DELTA is just a per-price upsert
- * using `c`; we can ignore the `q` field. qty == 0 removes the level.
- *
- * Sequence: "1" is the first snapshot. Subsequent numbers correspond to deltas.
- * If a client receives a sequence out of order, it should reconnect.
+ * In practice, the Photon OMS (Python) parses `q` as an absolute size and
+ * ignores `c` entirely, which has been production-stable. To be robust
+ * against either behavior, we use `c` when present and fall back to `q`.
+ * Either way we always treat the resulting number as the *absolute* level
+ * size and upsert (not accumulate). Level removals are represented by qty=0.
  */
 
-export const TOP_N = 20;
+export const TOP_N = 10;
 
 export interface Orderbook {
   bids: Array<[number, number]>; // sorted descending by price
   asks: Array<[number, number]>; // sorted ascending by price
   ts_ms: number;                 // envelope `ts`, server-generated
-  received_ms: number;           // wall-clock time when our process saw the message
+  received_ms: number;           // wall-clock time when we saw the message
   connected: boolean;
   updates: number;
   last_seq: number;              // last applied sequence
@@ -54,8 +54,8 @@ export function emptyBook(): Orderbook {
 
 interface ExtendedLevel {
   p: string | number;
-  q: string | number;
-  c: string | number;
+  q?: string | number;
+  c?: string | number;
 }
 
 export interface ExtendedMessage {
@@ -70,31 +70,28 @@ export interface ExtendedMessage {
 }
 
 /**
- * Returns true if the message was applied, false if ignored (wrong market, wrong shape, seq gap).
- * If the returned value is false AND msg.seq was provided AND != last_seq + 1 for the market,
- * the caller should treat this as a seq gap and reconnect.
+ * Apply a SNAPSHOT or DELTA to the book.
+ *
+ * Returns true if the message was applied, false if ignored (bad shape only).
+ *
+ * NOTE on sequence handling: the shared all-markets stream interleaves
+ * sequence numbers globally across markets, so per-market seq continuity
+ * cannot be enforced. Photon OMS (production) doesn't validate seq either
+ * and relies on the one-per-minute SNAPSHOT to self-heal any drift.
+ * We mirror that approach here.
  */
 export function applyExtendedMessage(book: Orderbook, msg: ExtendedMessage): boolean {
   if (!msg || !msg.data || !msg.type) return false;
 
-  // Sequence gap detection: snapshots reset seq to 1; deltas must increment by exactly 1
-  // except when a scheduled one-minute snapshot arrives (type=SNAPSHOT, any seq >= last).
   const isSnapshot = msg.type === "SNAPSHOT";
-  if (!isSnapshot && book.last_seq > 0 && typeof msg.seq === "number") {
-    if (msg.seq !== book.last_seq + 1) {
-      return false;
-    }
-  }
 
   const bids = toLevels(msg.data.b);
   const asks = toLevels(msg.data.a);
 
   if (isSnapshot) {
-    // c == absolute size for snapshot; qty=0 levels should not appear but guard anyway.
     book.bids = bids.filter((l) => l[1] > 0).sort((a, b) => b[0] - a[0]).slice(0, TOP_N);
     book.asks = asks.filter((l) => l[1] > 0).sort((a, b) => a[0] - b[0]).slice(0, TOP_N);
   } else {
-    // DELTA: c is the absolute size at that price level after the update.
     applyLevels(book.bids, bids, (a, b) => b[0] - a[0]);
     applyLevels(book.asks, asks, (a, b) => a[0] - b[0]);
     book.bids = book.bids.slice(0, TOP_N);
@@ -108,9 +105,25 @@ export function applyExtendedMessage(book: Orderbook, msg: ExtendedMessage): boo
   return true;
 }
 
+/**
+ * Map Extended level objects to [price, size] tuples.
+ * Prefer `c` (absolute size), fall back to `q` (Photon OMS convention).
+ */
 function toLevels(src: ExtendedLevel[] | undefined): Array<[number, number]> {
   if (!src) return [];
-  return src.map((lv) => [Number(lv.p), Number(lv.c)] as [number, number]);
+  const out: Array<[number, number]> = [];
+  for (const lv of src) {
+    if (lv.p === undefined || lv.p === null) continue;
+    const price = Number(lv.p);
+    const size = lv.c !== undefined && lv.c !== null
+      ? Number(lv.c)
+      : lv.q !== undefined && lv.q !== null
+      ? Number(lv.q)
+      : 0;
+    if (Number.isNaN(price) || Number.isNaN(size)) continue;
+    out.push([price, size]);
+  }
+  return out;
 }
 
 function applyLevels(
