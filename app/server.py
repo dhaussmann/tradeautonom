@@ -122,6 +122,9 @@ async def _init_exchange_clients():
         public_key=_settings.extended_public_key,
         private_key=_settings.extended_private_key,
         vault=_settings.extended_vault,
+        builder_enabled=_settings.extended_builder_enabled,
+        builder_id=_settings.extended_builder_id,
+        builder_fee=_settings.extended_builder_fee,
     )
     _exchange_clients = {"grvt": _client, "extended": _extended_client}
     # NADO client (optional — needs private key or linked signer key)
@@ -2362,6 +2365,9 @@ def _reinit_exchange_clients() -> None:
         public_key=_settings.extended_public_key,
         private_key=_settings.extended_private_key,
         vault=_settings.extended_vault,
+        builder_enabled=_settings.extended_builder_enabled,
+        builder_id=_settings.extended_builder_id,
+        builder_fee=_settings.extended_builder_fee,
     )
     _exchange_clients["extended"] = _extended_client
     # Reinit Variational client if configured

@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     extended_public_key: str = ""
     extended_private_key: str = ""
     extended_vault: int = 0
+    # Extended builder-code support (https://docs.extended.exchange/extended-resources/builder-codes).
+    # Builder fee is routed to the configured builder account per trade.
+    # Non-secret config — lives here, not in the vault.
+    extended_builder_enabled: bool = True
+    extended_builder_id: int = 177174            # clientId of the builder account
+    extended_builder_fee: float = 0.00007        # fee fraction (0.00007 = 0.007%)
     # NADO credentials
     nado_private_key: str = ""
     nado_subaccount_name: str = "default"

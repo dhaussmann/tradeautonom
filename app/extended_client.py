@@ -61,6 +61,9 @@ class ExtendedClient:
         public_key: str = "",
         private_key: str = "",
         vault: int = 0,
+        builder_enabled: bool = True,
+        builder_id: int = 0,
+        builder_fee: float = 0.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         # REST session for public endpoints
@@ -81,15 +84,44 @@ class ExtendedClient:
         self._vault = vault
         self._has_credentials = bool(api_key and private_key and public_key and vault is not None)
 
+        # Builder-code configuration (see docs/extended-resources/builder-codes).
+        # Non-secret; injected into every place_order / create_order_object call
+        # when enabled AND both id+fee are set.
+        self._builder_enabled = bool(builder_enabled)
+        self._builder_id = int(builder_id) if builder_id else 0
+        self._builder_fee = Decimal(str(builder_fee)) if builder_fee else Decimal("0")
+
         # Shared fill WS state — one connection per client, multiple symbol callbacks
         self._fill_callbacks: list[tuple[str, object]] = []  # [(symbol, callback), ...]
         self._fill_ws_task: object = None  # asyncio.Task | None
 
         if self._has_credentials:
             self._init_trading_client()
-            logger.info("ExtendedClient initialised WITH trading (base=%s)", self._base_url)
+            if self._builder_kwargs():
+                logger.info(
+                    "ExtendedClient initialised WITH trading (base=%s, builder_id=%s, builder_fee=%s%%)",
+                    self._base_url, self._builder_id, self._builder_fee * Decimal("100"),
+                )
+            else:
+                logger.info(
+                    "ExtendedClient initialised WITH trading (base=%s, builder_code=disabled)",
+                    self._base_url,
+                )
         else:
             logger.info("ExtendedClient initialised READ-ONLY (base=%s)", self._base_url)
+
+    def _builder_kwargs(self) -> dict:
+        """Return {builder_id, builder_fee} kwargs if configured, else {}.
+
+        Passed into place_order(...) and create_order_object(...). When empty,
+        orders are placed without a builder code (default Extended behaviour).
+        """
+        if self._builder_enabled and self._builder_id and self._builder_fee > 0:
+            return {
+                "builder_id": self._builder_id,
+                "builder_fee": self._builder_fee,
+            }
+        return {}
 
     def _init_trading_client(self) -> None:
         """Initialise the x10 SDK trading client."""
@@ -344,6 +376,7 @@ class ExtendedClient:
             expire_time=expire,
             time_in_force=TimeInForce.IOC,
             starknet_domain=config.starknet_domain,
+            **self._builder_kwargs(),
         )
         # Patch type LIMIT → MARKET (model is frozen, so use model_copy)
         return order.model_copy(update={"type": OrderType.MARKET})
@@ -417,6 +450,7 @@ class ExtendedClient:
                 price=final_limit,
                 side=order_side,
                 time_in_force=TimeInForce.IOC,
+                **self._builder_kwargs(),
             )
         )
 
@@ -489,6 +523,7 @@ class ExtendedClient:
                 side=order_side,
                 post_only=post_only,
                 reduce_only=reduce_only,
+                **self._builder_kwargs(),
             )
         )
 
@@ -737,6 +772,7 @@ class ExtendedClient:
             side=order_side,
             post_only=True,
             reduce_only=reduce_only,
+            **self._builder_kwargs(),
         )
 
         data = getattr(result, "data", result)
@@ -774,6 +810,7 @@ class ExtendedClient:
             side=order_side,
             time_in_force=TimeInForce.IOC,
             reduce_only=reduce_only,
+            **self._builder_kwargs(),
         )
 
         data = getattr(result, "data", result)
