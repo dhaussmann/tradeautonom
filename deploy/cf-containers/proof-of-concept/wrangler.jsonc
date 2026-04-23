@@ -1,9 +1,17 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+  "account_id": "e52977b75e8923af6487772b5e91c2b8",
   "name": "oms-v2-poc",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-23",
   "compatibility_flags": ["nodejs_compat"],
+  // Route on a real zone (bypasses workers.dev Gateway blocks on dev laptops).
+  // custom_domain=true auto-creates the DNS record; hostname must be bare (no path/wildcard).
+  // workers_dev left enabled as a fallback.
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "oms-v2-poc.defitool.de", "zone_name": "defitool.de", "custom_domain": true }
+  ],
   // Observability: enable logs in the Cloudflare dashboard.
   // Retention = 7 days on Workers Paid.
   "observability": {
