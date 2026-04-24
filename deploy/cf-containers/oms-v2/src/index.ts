@@ -25,6 +25,7 @@ import { NadoOms } from "./exchanges/nado";
 import { VariationalOms } from "./exchanges/variational";
 import { AggregatorDO } from "./aggregator";
 import { NadoRelayContainer } from "./nado-relay-container";
+import { ArbScannerDO } from "./arb-scanner";
 import type { Env } from "./types";
 
 export {
@@ -34,6 +35,7 @@ export {
   VariationalOms,
   AggregatorDO,
   NadoRelayContainer,
+  ArbScannerDO,
 };
 
 type ExchangeBindingKey = "extended" | "grvt" | "nado" | "variational";
@@ -50,6 +52,12 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Arb scanner routes (Phase C). /ws/arb is WebSocket; /arb/* is REST.
+    if (path === "/ws/arb" || path.startsWith("/arb/")) {
+      const stub = env.ARB_SCANNER.get(env.ARB_SCANNER.idFromName("singleton"));
+      return stub.fetch(request);
+    }
 
     // Aggregator-handled routes
     if (
@@ -101,6 +109,13 @@ export default {
           "Auto-discovery:",
           "  GET /discovery                 last-run stats",
           "  GET /discovery/run             force a fresh run",
+          "",
+          "Arb scanner (DNA-bot):",
+          "  WS  /ws/arb                    {action:'watch'|'unwatch'|'subscribe_opportunities'|'unsubscribe_opportunities'}",
+          "  GET /arb/opportunities         current cross-exchange opportunities",
+          "  GET /arb/opportunities?token=BTC&min_profit_bps=5",
+          "  GET /arb/config                scanner config (fees, thresholds)",
+          "  GET /arb/health                scanner status",
           "",
           "Per-exchange debugging:",
           "  GET /ext/health                ExtendedOms health",

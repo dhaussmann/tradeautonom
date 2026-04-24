@@ -57,6 +57,10 @@
       {
         "name": "NADO_RELAY",
         "class_name": "NadoRelayContainer"
+      },
+      {
+        "name": "ARB_SCANNER",
+        "class_name": "ArbScannerDO"
       }
     ]
   },
@@ -72,6 +76,10 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["NadoRelayContainer"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ArbScannerDO"]
     }
   ]
 }

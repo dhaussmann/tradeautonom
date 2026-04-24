@@ -1,6 +1,6 @@
 # V2 OMS — Cloudflare-native architecture
 
-Status: **Phase B complete**. Live: `https://oms-v2.defitool.de`.
+Status: **Phase C complete**. Live: `https://oms-v2.defitool.de`.
 
 Source under `deploy/cf-containers/oms-v2/`.
 
@@ -12,10 +12,74 @@ Working:
   Container that holds the `permessage-deflate` WebSocket to Nado and
   forwards events to `NadoOms` DO via a plain WebSocket on port 8080).
 - AggregatorDO (hibernation WS, V1 bot protocol)
+- ArbScannerDO (event-driven cross-exchange arb; V1-compatible `/ws/arb`)
 - Auto-discovery cron (every 15 min) — 117 cross-exchange token pairs
 
-Remaining phases: C (ArbScannerDO + /ws/arb DNA-bot protocol),
-D (canary rollout).
+Remaining phases: D (canary rollout of one V1 bot against oms-v2).
+
+## Phase C — Cross-exchange arbitrage scanner
+
+The `ArbScannerDO` is a separate Durable Object that receives book updates
+from every ExchangeOms in parallel with `AggregatorDO` (both targets get
+`Promise.allSettled([agg.onBookUpdate, scanner.onBookUpdate])`). It
+serves two consumer surfaces:
+
+### `/ws/arb` — DNA-bot WebSocket
+
+Wire protocol matches V1 Photon OMS byte-for-byte
+(`deploy/monitor/monitor_service.py` lines 824-927 and 958-1003) so that
+`app/dna_bot.py` can switch from Photon OMS to V2 OMS simply by flipping
+`oms_url` config.
+
+Client → server:
+- `{"action":"watch","token":"SOL","buy_exchange":"extended","sell_exchange":"grvt"}`
+- `{"action":"unwatch", ...same fields...}`
+- `{"action":"subscribe_opportunities","min_profit_bps":10,"exchanges":["extended","grvt"]}`
+- `{"action":"unsubscribe_opportunities"}`
+
+Server → client:
+- `{"type":"arb_opportunity", ...21 fields matching V1 _arb_opp_to_dict...}`
+- `{"type":"arb_status", token, buy_exchange, sell_exchange, buy_ask, sell_bid, spread_bps, fee_threshold_bps, profitable, timestamp_ms}`
+- `{"type":"arb_close", ...same fields..., reason:"spread_below_fees"}`
+- `{"type":"watching", token, buy_exchange, sell_exchange, has_data:false}` when no book data yet
+
+### `/arb/*` — REST
+
+- `GET /arb/opportunities` — current opportunities, sorted by `net_profit_bps` desc
+- `GET /arb/opportunities?token=BTC` — filter by base token
+- `GET /arb/opportunities?min_profit_bps=5` — live re-scan with custom threshold
+  (used by DNA-bot half-neutral/custom spread modes)
+- `GET /arb/config` — scanner config (exchanges, fees, thresholds)
+- `GET /arb/health` — tokens_tracked, books_cached, last_scan_ms, totals
+
+### Key V1 parity constants
+
+Ported verbatim from `monitor_service.py` to `src/lib/arb.ts`:
+- `TAKER_FEE_PCT = { extended: 0.0225, nado: 0.035, grvt: 0.039, variational: 0.04 }`
+- `ARB_FEE_BUFFER_BPS = 1.0`
+- `ARB_MAX_NOTIONAL_USD = 50_000`
+- `ARB_EXCHANGES = { extended, grvt, nado }` (Variational excluded per V1 default)
+- `ARB_EXCLUDED_TOKENS = { WTI, MEGA, AMZN, AAPL, TSLA, HOOD, META, USDJPY }`
+- Binary-search quantity finder: 12 iterations, `min_qty=0.001`
+- `_min_profit_bps(a,b) = (fee_a + fee_b) * 2 * 100 + buffer_bps`
+
+### Event-driven recomputation (instead of V1's 200ms poll loop)
+
+V1 Photon runs `_scan_arbitrage` on a fixed `OMS_ARB_SCAN_INTERVAL_S=0.2`
+timer. V2 recomputes opportunities for a single token the moment any
+exchange pushes a fresh book for that token — latency is bounded by the
+slowest leg's book freshness plus one RPC hop (~5 ms). Each update also
+triggers `notifyWatchers(snap)` for real-time per-position spread pushes.
+
+### Throughput observations (initial deploy)
+
+- 4,975 scans in ~4 minutes after deploy (event-driven, all 4 exchanges
+  fanning out)
+- 349 books cached across 117 tokens
+- 3-9 actionable opportunities at any time (varies with market)
+- Probe with `subscribe_opportunities` + 2 watches: 14 opportunity pushes,
+  2 `arb_status`, 450 `arb_close` in 20 s (`arb_close` fires on every
+  relevant book update of a non-profitable watched position; matches V1)
 
 ## The Nado deflate problem and why we use a container
 

@@ -176,10 +176,20 @@ export class VariationalOms extends DurableObject<Env> {
   }
 
   private fanOut(snap: BookSnapshot): void {
+    // Parallel fan-out to AggregatorDO (bots) + ArbScannerDO (arb). Variational
+    // is excluded from the default arb pair set (see src/lib/arb.ts
+    // ARB_EXCHANGES) but we still push so the scanner can cache books in case
+    // a future config enables it.
     const agg = this.env.AGGREGATOR_DO.get(
       this.env.AGGREGATOR_DO.idFromName("aggregator"),
     );
-    agg.onBookUpdate(snap).catch(() => { /* drop */ });
+    const scanner = this.env.ARB_SCANNER.get(
+      this.env.ARB_SCANNER.idFromName("singleton"),
+    );
+    void Promise.allSettled([
+      agg.onBookUpdate(snap),
+      scanner.onBookUpdate(snap),
+    ]);
   }
 
   private toSnapshot(market: string, book: Book): BookSnapshot {

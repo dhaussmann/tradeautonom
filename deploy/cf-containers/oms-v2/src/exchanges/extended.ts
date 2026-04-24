@@ -206,15 +206,24 @@ export class ExtendedOms extends DurableObject<Env> {
   }
 
   private fanOut(snap: BookSnapshot): void {
+    // Parallel fan-out: AggregatorDO (bot /ws subscribers) + ArbScannerDO
+    // (cross-exchange arb opportunities + /ws/arb). Both are fire-and-forget;
+    // one DO being slow won't block the other. Phase C.
     const agg = this.env.AGGREGATOR_DO.get(
       this.env.AGGREGATOR_DO.idFromName("aggregator"),
     );
-    // ArbScannerDO fan-out will be added in Phase C. For now only AggregatorDO.
-    agg.onBookUpdate(snap).catch((err: unknown) => {
-      // Silently drop individual RPC errors — aggregator will catch up on next update.
-      if (err instanceof Error && Math.random() < 0.001) {
-        // Log ~0.1% of failures to avoid flooding if aggregator is down.
-        console.warn("fanout to aggregator failed", err.message);
+    const scanner = this.env.ARB_SCANNER.get(
+      this.env.ARB_SCANNER.idFromName("singleton"),
+    );
+    void Promise.allSettled([
+      agg.onBookUpdate(snap),
+      scanner.onBookUpdate(snap),
+    ]).then((results) => {
+      for (const r of results) {
+        if (r.status === "rejected" && Math.random() < 0.001) {
+          const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+          console.warn("fanout failed", msg);
+        }
       }
     });
   }

@@ -26,11 +26,45 @@ import type {
   ClientMessage,
   WsAttachment,
   DiscoveredPairs,
+  MarketMeta,
 } from "./types";
 
 const MAX_SUBS_PER_WS = 200;
 const SUPPORTED_EXCHANGES = ["extended", "grvt", "nado", "variational"] as const;
 type SupportedExchange = (typeof SUPPORTED_EXCHANGES)[number];
+
+/**
+ * Re-shape the per-exchange meta arrays in DiscoveryResult into the
+ * `exchange → token → MarketMeta` shape used by ArbScannerDO.
+ */
+function buildScannerMeta(
+  result: DiscoveryResult,
+): Record<string, Record<string, MarketMeta>> {
+  const out: Record<string, Record<string, MarketMeta>> = {};
+  const { maxLeverage, minOrderSize, qtyStep } = result.meta;
+  const exchanges = new Set<string>([
+    ...Object.keys(maxLeverage),
+    ...Object.keys(minOrderSize),
+    ...Object.keys(qtyStep),
+  ]);
+  for (const exch of exchanges) {
+    const tokens = new Set<string>([
+      ...Object.keys(maxLeverage[exch] ?? {}),
+      ...Object.keys(minOrderSize[exch] ?? {}),
+      ...Object.keys(qtyStep[exch] ?? {}),
+    ]);
+    const perExch: Record<string, MarketMeta> = {};
+    for (const tok of tokens) {
+      perExch[tok] = {
+        maxLeverage: maxLeverage[exch]?.[tok] ?? 1,
+        minOrderSize: minOrderSize[exch]?.[tok] ?? 0,
+        qtyStep: qtyStep[exch]?.[tok] ?? 0,
+      };
+    }
+    out[exch] = perExch;
+  }
+  return out;
+}
 
 export class AggregatorDO extends DurableObject<Env> {
   async fetch(req: Request): Promise<Response> {
@@ -142,6 +176,16 @@ export class AggregatorDO extends DurableObject<Env> {
       );
       tasks.push(v.ensureTracking(result.symbolsByExchange.variational));
     }
+
+    // Phase C: push discovery + per-token meta to the arb scanner so it
+    // can evaluate cross-exchange arb opportunities. Independent of bot
+    // fan-out — if this fails the bot /ws pipeline is unaffected.
+    const scanner = this.env.ARB_SCANNER.get(
+      this.env.ARB_SCANNER.idFromName("singleton"),
+    );
+    const scannerMeta = buildScannerMeta(result);
+    tasks.push(scanner.updateDiscovery(result.pairs, scannerMeta));
+
     await Promise.allSettled(tasks);
 
     return {
@@ -153,6 +197,22 @@ export class AggregatorDO extends DurableObject<Env> {
         nado: result.symbolsByExchange.nado.length,
         variational: result.symbolsByExchange.variational.length,
       },
+    };
+  }
+
+  /**
+   * Bootstrap RPC: ArbScannerDO calls this on cold start to retrieve the
+   * last-known discovery result without waiting for the next cron.
+   */
+  async getDiscoveryForScanner(): Promise<
+    | { pairs: DiscoveredPairs; meta: Record<string, Record<string, MarketMeta>> }
+    | null
+  > {
+    const stored = await this.ctx.storage.get<DiscoveryResult>("discovery");
+    if (!stored) return null;
+    return {
+      pairs: stored.pairs,
+      meta: buildScannerMeta(stored),
     };
   }
 

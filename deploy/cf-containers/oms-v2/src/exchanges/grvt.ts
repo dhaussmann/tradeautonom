@@ -227,10 +227,18 @@ export class GrvtOms extends DurableObject<Env> {
   }
 
   private fanOut(snap: BookSnapshot): void {
+    // Parallel fan-out to AggregatorDO (bots) + ArbScannerDO (arb). See
+    // extended.ts::fanOut for rationale.
     const agg = this.env.AGGREGATOR_DO.get(
       this.env.AGGREGATOR_DO.idFromName("aggregator"),
     );
-    agg.onBookUpdate(snap).catch(() => { /* drop */ });
+    const scanner = this.env.ARB_SCANNER.get(
+      this.env.ARB_SCANNER.idFromName("singleton"),
+    );
+    void Promise.allSettled([
+      agg.onBookUpdate(snap),
+      scanner.onBookUpdate(snap),
+    ]);
   }
 
   private onClose(event: CloseEvent): void {
