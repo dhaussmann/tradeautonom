@@ -1,11 +1,24 @@
-grvt-pysdk>=0.1.0
-fastapi>=0.115.0
-uvicorn>=0.30.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
+# Runtime dependencies pinned to the versions actually running in production.
+#
+# Why pins: during Phase F.0 feasibility testing for UserContainer-v2 we built
+# a fresh image from this file and `x10-python-trading-starknet` resolved to
+# 1.4.0, which reorganised the package layout and broke `from x10.perpetual.accounts
+# import StarkPerpetualAccount`. V1 production (`tradeautonom-v3`) runs 1.3.1
+# because the image was built before 1.4.0 released. Pinning locks the known-good
+# versions so `docker build` is reproducible from any time forward.
+#
+# To refresh: verify against `docker exec tradeautonom-v3 pip list` on the live
+# V1 container, then update versions here in a dedicated commit with regression
+# testing.
+
+grvt-pysdk==0.2.1
+fastapi==0.136.0
+uvicorn==0.46.0
+pydantic==2.13.3
+pydantic-settings==2.14.0
 python-dotenv>=1.0.0
-httpx>=0.27.0
-requests>=2.31.0
-x10-python-trading-starknet>=1.0.0
-websockets>=12.0
-curl_cffi>=0.15.0
+httpx==0.28.1
+requests==2.33.1
+x10-python-trading-starknet==1.3.1
+websockets==13.1
+curl_cffi==0.15.0

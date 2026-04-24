@@ -1,0 +1,19 @@
+{
+  "name": "user-v2-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Phase F.0 feasibility PoC for UserContainer-v2. See docs/v2-cf-containers-architecture.md.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260401.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.20.0"
+  }
+}

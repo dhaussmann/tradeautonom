@@ -1,0 +1,24 @@
+# Phase F.0 PoC dependency pins.
+#
+# Matches what tradeautonom-v3 (V1 production image) actually runs.
+# Discovered via `docker exec tradeautonom-v3 pip list`.
+#
+# Key reason for pinning x10: version 1.4.0 reorganised the package layout —
+# `x10.perpetual.accounts` no longer exists as a module, breaking V1 imports.
+# 1.3.1 is the tested-good version.
+#
+# The production `tradeautonom:v3` image uses the root `requirements.txt`
+# without version pins because the image was built before 1.4.0 released;
+# whatever pip resolved at build time got baked in. For F.1, we'll pin these
+# versions in the root requirements.txt too.
+grvt-pysdk==0.2.1
+fastapi==0.136.0
+uvicorn==0.46.0
+pydantic==2.13.3
+pydantic-settings==2.14.0
+python-dotenv>=1.0.0
+httpx==0.28.1
+requests==2.33.1
+x10-python-trading-starknet==1.3.1
+websockets==13.1
+curl_cffi==0.15.0
