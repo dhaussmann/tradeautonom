@@ -1,10 +1,32 @@
 # V2 OMS — Cloudflare-native architecture
 
-Status: **Phase A deployed** (Extended + AggregatorDO + /ws bot protocol).
-Live: `https://oms-v2.defitool.de` — source under `deploy/cf-containers/oms-v2/`.
+Status: **Phase B partially deployed**. Live: `https://oms-v2.defitool.de`.
 
-Remaining phases: B (GRVT + Nado + Variational + auto-discovery),
-C (ArbScannerDO + /ws/arb DNA-bot protocol), D (canary rollout).
+Source under `deploy/cf-containers/oms-v2/`.
+
+Working:
+- Extended (114 markets, all-markets shared stream)
+- GRVT (90 markets, single subscribe frame, snapshot-style updates)
+- Variational (97 markets, 1.2s REST polling, 3-tier synthetic book)
+- AggregatorDO (hibernation WS, V1 bot protocol)
+- Auto-discovery cron (every 15 min) — 117 cross-exchange token pairs
+
+Blocked:
+- Nado requires `Sec-WebSocket-Extensions: permessage-deflate` on the
+  subscribe upgrade. Cloudflare Workers `fetch()` does not negotiate
+  deflate, so Nado gateway rejects the upgrade with 403
+  "Invalid compression headers". Options to resolve:
+    1. Add a tiny relay Worker on a different host that accepts the
+       compressed frames, inflates them, and forwards plain JSON to
+       NadoOms (complex; needs persistent WS host outside Workers).
+    2. Run NadoOms as a small CF Container (Python) that keeps the
+       deflate-capable `websockets` client. Mixes container + DO but
+       isolates the problem.
+    3. Wait for Cloudflare to add deflate negotiation to Workers WS
+       client and re-enable NadoOms then.
+
+Remaining phases: C (ArbScannerDO + /ws/arb DNA-bot protocol,
+deferred until Nado is available), D (canary rollout).
 
 ## What OMS does today (V1, Python, Photon VM)
 

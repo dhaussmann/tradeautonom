@@ -3,10 +3,16 @@
  */
 
 import type { ExtendedOms } from "./exchanges/extended";
+import type { GrvtOms } from "./exchanges/grvt";
+import type { NadoOms } from "./exchanges/nado";
+import type { VariationalOms } from "./exchanges/variational";
 import type { AggregatorDO } from "./aggregator";
 
 export interface Env {
   EXTENDED_OMS: DurableObjectNamespace<ExtendedOms>;
+  GRVT_OMS: DurableObjectNamespace<GrvtOms>;
+  NADO_OMS: DurableObjectNamespace<NadoOms>;
+  VARIATIONAL_OMS: DurableObjectNamespace<VariationalOms>;
   AGGREGATOR_DO: DurableObjectNamespace<AggregatorDO>;
 }
 
@@ -15,13 +21,13 @@ export interface BookSnapshot {
   symbol: string;
   bids: Array<[number, number]>; // sorted descending by price
   asks: Array<[number, number]>; // sorted ascending by price
-  timestamp_ms: number;           // server-provided timestamp from exchange message
+  timestamp_ms: number;
   connected: boolean;
   updates: number;
   last_seq: number;
 }
 
-/** Bot-client WS protocol messages — matches V1 Photon OMS wire format verbatim. */
+/** Bot-client WS protocol (V1-compatible Photon OMS wire format). */
 export interface ClientSubscribe {
   action: "subscribe";
   exchange: string;
@@ -56,8 +62,17 @@ export interface ServerError {
   detail?: string;
 }
 
-/** Per-WebSocket state persisted via serializeAttachment across hibernation. */
 export interface WsAttachment {
-  subs: string[]; // list of "exchange:symbol" keys this WS is subscribed to
+  subs: string[];
   connected_at: number;
 }
+
+/** Per-exchange market metadata collected during auto-discovery. */
+export interface MarketMeta {
+  maxLeverage: number;
+  minOrderSize: number;
+  qtyStep: number;
+}
+
+/** Auto-discovery result: base token → { exchange → symbol }. */
+export type DiscoveredPairs = Record<string, Record<string, string>>;
