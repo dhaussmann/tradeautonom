@@ -31,15 +31,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc tini curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Python deps FIRST (build-cache friendly — rebuilds only on pip changes).
-# The root requirements.txt is pinned to the same versions tradeautonom-v3
-# runs in V1, which we verified in Phase F.0.
+# Python deps. The root requirements.txt is pinned to the same versions
+# tradeautonom-v3 runs in V1 (verified in Phase F.0). F.4 persistence uses
+# only urllib (stdlib) to call back to the user-v2 Worker — no boto3/S3
+# client needed since the Worker owns the R2 binding.
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-
-# Additional deps used by Phase F.2 R2 persistence.
-# (boto3 is ~13 MB; cheap to include even before F.2 is wired up.)
-RUN pip install --no-cache-dir boto3==1.35.0
 
 # App code. V2 is HEADLESS — no static/ directory, no /ui route. The
 # user-facing Vue SPA lives on bot.defitool.de (see deploy/cloudflare/).
@@ -53,6 +50,9 @@ RUN chmod +x /app/entrypoint.sh
 
 # Signal to app/server.py to skip the /ui static-file endpoint.
 ENV V2_HEADLESS=1
+
+# Build cache-bust marker for Phase F.4 roll-out
+ENV V2_BUILD_TAG=f4-2026-04-24-v9-bodydiag
 
 EXPOSE 8000
 

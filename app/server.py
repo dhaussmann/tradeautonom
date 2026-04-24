@@ -381,6 +381,44 @@ app.add_middleware(
 )
 
 
+# Phase F.4: pick up USER_ID + V2_SHARED_TOKEN from the first request that
+# the Worker forwards (it always sets X-User-Id + X-Internal-Token). On
+# first sight, inject them into cloud_persistence, restore state, and
+# start the background flush task.
+_v2_state_bootstrapped = False
+_v2_flush_task: "asyncio.Task | None" = None
+
+
+@app.middleware("http")
+async def _v2_runtime_bootstrap(request, call_next):
+    global _v2_state_bootstrapped, _v2_flush_task
+    if not _v2_state_bootstrapped:
+        try:
+            user_id = request.headers.get("x-user-id", "") or request.headers.get("X-User-Id", "")
+            token = request.headers.get("x-internal-token", "") or request.headers.get("X-Internal-Token", "")
+            if user_id and token and _settings and getattr(_settings, "v2_cloud_persistence", False):
+                from app.cloud_persistence import (
+                    set_runtime_credentials,
+                    restore_sync,
+                    start_background_flush,
+                )
+                set_runtime_credentials(user_id, token)
+                # Restore in a thread so we don't block the request.
+                import asyncio as _asyncio
+                await _asyncio.get_event_loop().run_in_executor(None, restore_sync)
+                # Start the flush task now that creds are present.
+                if _v2_flush_task is None or _v2_flush_task.done():
+                    _v2_flush_task = await start_background_flush()
+                _v2_state_bootstrapped = True
+                logger.info(
+                    "cloud_persistence: runtime bootstrap complete user_id=%s flush_task=%s",
+                    user_id, bool(_v2_flush_task),
+                )
+        except Exception as exc:
+            logger.warning("cloud_persistence: runtime bootstrap failed: %s", exc)
+    return await call_next(request)
+
+
 # ------------------------------------------------------------------
 # Health
 # ------------------------------------------------------------------
@@ -2691,26 +2729,113 @@ async def get_keys():
     }
 
 
+@app.post("/settings/flush-state")
+async def trigger_flush_state():
+    """Manually trigger a cloud_persistence flush. For debugging — in
+    production the periodic task in the lifespan + bootstrap middleware
+    handles this automatically. Safe to call anytime; no-op if persistence
+    is disabled or creds are missing."""
+    try:
+        from app.cloud_persistence import (
+            flush as _cp_flush,
+            _Config,
+            _make_tarball,
+            _endpoint_base,
+            _http_post,
+            _http_post_with_body,
+        )
+        _Config.load()
+        # Diagnostic: inspect each step individually
+        _tok = _Config.shared_token or ""
+        _tok_masked = (_tok[:4] + "…" + _tok[-4:]) if len(_tok) >= 10 else ("***" if _tok else "")
+        diag = {
+            "user_id": _Config.user_id,
+            "state_endpoint": _Config.state_endpoint,
+            "shared_token_present": bool(_Config.shared_token),
+            "shared_token_masked": _tok_masked,
+            "shared_token_length": len(_tok),
+            "enabled": _Config.enabled,
+        }
+        if not _Config.enabled:
+            diag["result"] = "disabled"
+            return {"ok": False, **diag}
+        if not all([_Config.user_id, _Config.state_endpoint, _Config.shared_token]):
+            diag["result"] = "missing_creds"
+            return {"ok": False, **diag}
+
+        # Build tarball manually to inspect size + contents
+        try:
+            buf = _make_tarball()
+        except Exception as exc:
+            return {"ok": False, "result": "tar_exception", "error": str(exc), **diag}
+        if buf is None:
+            return {"ok": False, "result": "tar_none", **diag}
+        body = buf.getvalue()
+        diag["tar_bytes"] = len(body)
+
+        if len(body) == 0:
+            return {"ok": False, "result": "empty_tar", **diag}
+
+        # POST to state endpoint
+        url = f"{_endpoint_base()}/__state/flush?user_id={_Config.user_id}"
+        diag["post_url"] = url
+        try:
+            import asyncio as _asyncio
+            loop = _asyncio.get_event_loop()
+            code, resp_body, server = await loop.run_in_executor(
+                None, _http_post_with_body, url, body
+            )
+            diag["http_status"] = code
+            diag["http_response_body"] = resp_body
+            diag["http_server_header"] = server
+            return {"ok": 200 <= code < 300, "result": "posted", **diag}
+        except Exception as exc:
+            return {"ok": False, "result": "post_exception", "error": str(exc), **diag}
+    except Exception as exc:
+        import traceback
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc().splitlines()[-8:],
+        }
+
+
 @app.get("/settings/runtime")
 async def get_runtime_settings():
     """Return non-sensitive runtime config values. Useful for verifying which
     env overrides are active (e.g. EXTENDED_BUILDER_ENABLED) without exposing
     secrets. No auth required — none of these fields are sensitive.
     """
+    # Reload Settings() to capture env vars injected after module import
+    # (e.g. USER_ID set by UserContainer.ensureStarted via startAndWaitForPorts).
+    from app.config import Settings as _FreshSettings
+    try:
+        s = _FreshSettings()
+    except Exception:
+        s = _settings
     return {
-        "grvt_env": _settings.grvt_env,
-        "app_host": _settings.app_host,
-        "app_port": _settings.app_port,
-        "app_reload": _settings.app_reload,
-        "extended_builder_enabled": _settings.extended_builder_enabled,
-        "extended_builder_id": _settings.extended_builder_id,
-        "extended_builder_fee": _settings.extended_builder_fee,
-        "fn_opt_shared_monitor_url": _settings.fn_opt_shared_monitor_url,
-        "fn_enabled": _settings.fn_enabled,
-        "arb_simulation_mode": _settings.arb_simulation_mode,
-        "fn_simulation_mode": _settings.fn_simulation_mode,
-        "v2_cloud_persistence": getattr(_settings, "v2_cloud_persistence", False),
+        "grvt_env": s.grvt_env,
+        "app_host": s.app_host,
+        "app_port": s.app_port,
+        "app_reload": s.app_reload,
+        "extended_builder_enabled": s.extended_builder_enabled,
+        "extended_builder_id": s.extended_builder_id,
+        "extended_builder_fee": s.extended_builder_fee,
+        "fn_opt_shared_monitor_url": s.fn_opt_shared_monitor_url,
+        "fn_enabled": s.fn_enabled,
+        "arb_simulation_mode": s.arb_simulation_mode,
+        "fn_simulation_mode": s.fn_simulation_mode,
+        "v2_cloud_persistence": getattr(s, "v2_cloud_persistence", False),
         "v2_headless": bool(os.environ.get("V2_HEADLESS")),
+        # Phase F.4 diagnostics — exposes whether cloud persistence has
+        # everything it needs (user_id + state_endpoint + shared_token).
+        "user_id": getattr(s, "user_id", "") or os.environ.get("USER_ID", ""),
+        "state_endpoint": getattr(s, "state_endpoint", "") or os.environ.get("STATE_ENDPOINT", ""),
+        "v2_shared_token_present": bool(
+            getattr(s, "v2_shared_token", "") or os.environ.get("V2_SHARED_TOKEN", "")
+        ),
+        "v2_flush_interval_s": getattr(s, "v2_flush_interval_s", 0),
+        "v2_build_tag": os.environ.get("V2_BUILD_TAG", ""),
     }
 
 

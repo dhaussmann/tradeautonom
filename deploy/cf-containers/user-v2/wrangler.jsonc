@@ -39,6 +39,17 @@
       }
     ]
   },
+  // Phase F.4: R2 bucket for per-user state tarballs (auth.json, secrets.enc,
+  // bots/<sym>/{config,position,timer}.json, dna_bot/, etc.). One object per
+  // user keyed as "<user_id>.tar.gz". cloud_persistence.py in the container
+  // restores on cold-start + flushes every 30s via the /__state/* endpoints
+  // on this same Worker.
+  "r2_buckets": [
+    {
+      "binding": "STATE_BUCKET",
+      "bucket_name": "tradeautonom-user-state"
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",

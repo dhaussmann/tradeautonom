@@ -160,11 +160,12 @@ export default {
       }
     }
 
-    // ── TEMP: Admin probe — proxy a GET to the user's current backend.
+    // ── TEMP: Admin probe — proxy a GET or POST to the user's current backend.
     //    Used for debugging V2 routing without needing a session cookie.
-    //    Usage: GET /api/admin/probe/<user_id>/<backend_path>?token=...
+    //    Usage: GET  /api/admin/probe/<user_id>/<backend_path>?token=...
+    //           POST /api/admin/probe/<user_id>/<backend_path>?token=... (body forwarded)
     //    Respects user.backend so you can verify V1 vs V2 routes.
-    if (url.pathname.startsWith("/api/admin/probe/") && request.method === "GET") {
+    if (url.pathname.startsWith("/api/admin/probe/")) {
       const token = url.searchParams.get("token");
       if (token !== env.INGEST_TOKEN) return jsonResponse({ error: "Forbidden" }, 403);
       const match = url.pathname.match(/^\/api\/admin\/probe\/([^/]+)(\/.*)?$/);
@@ -172,18 +173,26 @@ export default {
       const probeUserId = match[1]!;
       const probePath = match[2] ?? "/health";
       const backend = await getUserBackend(env, probeUserId);
-      // Build a request that mimics what handleUserApiProxy would forward.
-      // We skip the `?token=` to not leak it into the container.
       const forwardedUrl = new URL(request.url);
       forwardedUrl.pathname = "/api" + probePath;
       forwardedUrl.search = "";
-      const fakeRequest = new Request(forwardedUrl.toString(), { method: "GET" });
+      const forwardedHeaders = new Headers();
+      const ct = request.headers.get("content-type");
+      if (ct) forwardedHeaders.set("content-type", ct);
+      const fakeRequest = new Request(forwardedUrl.toString(), {
+        method: request.method,
+        headers: forwardedHeaders,
+        body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+        // @ts-expect-error — duplex needed for streaming request bodies
+        duplex: "half",
+      });
       const resp = await handleUserApiProxy(fakeRequest, new URL(fakeRequest.url), env, probeUserId);
       const body = await resp.text();
       return new Response(JSON.stringify({
         user_id: probeUserId,
         backend_resolved: backend,
         backend_path: probePath,
+        upstream_method: request.method,
         upstream_status: resp.status,
         upstream_content_type: resp.headers.get("content-type"),
         upstream_body_preview: body.slice(0, 2000),

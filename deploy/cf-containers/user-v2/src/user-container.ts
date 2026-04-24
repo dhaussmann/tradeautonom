@@ -38,16 +38,16 @@ export class UserContainer extends Container<Env> {
   // flush-to-R2 task will keep things active in practice.
   sleepAfter = "30m";
 
-  // Baseline env vars for every instance. Per-user overrides (USER_ID,
-  // R2 credentials) will be injected at `.get()`-time via envVars(...)
-  // once we wire the Worker to look up the user.
+  // Baseline env vars for every instance.
   //
   // NOTE: env vars are GLOBAL for all V2 users because CF Containers
   // `envVars` is static per-class. Per-user overrides (e.g. different
-  // builder-id settings) would need a D1 `user_settings` table and a
-  // `/internal/apply-settings` POST on each Worker-proxied request,
-  // mirroring the existing `/internal/apply-keys` pattern. Not needed
-  // yet because V2 has a single test user (dhaussmann@outlook.com).
+  // builder-id settings or USER_ID) are injected at request time via
+  // `/internal/apply-*` HTTP endpoints, not via envVars.
+  //
+  // USER_ID and V2_SHARED_TOKEN are set at DO construction time in
+  // user-v2/src/index.ts via `stub = ns.get(...).withEnvVars({...})` so
+  // each Container instance knows which user it belongs to.
   envVars = {
     APP_HOST: "0.0.0.0",
     APP_PORT: "8000",
@@ -58,12 +58,13 @@ export class UserContainer extends Container<Env> {
     // History ingestion — same as V1 .env.container.
     HISTORY_INGEST_URL: "https://bot.defitool.de/api/history/ingest",
     HISTORY_INGEST_INTERVAL_S: "300",
-    // V2-CLOUD-PERSISTENCE flag — Phase F.2 will flip this to "1".
-    V2_CLOUD_PERSISTENCE: "0",
+    // Cloud persistence ON. cloud_persistence.py calls back via HTTPS to
+    // the Worker's /__state/* endpoints (the Worker owns the R2 binding).
+    V2_CLOUD_PERSISTENCE: "1",
+    V2_FLUSH_INTERVAL_S: "30",
+    STATE_ENDPOINT: "https://user-v2.defitool.de",
     // Extended builder-code routing disabled for all V2 users until we add
-    // a per-user override mechanism. V1 `tradeautonom-v3` has the same
-    // setting (EXTENDED_BUILDER_ENABLED=false in .env.container). The
-    // default in app/config.py is True — we're explicitly overriding here.
+    // a per-user override mechanism.
     EXTENDED_BUILDER_ENABLED: "false",
   };
 
@@ -85,12 +86,36 @@ export class UserContainer extends Container<Env> {
   }
 
   /**
-   * Override fetch to handle an internal `/__recycle` path that stops the
-   * running container (so the next request cold-starts with fresh envVars).
-   * All other paths forward to the Python FastAPI on port 8000 as usual.
+   * Track which user this container instance belongs to so each instance
+   * starts with the correct USER_ID env var (used by cloud_persistence for
+   * R2 object-key scoping). Durable Object state persists across container
+   * restarts within the same DO lifetime.
+   */
+  private _userIdCache: string | null = null;
+
+  /**
+   * Override fetch to:
+   *   1. Handle the internal `/__recycle` path (stops the container so the
+   *      next request cold-starts with fresh envVars).
+   *   2. Read the `X-User-Id` header from the first request and remember
+   *      it. Used for the per-instance USER_ID envVar.
+   *   3. Forward everything else to the Python FastAPI on port 8000.
    */
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    // Capture user_id from header on first request. Persist to DO storage
+    // so we survive container restarts within the same DO lifetime.
+    const headerUserId = request.headers.get("X-User-Id");
+    if (headerUserId && !this._userIdCache) {
+      this._userIdCache = headerUserId;
+      await this.ctx.storage.put("user_id", headerUserId);
+    }
+    if (!this._userIdCache) {
+      const stored = await this.ctx.storage.get<string>("user_id");
+      if (stored) this._userIdCache = stored;
+    }
+
     if (url.pathname === "/__recycle") {
       try {
         await this.stop();
@@ -110,5 +135,52 @@ export class UserContainer extends Container<Env> {
       }
     }
     return super.fetch(request);
+  }
+
+  /**
+   * Ensure the container is started with per-instance envVars that carry
+   * USER_ID + V2_SHARED_TOKEN + other per-user config. Called from the
+   * index.ts Worker on FIRST request only — subsequent requests skip the
+   * start call because the container is already running with the right env.
+   */
+  private _startedWithEnv = false;
+
+  async ensureStarted(userId: string, sharedToken: string): Promise<void> {
+    if (!this._userIdCache) {
+      const stored = await this.ctx.storage.get<string>("user_id");
+      this._userIdCache = stored ?? userId;
+      if (!stored) await this.ctx.storage.put("user_id", userId);
+    }
+
+    // Only start once per DO lifetime. If Worker restarts the DO, this
+    // flag resets and we start the container with fresh envVars.
+    if (this._startedWithEnv) return;
+
+    try {
+      // IMPORTANT: startAndWaitForPorts replaces (not merges) class envVars.
+      // We must re-include the class-level defaults so GRVT_ENV, APP_RELOAD,
+      // V2_CLOUD_PERSISTENCE, STATE_ENDPOINT, etc. actually reach the
+      // container. Without this, cloud_persistence.py sees
+      // V2_CLOUD_PERSISTENCE=0 and silently no-ops.
+      await this.startAndWaitForPorts(this.defaultPort, undefined, {
+        envVars: {
+          ...this.envVars,
+          USER_ID: this._userIdCache!,
+          V2_SHARED_TOKEN: sharedToken,
+        },
+      });
+      this._startedWithEnv = true;
+    } catch (err) {
+      console.log(JSON.stringify({
+        evt: "ensureStarted_noop_or_error",
+        err: err instanceof Error ? err.message : String(err),
+      }));
+      // If the error says "already running" we can consider it started;
+      // otherwise leave the flag false so we retry next time.
+      const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+      if (msg.includes("already") || msg.includes("running")) {
+        this._startedWithEnv = true;
+      }
+    }
   }
 }

@@ -151,15 +151,19 @@ class Settings(BaseSettings):
 
     # ── V2 Cloudflare Containers persistence ────────────────────
     # Only used when running under Cloudflare Containers (ephemeral disk).
-    # app/cloud_persistence.py reads these + restores /app/data from R2 at
-    # startup and periodically tars+uploads on change. See
+    # app/cloud_persistence.py reads these + restores /app/data via an HTTP
+    # callback to the user-v2 Worker (which owns the R2 binding) on startup,
+    # and periodically tars+uploads on change. See
     # docs/v2-cf-containers-architecture.md. V1 (Photon) ignores all of these.
     v2_cloud_persistence: bool = False        # master switch
     v2_flush_interval_s: float = 30.0         # periodic upload cadence
-    user_id: str = ""                         # container's user id (R2 key prefix)
-    r2_bucket: str = ""
-    r2_endpoint: str = ""                     # https://<account>.r2.cloudflarestorage.com
-    r2_access_key_id: str = ""
-    r2_secret: str = ""
+    user_id: str = ""                         # container's user id (R2 key)
+    # URL the container uses to reach its own user-v2 Worker for /__state/*
+    # endpoints. In the container: http://user-v2.internal (CF Containers
+    # resolves this via outbound service bindings, no DNS needed).
+    state_endpoint: str = ""
+    # Same shared secret as the Worker's V2_SHARED_TOKEN — container presents
+    # it on X-Internal-Token when calling back into the Worker.
+    v2_shared_token: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
