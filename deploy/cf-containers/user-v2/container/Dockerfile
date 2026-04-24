@@ -52,7 +52,7 @@ RUN chmod +x /app/entrypoint.sh
 ENV V2_HEADLESS=1
 
 # Build cache-bust marker for Phase F.4 roll-out
-ENV V2_BUILD_TAG=f4-2026-04-24-v9-bodydiag
+ENV V2_BUILD_TAG=batch2-2026-04-24-v10-depthlogs
 
 EXPOSE 8000
 
