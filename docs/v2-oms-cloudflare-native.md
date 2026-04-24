@@ -1,6 +1,6 @@
 # V2 OMS — Cloudflare-native architecture
 
-Status: **Phase C complete**. Live: `https://oms-v2.defitool.de`.
+Status: **Phase E complete**. Live: `https://oms-v2.defitool.de`.
 
 Source under `deploy/cf-containers/oms-v2/`.
 
@@ -11,8 +11,11 @@ Working:
 - Nado (52 markets via `NadoRelayContainer` — a tiny Node.js Cloudflare
   Container that holds the `permessage-deflate` WebSocket to Nado and
   forwards events to `NadoOms` DO via a plain WebSocket on port 8080).
-- AggregatorDO (hibernation WS, V1 bot protocol)
+- AggregatorDO (hibernation WS, V1 bot protocol, quote endpoints)
 - ArbScannerDO (event-driven cross-exchange arb; V1-compatible `/ws/arb`)
+- Phase E bot-entry enrichment: `/meta`, `/quote`, `/quote/cross`,
+  enriched `{type:"book"}` with mid + cumsum, WS `quote`/`quote_cross`
+  subscriptions.
 - Auto-discovery cron (every 15 min) — 117 cross-exchange token pairs
 
 Remaining phases: D (canary rollout of one V1 bot against oms-v2).
@@ -486,6 +489,141 @@ Resolved by PoC (Phase 0):
 - **Historical orderbook storage.** Out of scope. Journaling stays in `journal_collector.py` on the user container side.
 - **Symbol sharding.** Each ExchangeOms DO handles all symbols. Current scale (~100 base tokens) does not justify sharding.
 - **Broadcast DO split.** Considered but punted: introducing a separate fan-out DO in front of AggregatorDO adds latency and complexity for a marginal hibernation gain. Revisit if AggregatorDO becomes a bottleneck.
+
+## Phase E — Bot-entry enrichment
+
+Phase E moves every orderbook-derived calculation that V1 bots do at entry
+into OMS, so each bot's entry logic reduces to: "receive an opportunity →
+call /quote/cross → place orders at the returned limit prices." Live on
+`oms-v2.defitool.de` at deploy `127c7992`.
+
+### Static per-symbol meta: `/meta`
+
+```
+GET /meta                        → all 323 symbols' static meta
+GET /meta/:exchange              → per-exchange subset
+GET /meta/:exchange/:symbol      → one symbol
+```
+
+Per-symbol fields:
+- `tick_size` — sourced from each exchange's metadata API at discovery time:
+  Extended `tradingConfig.minPriceChange`, GRVT `tick_size`,
+  Nado `price_increment_x18 / 1e18`. Variational publishes no tick.
+- `min_order_size`, `qty_step`, `max_leverage` — also from discovery
+- `taker_fee_pct` — `TAKER_FEE_PCT` constants (same table as `/arb/config`)
+- `maker_fee_pct` — reserved (null for now)
+- `funding_interval_s` — 3600 for Extended/GRVT/Nado; inferred from
+  symbol format for Variational (`P-{TICKER}-USDC-{interval_s}`)
+
+Coverage after discovery run (2026-04-24):
+- extended: 84/84 with tick_size ✓
+- grvt: 90/90 with tick_size ✓
+- nado: 52/52 with tick_size ✓
+- variational: 0/97 (API does not publish tick)
+
+### Single-leg quote: `/quote/:exchange/:symbol`
+
+```
+GET /quote/grvt/BTC_USDT_Perp?side=buy&qty=0.05
+GET /quote/extended/BTC-USD?side=sell&notional_usd=5000&buffer_ticks=2
+```
+
+Replaces every call to `app/safety.py::walk_book`,
+`estimate_fill_price`, `check_order_book_depth`, `check_book_quantity`,
+and `app/arbitrage.py::_compute_vwap_limit`.
+
+Response includes:
+- `fillable_qty`, `unfilled_qty` — feasibility
+- `vwap`, `best_price`, `worst_price` — fill stats
+- `slippage_bps_vs_best`, `slippage_bps_vs_mid` — pre-trade slippage
+- `notional_usd` — total USD cost of the sweep
+- `limit_price_with_buffer` — `worst_price ± buffer_ticks*tick_size`
+  (BUY adds buffer above worst; SELL uses worst exactly — matches V1
+  `_compute_vwap_limit` semantics)
+- `harmonized_qty` — requested qty rounded down to `qty_step`
+- `feasible: bool` + `feasibility_reason` (`no_book`, `book_stale`,
+  `book_disconnected`, `empty_side`, `missing_size_input`,
+  `qty_below_step`, `qty_below_min_order_size`, `insufficient_depth`)
+- Static meta repeated in response (tick_size, fees, step) so a bot
+  can skip the `/meta` call
+
+Input: exactly one of `qty` (base units) or `notional_usd`. If
+`notional_usd`, OMS derives qty = `notional_usd / mid_price`.
+
+### Cross-venue arb quote: `/quote/cross`
+
+```
+GET /quote/cross?token=BTC&buy_exchange=grvt&sell_exchange=extended&notional_usd=5000
+```
+
+Replaces `app/spread_analyzer.py::analyze_cross_venue_spread` and
+`app/dna_bot.py::_harmonize_qty`. Fetches both books, harmonises qty to
+the coarser `qty_step`, runs `computeQuote` on each leg, computes:
+- `bbo_spread_bps` — top-of-book spread
+- `exec_spread_bps` — VWAP execution spread at harmonized qty
+- `slippage_bps_over_bbo` — `exec - bbo` (extra cost vs best)
+- `fee_threshold_bps` — same per-pair fee sum as `/arb/config`
+- `net_profit_bps_after_fees` — `exec_spread_bps - fee_threshold_bps`
+- `profitable: bool`
+- `min_order_size_binding` — which exchange's step was the coarser one
+- Both legs returned as full `Quote` objects (per-leg `limit_price_with_buffer`
+  is what the bot passes to `create_limit_order`)
+
+### Enriched `{type:"book"}` WebSocket pushes
+
+Every book push now also carries:
+- `mid_price`
+- `bid_qty_cumsum: number[]`, `ask_qty_cumsum: number[]`
+- `bid_notional_cumsum: number[]`, `ask_notional_cumsum: number[]`
+
+Index `i` in each cumsum array is the cumulative sum across levels `0..i`.
+Cheap (O(depth)=10 adds per push); bots never need to cumsum themselves.
+
+The `{type:"subscribed"}` ACK also now carries `meta: SymbolMeta | null`
+so that a subscriber sees tick/step/fee once at subscribe time and never
+needs a separate `/meta` round-trip.
+
+### WS quote subscriptions
+
+On the same `/ws` connection a bot can also subscribe to live quote
+pushes that refresh on every relevant book update (coalesced to at most
+10/sec per subscription):
+
+```
+Client → Server: {action:"quote", exchange, symbol, side,
+                  qty?, notional_usd?, buffer_ticks?}
+Client → Server: {action:"quote_cross", token, buy_exchange, sell_exchange,
+                  qty?, notional_usd?, buffer_ticks?}
+Client → Server: {action:"unquote", ...}
+Client → Server: {action:"unquote_cross", ...}
+
+Server → Client: {type:"quote", ...full Quote fields...}
+Server → Client: {type:"quote_cross", ...full CrossQuote fields...}
+```
+
+Per-connection cap: 50 quote subscriptions. Throttle:
+`QUOTE_PUSH_MIN_INTERVAL_MS = 100` between pushes per subscription.
+
+### What V1 bots can delete after adopting Phase E
+
+- `app/safety.py::walk_book`, `estimate_fill_price`,
+  `check_order_book_depth`, `check_book_quantity`, `check_dual_liquidity`
+  → replaced by `/quote` fields
+- `app/spread_analyzer.py::analyze_cross_venue_spread`
+  → replaced by `/quote/cross` fields
+- `app/arbitrage.py::_compute_vwap_limit`
+  → replaced by `Quote.limit_price_with_buffer`
+- `app/dna_bot.py::_harmonize_qty`
+  → replaced by `Quote.harmonized_qty`
+- `client.get_tick_size()` hot-path calls
+  → replaced by `subscribed` ACK meta or `/meta/:exch/:sym`
+
+Bot entry path after full adoption:
+1. Receive `arb_opportunity` on `/ws/arb`
+2. `GET /quote/cross?token=T&buy_exchange=A&sell_exchange=B&notional_usd={config.position_size_usd}`
+3. If `feasible && profitable`, `create_limit_order` on each leg in
+   parallel using `buy.limit_price_with_buffer` / `sell.limit_price_with_buffer`
+   with `harmonized_qty`
 
 ## Cross-references
 

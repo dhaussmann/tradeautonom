@@ -52,15 +52,73 @@ export interface ClientUnsubscribe {
   symbol: string;
 }
 
-export type ClientMessage = ClientSubscribe | ClientUnsubscribe;
+/** Phase E: quote subscription over WS. */
+export interface ClientQuote {
+  action: "quote";
+  exchange: string;
+  symbol: string;
+  side: "buy" | "sell";
+  qty?: number;
+  notional_usd?: number;
+  buffer_ticks?: number;
+}
+
+export interface ClientUnquote {
+  action: "unquote";
+  exchange: string;
+  symbol: string;
+  side: "buy" | "sell";
+  qty?: number;
+  notional_usd?: number;
+  buffer_ticks?: number;
+}
+
+export interface ClientQuoteCross {
+  action: "quote_cross";
+  token: string;
+  buy_exchange: string;
+  sell_exchange: string;
+  qty?: number;
+  notional_usd?: number;
+  buffer_ticks?: number;
+}
+
+export interface ClientUnquoteCross {
+  action: "unquote_cross";
+  token: string;
+  buy_exchange: string;
+  sell_exchange: string;
+  qty?: number;
+  notional_usd?: number;
+  buffer_ticks?: number;
+}
+
+export type ClientMessage =
+  | ClientSubscribe
+  | ClientUnsubscribe
+  | ClientQuote
+  | ClientUnquote
+  | ClientQuoteCross
+  | ClientUnquoteCross;
 
 export interface ServerSubscribed {
   type: "subscribed";
   exchange: string;
   symbol: string;
+  /** Phase E: static per-symbol meta (if discovered). */
+  meta?: SymbolMeta | null;
 }
 
-export interface ServerBookUpdate {
+/** Phase E: cheap per-push stats attached to every {type:"book"}. */
+export interface BookPushStats {
+  mid_price: number;
+  bid_qty_cumsum: number[];
+  ask_qty_cumsum: number[];
+  bid_notional_cumsum: number[];
+  ask_notional_cumsum: number[];
+}
+
+export interface ServerBookUpdate extends BookPushStats {
   type: "book";
   exchange: string;
   symbol: string;
@@ -74,9 +132,39 @@ export interface ServerError {
   detail?: string;
 }
 
+/**
+ * Per-connection attachment persisted across hibernation. Phase E adds
+ * quote subscription state (single-leg and cross).
+ */
 export interface WsAttachment {
   subs: string[];
+  /** Encoded key: "exchange:symbol:side:qty_or_notional:mode:bufferTicks". */
+  quoteSubs: QuoteSub[];
+  /** Encoded key plus the token + two exchanges. */
+  crossQuoteSubs: CrossQuoteSub[];
   connected_at: number;
+}
+
+export interface QuoteSub {
+  exchange: string;
+  symbol: string;
+  side: "buy" | "sell";
+  /** Exactly one is non-null. */
+  qty: number | null;
+  notional_usd: number | null;
+  buffer_ticks: number;
+  /** Last-send throttle timestamp (ms). Not persisted through hibernation. */
+  last_sent_ms?: number;
+}
+
+export interface CrossQuoteSub {
+  token: string;
+  buy_exchange: string;
+  sell_exchange: string;
+  qty: number | null;
+  notional_usd: number | null;
+  buffer_ticks: number;
+  last_sent_ms?: number;
 }
 
 /** Per-exchange market metadata collected during auto-discovery. */
@@ -84,6 +172,20 @@ export interface MarketMeta {
   maxLeverage: number;
   minOrderSize: number;
   qtyStep: number;
+}
+
+/** Phase E: Public /meta surface per exchange+symbol. */
+export interface SymbolMeta {
+  exchange: string;
+  symbol: string;
+  base_token: string;
+  tick_size: number;
+  min_order_size: number;
+  qty_step: number;
+  max_leverage: number;
+  taker_fee_pct: number;
+  maker_fee_pct: number | null;
+  funding_interval_s: number | null;
 }
 
 /** Auto-discovery result: base token → { exchange → symbol }. */
@@ -152,4 +254,84 @@ export interface ArbWsAttachment {
     exchanges: string[] | null;
   };
   connected_at: number;
+}
+
+// ── Phase E: Quote surfaces ──────────────────────────────────────
+
+/**
+ * Quote — one-leg VWAP/depth/slippage calculation, sized to the caller's
+ * requested qty or notional. Replaces:
+ *   - app/safety.py::walk_book / estimate_fill_price / check_order_book_depth
+ *   - app/arbitrage.py::_compute_vwap_limit
+ */
+export interface Quote {
+  exchange: string;
+  symbol: string;
+  side: "buy" | "sell";
+  requested_qty: number;
+  requested_notional_usd: number;
+  fillable_qty: number;
+  unfilled_qty: number;
+  best_price: number;
+  worst_price: number;
+  vwap: number;
+  mid_price: number;
+  slippage_bps_vs_best: number;
+  slippage_bps_vs_mid: number;
+  notional_usd: number;
+  levels_consumed: number;
+  total_levels_on_side: number;
+  /** worst_price + buffer_ticks*tick_size for buy; worst_price for sell. */
+  limit_price_with_buffer: number;
+  buffer_ticks: number;
+  min_order_size: number;
+  qty_step: number;
+  tick_size: number;
+  taker_fee_pct: number;
+  /** requested_qty rounded down to qty_step. */
+  harmonized_qty: number;
+  feasible: boolean;
+  feasibility_reason:
+    | null
+    | "no_book"
+    | "book_stale"
+    | "book_disconnected"
+    | "empty_side"
+    | "missing_size_input"
+    | "qty_below_step"
+    | "qty_below_min_order_size"
+    | "insufficient_depth";
+  book_age_ms: number | null;
+  timestamp_ms: number;
+}
+
+/**
+ * CrossQuote — dual-leg arb pre-trade snapshot. Replaces:
+ *   - app/spread_analyzer.py::analyze_cross_venue_spread
+ *   - app/dna_bot.py::_harmonize_qty
+ * The bot needs only this plus client.create_limit_order to enter.
+ */
+export interface CrossQuote {
+  token: string;
+  buy_exchange: string;
+  buy_symbol: string;
+  sell_exchange: string;
+  sell_symbol: string;
+  requested_qty: number;
+  harmonized_qty: number;
+  mid_price: number;
+  notional_usd: number;
+  buy: Quote;
+  sell: Quote;
+  bbo_spread_bps: number;
+  exec_spread_bps: number;
+  slippage_bps_over_bbo: number;
+  fee_threshold_bps: number;
+  net_profit_bps_after_fees: number;
+  profitable: boolean;
+  /** Exchange whose qty_step was the coarser (binding) one. */
+  min_order_size_binding: string;
+  feasible: boolean;
+  feasibility_reason: string | null;
+  timestamp_ms: number;
 }

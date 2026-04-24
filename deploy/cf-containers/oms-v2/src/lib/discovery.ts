@@ -25,11 +25,12 @@ export interface DiscoveryResult {
     nado: Array<{ symbol: string; product_id: number }>;
     variational: string[];
   };
-  /** Per-exchange metadata for arb scanner (future phase). */
+  /** Per-exchange metadata for arb scanner + Phase E quote endpoints. */
   meta: {
     maxLeverage: Record<string, Record<string, number>>;
     minOrderSize: Record<string, Record<string, number>>;
     qtyStep: Record<string, Record<string, number>>;
+    tickSize: Record<string, Record<string, number>>;
   };
 }
 
@@ -41,32 +42,38 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
     variational: {},
   };
   const nadoProductIds: Record<string, number> = {};
-  const lev: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {} };
-  const mins: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {} };
-  const steps: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {} };
+  const lev: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
+  const mins: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
+  const steps: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
+  const ticks: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
 
   const tasks = [
-    loadExtended().then(({ markets, metaLev, metaMin, metaStep }) => {
+    loadExtended().then(({ markets, metaLev, metaMin, metaStep, metaTick }) => {
       maps.extended = markets;
       lev.extended = metaLev;
       mins.extended = metaMin;
       steps.extended = metaStep;
+      ticks.extended = metaTick;
     }).catch((e) => console.warn("Extended discovery failed:", e)),
-    loadGrvt().then(({ markets, metaMin, metaStep }) => {
+    loadGrvt().then(({ markets, metaMin, metaStep, metaTick }) => {
       maps.grvt = markets;
       lev.grvt = Object.fromEntries(Object.keys(markets).map((k) => [k, 10]));
       mins.grvt = metaMin;
       steps.grvt = metaStep;
+      ticks.grvt = metaTick;
     }).catch((e) => console.warn("GRVT discovery failed:", e)),
-    loadNado().then(({ markets, productIds, metaLev, metaMin, metaStep }) => {
+    loadNado().then(({ markets, productIds, metaLev, metaMin, metaStep, metaTick }) => {
       maps.nado = markets;
       Object.assign(nadoProductIds, productIds);
       lev.nado = metaLev;
       mins.nado = metaMin;
       steps.nado = metaStep;
+      ticks.nado = metaTick;
     }).catch((e) => console.warn("Nado discovery failed:", e)),
     loadVariational().then(({ markets }) => {
       maps.variational = markets;
+      // Variational has no per-symbol tick size published; bots use 1 tick
+      // = 0.01 historically. Use 0 to signal "unknown" so /quote falls back.
     }).catch((e) => console.warn("Variational discovery failed:", e)),
   ];
   await Promise.all(tasks);
@@ -110,7 +117,7 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
         .sort((a, b) => a.symbol.localeCompare(b.symbol)),
       variational: Array.from(tracked.variational!).sort(),
     },
-    meta: { maxLeverage: lev, minOrderSize: mins, qtyStep: steps },
+    meta: { maxLeverage: lev, minOrderSize: mins, qtyStep: steps, tickSize: ticks },
   };
 }
 
@@ -126,6 +133,7 @@ async function loadExtended() {
   const metaLev: Record<string, number> = {};
   const metaMin: Record<string, number> = {};
   const metaStep: Record<string, number> = {};
+  const metaTick: Record<string, number> = {};
   for (const m of body?.data ?? []) {
     if (m?.status !== "ACTIVE") continue;
     const name: string = m.name;
@@ -137,8 +145,9 @@ async function loadExtended() {
     if (tc.maxLeverage) metaLev[base] = Number(tc.maxLeverage);
     if (tc.minOrderSize) metaMin[base] = Number(tc.minOrderSize);
     if (tc.minOrderSizeChange) metaStep[base] = Number(tc.minOrderSizeChange);
+    if (tc.minPriceChange) metaTick[base] = Number(tc.minPriceChange);
   }
-  return { markets, metaLev, metaMin, metaStep };
+  return { markets, metaLev, metaMin, metaStep, metaTick };
 }
 
 async function loadGrvt() {
@@ -157,6 +166,7 @@ async function loadGrvt() {
   const markets: Record<string, string> = {};
   const metaMin: Record<string, number> = {};
   const metaStep: Record<string, number> = {};
+  const metaTick: Record<string, number> = {};
   for (const i of body?.result ?? []) {
     const inst: string = i?.instrument;
     const base: string = String(i?.base ?? "").toUpperCase();
@@ -166,8 +176,9 @@ async function loadGrvt() {
       metaMin[base] = Number(i.min_size);
       metaStep[base] = Number(i.min_size);
     }
+    if (i.tick_size) metaTick[base] = Number(i.tick_size);
   }
-  return { markets, metaMin, metaStep };
+  return { markets, metaMin, metaStep, metaTick };
 }
 
 async function loadNado() {
@@ -183,6 +194,7 @@ async function loadNado() {
   const metaLev: Record<string, number> = {};
   const metaMin: Record<string, number> = {};
   const metaStep: Record<string, number> = {};
+  const metaTick: Record<string, number> = {};
   for (const s of body ?? []) {
     const sym: string = s?.symbol;
     if (!sym || !sym.endsWith("-PERP")) continue;
@@ -202,8 +214,13 @@ async function loadNado() {
     if (ms && ms !== "0") {
       metaMin[base] = Number(ms) / 1e18;
     }
+    // Nado price tick comes as `price_increment_x18` (integer string × 1e18).
+    const pi: string = String(s.price_increment_x18 ?? s.price_increment ?? "0");
+    if (pi && pi !== "0") {
+      metaTick[base] = Number(pi) / 1e18;
+    }
   }
-  return { markets, productIds, metaLev, metaMin, metaStep };
+  return { markets, productIds, metaLev, metaMin, metaStep, metaTick };
 }
 
 async function loadVariational() {

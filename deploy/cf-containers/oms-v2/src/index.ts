@@ -67,6 +67,9 @@ export default {
       path === "/status" ||
       path === "/discovery" ||
       path === "/discovery/run" ||
+      path === "/meta" ||
+      path.startsWith("/meta/") ||
+      path.startsWith("/quote/") ||
       path.startsWith("/book/")
     ) {
       const stub = env.AGGREGATOR_DO.get(env.AGGREGATOR_DO.idFromName("aggregator"));
@@ -116,6 +119,15 @@ export default {
           "  GET /arb/opportunities?token=BTC&min_profit_bps=5",
           "  GET /arb/config                scanner config (fees, thresholds)",
           "  GET /arb/health                scanner status",
+          "",
+          "Entry helpers (Phase E):",
+          "  GET /meta                      static per-symbol meta (all)",
+          "  GET /meta/{exch}               per-exchange static meta",
+          "  GET /meta/{exch}/{sym}         single symbol: tick, step, leverage, fee",
+          "  GET /quote/{exch}/{sym}?side=buy&qty=0.05",
+          "  GET /quote/{exch}/{sym}?side=buy&notional_usd=5000&buffer_ticks=2",
+          "  GET /quote/cross?token=BTC&buy_exchange=grvt&sell_exchange=extended&notional_usd=5000",
+          "  WS  /ws                        + {action:'quote'|'quote_cross'} for live quotes",
           "",
           "Per-exchange debugging:",
           "  GET /ext/health                ExtendedOms health",
