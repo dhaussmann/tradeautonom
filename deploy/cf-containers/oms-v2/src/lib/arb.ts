@@ -166,21 +166,17 @@ function lookupMeta(
 }
 
 /**
- * Convert a possibly-notional min to an effective base-qty min using the
- * opportunity's mid price. Matches V1 app/nado_client.py::get_min_order_size.
- * Nado publishes its min as USD notional; Extended / GRVT publish it as
- * base qty (minNotionalUsd=0 → no conversion).
+ * Effective base-qty min reported per ArbOpportunity leg.
+ *
+ * TEMPORARILY SIMPLIFIED (matches lib/quote.ts::computeEffectiveMinQty):
+ * returns only the hard base-qty floor (`minOrderSize`), ignoring the
+ * USD-notional floor. The notional→qty conversion is bugged for Nado
+ * and was rejecting valid small orders; until that's fixed, bot-side
+ * min checks are disabled and exchange-side validation is the only
+ * gate. Restore the notional conversion alongside the fix.
  */
-function effectiveMinQty(meta: MarketMeta, midPrice: number): number {
-  const base = meta.minOrderSize > 0 ? meta.minOrderSize : 0;
-  if (meta.minNotionalUsd > 0 && midPrice > 0) {
-    const rawQty = meta.minNotionalUsd / midPrice;
-    const nominalMinQty = meta.qtyStep > 0
-      ? Math.ceil(rawQty / meta.qtyStep) * meta.qtyStep
-      : rawQty;
-    return Math.max(base, nominalMinQty);
-  }
-  return base;
+function effectiveMinQty(meta: MarketMeta, _midPrice: number): number {
+  return meta.minOrderSize > 0 ? meta.minOrderSize : 0;
 }
 
 export interface FindArbConfig {

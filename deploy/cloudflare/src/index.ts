@@ -121,6 +121,39 @@ export default {
       return jsonResponse({ injected, user_id: body.user_id });
     }
 
+    // ── TEMP: Admin probe — proxy a GET to the user's current backend.
+    //    Used for debugging V2 routing without needing a session cookie.
+    //    Usage: GET /api/admin/probe/<user_id>/<backend_path>?token=...
+    //    Respects user.backend so you can verify V1 vs V2 routes.
+    if (url.pathname.startsWith("/api/admin/probe/") && request.method === "GET") {
+      const token = url.searchParams.get("token");
+      if (token !== env.INGEST_TOKEN) return jsonResponse({ error: "Forbidden" }, 403);
+      const match = url.pathname.match(/^\/api\/admin\/probe\/([^/]+)(\/.*)?$/);
+      if (!match) return jsonResponse({ error: "Invalid probe path" }, 400);
+      const probeUserId = match[1]!;
+      const probePath = match[2] ?? "/health";
+      const backend = await getUserBackend(env, probeUserId);
+      // Build a request that mimics what handleUserApiProxy would forward.
+      // We skip the `?token=` to not leak it into the container.
+      const forwardedUrl = new URL(request.url);
+      forwardedUrl.pathname = "/api" + probePath;
+      forwardedUrl.search = "";
+      const fakeRequest = new Request(forwardedUrl.toString(), { method: "GET" });
+      const resp = await handleUserApiProxy(fakeRequest, new URL(fakeRequest.url), env, probeUserId);
+      const body = await resp.text();
+      return new Response(JSON.stringify({
+        user_id: probeUserId,
+        backend_resolved: backend,
+        backend_path: probePath,
+        upstream_status: resp.status,
+        upstream_content_type: resp.headers.get("content-type"),
+        upstream_body_preview: body.slice(0, 2000),
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
     // ── Admin: user management ──────────────────────────────
     if (url.pathname === "/api/admin/users" && request.method === "GET") {
       const session = await getSession(request, env);

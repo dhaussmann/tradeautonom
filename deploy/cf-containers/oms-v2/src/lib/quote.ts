@@ -392,32 +392,32 @@ export function computeCrossQuote(input: ComputeCrossQuoteInput): CrossQuote {
 // ── Effective min qty ─────────────────────────────────────────────
 
 /**
- * Compute the effective base-qty min, combining:
- *   - `minOrderSize` (hard base-qty floor, e.g. 0.001 BTC),
- *   - `minNotionalUsd` (USD-notional floor, used only by Nado today),
- *     converted to base qty via `ceil(notional / mid / step) * step`
- *     matching V1 app/nado_client.py::get_min_order_size.
+ * Compute the effective base-qty min.
  *
- * Returns 0 when no floor applies (neither publishes a min).
- * When midPrice is 0 (cold start, no book yet), the notional conversion
- * is skipped; we never false-reject on missing price data.
+ * TEMPORARILY SIMPLIFIED: the notional→qty conversion was producing
+ * wrong values (rejecting valid small orders on Nado because
+ * `minNotionalUsd / mid / step` ceiled up too aggressively in some cases).
+ * For now we return only the hard base-qty floor (`minOrderSize`) and
+ * ignore `minNotionalUsd`. The real min-notional check still happens on
+ * the exchange side at order-placement time — we just don't pre-reject
+ * bot-side.
+ *
+ * To restore the notional-based computation once the arithmetic bug is
+ * isolated:
+ *
+ *   if (meta.minNotionalUsd > 0 && midPrice > 0) {
+ *     const rawQty = meta.minNotionalUsd / midPrice;
+ *     const nominalMinQty = meta.qtyStep > 0
+ *       ? Math.ceil(rawQty / meta.qtyStep) * meta.qtyStep
+ *       : rawQty;
+ *     return Math.max(base, nominalMinQty);
+ *   }
  */
 export function computeEffectiveMinQty(
   meta: { minOrderSize: number; qtyStep: number; minNotionalUsd: number },
-  midPrice: number,
+  _midPrice: number,
 ): number {
-  const base = meta.minOrderSize > 0 ? meta.minOrderSize : 0;
-  if (meta.minNotionalUsd > 0 && midPrice > 0) {
-    const rawQty = meta.minNotionalUsd / midPrice;
-    let nominalMinQty: number;
-    if (meta.qtyStep > 0) {
-      nominalMinQty = Math.ceil(rawQty / meta.qtyStep) * meta.qtyStep;
-    } else {
-      nominalMinQty = rawQty;
-    }
-    return Math.max(base, nominalMinQty);
-  }
-  return base;
+  return meta.minOrderSize > 0 ? meta.minOrderSize : 0;
 }
 
 // ── Rounding helpers ──────────────────────────────────────────────

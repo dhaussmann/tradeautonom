@@ -366,25 +366,23 @@ class NadoClient:
         return markets
 
     def get_min_order_size(self, symbol: str) -> Decimal:
-        """Return the minimum order size in base qty, derived from USD notional + current price."""
-        if symbol not in self._min_notional_cache:
+        """Return the minimum order size in base qty.
+
+        TEMPORARY: the notional→qty conversion produces wrong values in
+        some cases (rejects valid orders). Returning the raw size_increment
+        (the true base-qty tick) disables the notional-based floor check
+        downstream. Exchange-side validation still rejects orders below
+        the real minimum if one is ever sent — this just prevents us from
+        pre-emptively blocking them bot-side.
+
+        To re-enable the notional-based computation, restore the block:
+            notional = self._min_notional_cache.get(symbol, Decimal("0"))
+            if notional > 0:
+                book = self.fetch_order_book(symbol, limit=1)
+                ... (mid-price conversion) ...
+        """
+        if symbol not in self._size_increment_cache:
             self._load_symbols()
-        notional = self._min_notional_cache.get(symbol, Decimal("0"))
-        if notional <= 0:
-            return self._size_increment_cache.get(symbol, Decimal("0"))
-        # Use mid price from orderbook to convert notional -> qty
-        try:
-            book = self.fetch_order_book(symbol, limit=1)
-            best_bid = Decimal(book["bids"][0][0]) if book.get("bids") else Decimal("0")
-            best_ask = Decimal(book["asks"][0][0]) if book.get("asks") else Decimal("0")
-            mid = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
-            if mid > 0:
-                raw_qty = notional / mid
-                step = self._size_increment_cache.get(symbol, Decimal("1"))
-                min_qty = ((raw_qty / step).to_integral_value(rounding="ROUND_UP")) * step
-                return min_qty
-        except Exception:
-            pass
         return self._size_increment_cache.get(symbol, Decimal("0"))
 
     def get_tick_size(self, symbol: str) -> Decimal:
