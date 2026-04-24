@@ -603,7 +603,7 @@ async function submit() {
               <div :class="$style.field">
                 <label :class="$style.label">Max Spread (%)</label>
                 <div :class="$style.inputWithHint">
-                  <input v-model.number="maxSpreadPct" :class="$style.input" type="number" step="0.01" min="0" />
+                  <input v-model.number="maxSpreadPct" :class="$style.input" type="number" step="0.01" />
                   <Typography v-if="priceSpreadPct !== null" size="text-xs" :style="{ color: priceSpreadPct <= maxSpreadPct ? '#22c55e' : '#ef4444' }">
                     Current: {{ priceSpreadPct.toFixed(4) }}%
                   </Typography>

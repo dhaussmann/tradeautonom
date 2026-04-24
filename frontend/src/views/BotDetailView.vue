@@ -394,7 +394,10 @@ function openSpreadEditor() {
 async function saveSpread() {
   showSpreadPopover.value = false
   const val = Number(editSpreadValue.value)
-  if (!isNaN(val) && val >= 0) {
+  // Accept any numeric value, including negatives — a negative max_spread_pct
+  // means "bot only enters when short leg is at least |val|% more expensive
+  // than long leg", e.g. -0.02 demands ≥ 2 bp favour before placing a maker.
+  if (!isNaN(val)) {
     try { await updateBotConfig(botId.value!, { max_spread_pct: val }) } catch (e) { console.error('saveSpread failed:', e) }
   }
 }
@@ -592,7 +595,6 @@ onUnmounted(() => {
                 v-model.number="editSpreadValue"
                 :class="$style.popoverInput"
                 type="number"
-                min="0"
                 step="0.01"
               />
               <div v-if="priceSpreadPct !== null" :class="$style.popoverUsd">
