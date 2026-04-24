@@ -68,17 +68,19 @@ function buildScannerMeta(
   result: DiscoveryResult,
 ): Record<string, Record<string, MarketMeta>> {
   const out: Record<string, Record<string, MarketMeta>> = {};
-  const { maxLeverage, minOrderSize, qtyStep } = result.meta;
+  const { maxLeverage, minOrderSize, qtyStep, minNotionalUsd } = result.meta;
   const exchanges = new Set<string>([
     ...Object.keys(maxLeverage),
     ...Object.keys(minOrderSize),
     ...Object.keys(qtyStep),
+    ...Object.keys(minNotionalUsd ?? {}),
   ]);
   for (const exch of exchanges) {
     const tokens = new Set<string>([
       ...Object.keys(maxLeverage[exch] ?? {}),
       ...Object.keys(minOrderSize[exch] ?? {}),
       ...Object.keys(qtyStep[exch] ?? {}),
+      ...Object.keys(minNotionalUsd?.[exch] ?? {}),
     ]);
     const perExch: Record<string, MarketMeta> = {};
     for (const tok of tokens) {
@@ -86,6 +88,7 @@ function buildScannerMeta(
         maxLeverage: maxLeverage[exch]?.[tok] ?? 1,
         minOrderSize: minOrderSize[exch]?.[tok] ?? 0,
         qtyStep: qtyStep[exch]?.[tok] ?? 0,
+        minNotionalUsd: minNotionalUsd?.[exch]?.[tok] ?? 0,
       };
     }
     out[exch] = perExch;
@@ -340,12 +343,14 @@ export class AggregatorDO extends DurableObject<Env> {
     const mn = stored.meta.minOrderSize[exch]?.[token];
     const st = stored.meta.qtyStep[exch]?.[token];
     const tk = stored.meta.tickSize[exch]?.[token];
+    const nom = stored.meta.minNotionalUsd?.[exch]?.[token];
     return {
       exchange: exch,
       symbol,
       base_token: token,
       tick_size: typeof tk === "number" ? tk : 0,
       min_order_size: typeof mn === "number" ? mn : 0,
+      min_notional_usd: typeof nom === "number" && nom > 0 ? nom : null,
       qty_step: typeof st === "number" ? st : 0,
       max_leverage: typeof lev === "number" ? lev : 1,
       taker_fee_pct: TAKER_FEE_PCT[exch] ?? 0.04,
@@ -411,11 +416,7 @@ export class AggregatorDO extends DurableObject<Env> {
       book,
       qty,
       notionalUsd: notional,
-      meta: {
-        maxLeverage: meta.max_leverage,
-        minOrderSize: meta.min_order_size,
-        qtyStep: meta.qty_step,
-      },
+      meta: symbolMetaToMarketMeta(meta),
       takerFeePct: meta.taker_fee_pct,
       tickSize: meta.tick_size,
       bufferTicks,
@@ -496,11 +497,7 @@ export class AggregatorDO extends DurableObject<Env> {
         exchange: buyExch,
         symbol: buySymbol,
         book: buyBook,
-        meta: {
-          maxLeverage: buyMeta.max_leverage,
-          minOrderSize: buyMeta.min_order_size,
-          qtyStep: buyMeta.qty_step,
-        },
+        meta: symbolMetaToMarketMeta(buyMeta),
         takerFeePct: buyMeta.taker_fee_pct,
         tickSize: buyMeta.tick_size,
         bufferTicks,
@@ -509,11 +506,7 @@ export class AggregatorDO extends DurableObject<Env> {
         exchange: sellExch,
         symbol: sellSymbol,
         book: sellBook,
-        meta: {
-          maxLeverage: sellMeta.max_leverage,
-          minOrderSize: sellMeta.min_order_size,
-          qtyStep: sellMeta.qty_step,
-        },
+        meta: symbolMetaToMarketMeta(sellMeta),
         takerFeePct: sellMeta.taker_fee_pct,
         tickSize: sellMeta.tick_size,
         bufferTicks,
@@ -865,11 +858,7 @@ export class AggregatorDO extends DurableObject<Env> {
       book,
       qty: sub.qty ?? undefined,
       notionalUsd: sub.notional_usd ?? undefined,
-      meta: {
-        maxLeverage: meta.max_leverage,
-        minOrderSize: meta.min_order_size,
-        qtyStep: meta.qty_step,
-      },
+      meta: symbolMetaToMarketMeta(meta),
       takerFeePct: meta.taker_fee_pct,
       tickSize: meta.tick_size,
       bufferTicks: sub.buffer_ticks,
@@ -999,4 +988,18 @@ function crossQuoteSubEq(a: CrossQuoteSub, b: CrossQuoteSub): boolean {
     a.qty === b.qty &&
     a.notional_usd === b.notional_usd &&
     a.buffer_ticks === b.buffer_ticks;
+}
+
+/**
+ * Map the public `SymbolMeta` shape (kebab/snake_case JSON fields) back to
+ * the internal `MarketMeta` shape consumed by computeQuote / computeCrossQuote.
+ * `min_notional_usd: null` on the public side maps to 0 internally.
+ */
+function symbolMetaToMarketMeta(m: SymbolMeta): MarketMeta {
+  return {
+    maxLeverage: m.max_leverage,
+    minOrderSize: m.min_order_size,
+    qtyStep: m.qty_step,
+    minNotionalUsd: m.min_notional_usd ?? 0,
+  };
 }

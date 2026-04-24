@@ -160,8 +160,27 @@ function lookupMeta(
       maxLeverage: 1,
       minOrderSize: 0,
       qtyStep: 0,
+      minNotionalUsd: 0,
     }
   );
+}
+
+/**
+ * Convert a possibly-notional min to an effective base-qty min using the
+ * opportunity's mid price. Matches V1 app/nado_client.py::get_min_order_size.
+ * Nado publishes its min as USD notional; Extended / GRVT publish it as
+ * base qty (minNotionalUsd=0 → no conversion).
+ */
+function effectiveMinQty(meta: MarketMeta, midPrice: number): number {
+  const base = meta.minOrderSize > 0 ? meta.minOrderSize : 0;
+  if (meta.minNotionalUsd > 0 && midPrice > 0) {
+    const rawQty = meta.minNotionalUsd / midPrice;
+    const nominalMinQty = meta.qtyStep > 0
+      ? Math.ceil(rawQty / meta.qtyStep) * meta.qtyStep
+      : rawQty;
+    return Math.max(base, nominalMinQty);
+  }
+  return base;
 }
 
 export interface FindArbConfig {
@@ -252,6 +271,11 @@ export function findArbForToken(
 
         const buyMeta = lookupMeta(config.meta, d.buy.exch, token);
         const sellMeta = lookupMeta(config.meta, d.sell.exch, token);
+        // Report the EFFECTIVE base-qty min (notional converted via the
+        // opportunity's mid when applicable). Matches V1 semantics so DNA-bot
+        // _harmonize_qty compares against the right threshold.
+        const buyEffMin = effectiveMinQty(buyMeta, midPrice);
+        const sellEffMin = effectiveMinQty(sellMeta, midPrice);
 
         opps.push({
           token,
@@ -271,8 +295,8 @@ export function findArbForToken(
           timestamp_ms: nowMs,
           buy_max_leverage: buyMeta.maxLeverage,
           sell_max_leverage: sellMeta.maxLeverage,
-          buy_min_order_size: buyMeta.minOrderSize,
-          sell_min_order_size: sellMeta.minOrderSize,
+          buy_min_order_size: round6(buyEffMin),
+          sell_min_order_size: round6(sellEffMin),
           buy_qty_step: buyMeta.qtyStep,
           sell_qty_step: sellMeta.qtyStep,
         });

@@ -170,8 +170,20 @@ export interface CrossQuoteSub {
 /** Per-exchange market metadata collected during auto-discovery. */
 export interface MarketMeta {
   maxLeverage: number;
+  /**
+   * Base-qty floor (e.g. 0.001 BTC). For Nado this is `size_increment`
+   * because Nado's API `min_size` is actually USD notional (see
+   * minNotionalUsd below).
+   */
   minOrderSize: number;
   qtyStep: number;
+  /**
+   * USD-notional floor. Populated only for exchanges that publish one
+   * (currently Nado). Quote + arb code converts this to an effective
+   * base-qty threshold at evaluation time using the live book's mid price.
+   * 0 means "no notional floor".
+   */
+  minNotionalUsd: number;
 }
 
 /** Phase E: Public /meta surface per exchange+symbol. */
@@ -180,7 +192,13 @@ export interface SymbolMeta {
   symbol: string;
   base_token: string;
   tick_size: number;
+  /** Base-qty floor. For Nado this equals size_increment (see min_notional_usd). */
   min_order_size: number;
+  /**
+   * USD-notional floor, or null if the exchange does not publish one.
+   * Nado publishes 100 USD on all perps; Extended/GRVT/Variational don't.
+   */
+  min_notional_usd: number | null;
   qty_step: number;
   max_leverage: number;
   taker_fee_pct: number;

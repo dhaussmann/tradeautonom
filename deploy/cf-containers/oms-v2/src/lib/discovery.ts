@@ -31,6 +31,12 @@ export interface DiscoveryResult {
     minOrderSize: Record<string, Record<string, number>>;
     qtyStep: Record<string, Record<string, number>>;
     tickSize: Record<string, Record<string, number>>;
+    /**
+     * USD-notional floor, populated only for Nado (publishes min_size as
+     * notional). Consumers convert to effective base-qty at evaluation time
+     * using the live book's mid price.
+     */
+    minNotionalUsd: Record<string, Record<string, number>>;
   };
 }
 
@@ -46,6 +52,7 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
   const mins: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
   const steps: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
   const ticks: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
+  const minNotionals: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
 
   const tasks = [
     loadExtended().then(({ markets, metaLev, metaMin, metaStep, metaTick }) => {
@@ -62,13 +69,14 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
       steps.grvt = metaStep;
       ticks.grvt = metaTick;
     }).catch((e) => console.warn("GRVT discovery failed:", e)),
-    loadNado().then(({ markets, productIds, metaLev, metaMin, metaStep, metaTick }) => {
+    loadNado().then(({ markets, productIds, metaLev, metaMin, metaStep, metaTick, metaMinNotional }) => {
       maps.nado = markets;
       Object.assign(nadoProductIds, productIds);
       lev.nado = metaLev;
       mins.nado = metaMin;
       steps.nado = metaStep;
       ticks.nado = metaTick;
+      minNotionals.nado = metaMinNotional;
     }).catch((e) => console.warn("Nado discovery failed:", e)),
     loadVariational().then(({ markets }) => {
       maps.variational = markets;
@@ -117,7 +125,13 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
         .sort((a, b) => a.symbol.localeCompare(b.symbol)),
       variational: Array.from(tracked.variational!).sort(),
     },
-    meta: { maxLeverage: lev, minOrderSize: mins, qtyStep: steps, tickSize: ticks },
+    meta: {
+      maxLeverage: lev,
+      minOrderSize: mins,
+      qtyStep: steps,
+      tickSize: ticks,
+      minNotionalUsd: minNotionals,
+    },
   };
 }
 
@@ -195,6 +209,7 @@ async function loadNado() {
   const metaMin: Record<string, number> = {};
   const metaStep: Record<string, number> = {};
   const metaTick: Record<string, number> = {};
+  const metaMinNotional: Record<string, number> = {};
   for (const s of body ?? []) {
     const sym: string = s?.symbol;
     if (!sym || !sym.endsWith("-PERP")) continue;
@@ -204,15 +219,19 @@ async function loadNado() {
     productIds[sym] = Number(s.product_id);
     const ml = s.max_leverage ?? s.maxLeverage;
     metaLev[base] = ml ? Number(ml) : 20;
+    // size_increment is the base-qty tick (and the base-qty floor).
     const si: string = String(s.size_increment ?? "0");
     if (si && si !== "0") {
       const step = Number(si) / 1e18;
       metaStep[base] = step;
       metaMin[base] = step;
     }
+    // Nado's `min_size` is a USD NOTIONAL floor (not base qty). V1's
+    // app/nado_client.py converts it via ceil(notional / mid / step) * step
+    // at evaluation time. Store it separately so consumers can do the same.
     const ms: string = String(s.min_size ?? "0");
     if (ms && ms !== "0") {
-      metaMin[base] = Number(ms) / 1e18;
+      metaMinNotional[base] = Number(ms) / 1e18;
     }
     // Nado price tick comes as `price_increment_x18` (integer string × 1e18).
     const pi: string = String(s.price_increment_x18 ?? s.price_increment ?? "0");
@@ -220,7 +239,7 @@ async function loadNado() {
       metaTick[base] = Number(pi) / 1e18;
     }
   }
-  return { markets, productIds, metaLev, metaMin, metaStep, metaTick };
+  return { markets, productIds, metaLev, metaMin, metaStep, metaTick, metaMinNotional };
 }
 
 async function loadVariational() {

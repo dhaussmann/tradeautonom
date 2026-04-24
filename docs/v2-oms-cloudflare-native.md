@@ -510,6 +510,10 @@ Per-symbol fields:
   Extended `tradingConfig.minPriceChange`, GRVT `tick_size`,
   Nado `price_increment_x18 / 1e18`. Variational publishes no tick.
 - `min_order_size`, `qty_step`, `max_leverage` — also from discovery
+- `min_notional_usd` — USD-notional floor, **non-null only for Nado**
+  (Nado publishes `min_size` as USD notional; Extended/GRVT/Variational
+  publish base-qty mins and report `null` here). See the Nado notional
+  section below.
 - `taker_fee_pct` — `TAKER_FEE_PCT` constants (same table as `/arb/config`)
 - `maker_fee_pct` — reserved (null for now)
 - `funding_interval_s` — 3600 for Extended/GRVT/Nado; inferred from
@@ -518,8 +522,40 @@ Per-symbol fields:
 Coverage after discovery run (2026-04-24):
 - extended: 84/84 with tick_size ✓
 - grvt: 90/90 with tick_size ✓
-- nado: 52/52 with tick_size ✓
+- nado: 52/52 with tick_size ✓ + 52/52 `min_notional_usd` = 100 USD
 - variational: 0/97 (API does not publish tick)
+
+### Nado `min_size` is USD notional (Phase F)
+
+Nado's `/symbols` API publishes `min_size` as a **USD-notional floor**, not a
+base-qty threshold — unlike Extended/GRVT/Variational which publish real
+base-qty mins. The raw value for every Nado perp is `100` (i.e. $100
+minimum notional). V1's `app/nado_client.py::get_min_order_size` handles
+this via `ceil(notional / mid / step) * step`; V2 OMS now does the same.
+
+Discovery now stores two separate fields for Nado:
+- `min_order_size = size_increment` (the true base-qty tick, e.g. 0.00005 BTC)
+- `min_notional_usd = 100` (the USD floor)
+
+`computeQuote` (and `findArbForToken` for `/arb/opportunities`) compute
+an **effective base-qty min** at evaluation time using the live book's
+mid price:
+
+```
+effMinQty = max(
+  minOrderSize,
+  minNotionalUsd > 0 && midPrice > 0
+    ? ceil(minNotionalUsd / midPrice / qtyStep) * qtyStep
+    : 0
+)
+```
+
+Cold-start fallback (no book mid yet): skip the notional conversion,
+use `minOrderSize` only → never false-reject.
+
+All `Quote.min_order_size` and `ArbOpportunity.buy/sell_min_order_size`
+fields now carry the **effective** value (not the raw Nado `100`). Wire-
+compatible with V1 DNA-bot `_harmonize_qty`.
 
 ### Single-leg quote: `/quote/:exchange/:symbol`
 

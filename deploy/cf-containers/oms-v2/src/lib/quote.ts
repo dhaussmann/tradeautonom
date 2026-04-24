@@ -166,7 +166,14 @@ export function computeQuote(input: ComputeQuoteInput): Quote {
       feasibility_reason: "qty_below_step",
     };
   }
-  if (meta.minOrderSize > 0 && harmonized < meta.minOrderSize) {
+  // Effective base-qty floor:
+  //   max(minOrderSize, ceil(minNotionalUsd / mid / step) * step)
+  // For Nado, minOrderSize is the base-qty tick (size_increment) and
+  // minNotionalUsd is the real USD floor — we convert it to base qty using
+  // the live book's mid price. If no mid is available (cold start), fall
+  // back to the base-qty floor only (never false-reject).
+  const effMinQty = computeEffectiveMinQty(meta, midPrice);
+  if (effMinQty > 0 && harmonized < effMinQty) {
     return {
       ...(base as Quote),
       book_age_ms: bookAgeMs,
@@ -174,6 +181,8 @@ export function computeQuote(input: ComputeQuoteInput): Quote {
       best_price: bestPrice,
       total_levels_on_side: totalLevels,
       harmonized_qty: harmonized,
+      // Report the effective min so callers see what they need to beat.
+      min_order_size: effMinQty,
       feasible: false,
       feasibility_reason: "qty_below_min_order_size",
     };
@@ -242,7 +251,9 @@ export function computeQuote(input: ComputeQuoteInput): Quote {
     total_levels_on_side: totalLevels,
     limit_price_with_buffer: round8(limitPrice),
     buffer_ticks: bufferTicks,
-    min_order_size: meta.minOrderSize,
+    // Report the EFFECTIVE base-qty min (notional→qty converted with live
+    // mid when applicable). See computeEffectiveMinQty.
+    min_order_size: round8(effMinQty > 0 ? effMinQty : meta.minOrderSize),
     qty_step: meta.qtyStep,
     tick_size: tickSize,
     taker_fee_pct: takerFeePct,
@@ -301,9 +312,14 @@ export function computeCrossQuote(input: ComputeCrossQuoteInput): CrossQuote {
   const buyStep = buy.meta.qtyStep;
   const sellStep = sell.meta.qtyStep;
   const bindingStep = Math.max(buyStep, sellStep);
+  // Resolve which exchange is the binding one: primarily the coarser step,
+  // but fall back to the one with the larger effective min_qty if steps match.
+  const buyEffMin = computeEffectiveMinQty(buy.meta, buyMidCandidate);
+  const sellEffMin = computeEffectiveMinQty(sell.meta, sellMidCandidate);
   const stepExchange =
     bindingStep === 0 || bindingStep === buyStep && bindingStep === sellStep
-      ? buy.exchange
+      // When steps tie, binding exchange = the one with the larger eff min.
+      ? (buyEffMin >= sellEffMin ? buy.exchange : sell.exchange)
       : (bindingStep === buyStep ? buy.exchange : sell.exchange);
   const harmonized = bindingStep > 0
     ? Math.floor(targetQty / bindingStep) * bindingStep
@@ -371,6 +387,37 @@ export function computeCrossQuote(input: ComputeCrossQuoteInput): CrossQuote {
     feasibility_reason: feasibilityReason,
     timestamp_ms: nowMs,
   };
+}
+
+// ── Effective min qty ─────────────────────────────────────────────
+
+/**
+ * Compute the effective base-qty min, combining:
+ *   - `minOrderSize` (hard base-qty floor, e.g. 0.001 BTC),
+ *   - `minNotionalUsd` (USD-notional floor, used only by Nado today),
+ *     converted to base qty via `ceil(notional / mid / step) * step`
+ *     matching V1 app/nado_client.py::get_min_order_size.
+ *
+ * Returns 0 when no floor applies (neither publishes a min).
+ * When midPrice is 0 (cold start, no book yet), the notional conversion
+ * is skipped; we never false-reject on missing price data.
+ */
+export function computeEffectiveMinQty(
+  meta: { minOrderSize: number; qtyStep: number; minNotionalUsd: number },
+  midPrice: number,
+): number {
+  const base = meta.minOrderSize > 0 ? meta.minOrderSize : 0;
+  if (meta.minNotionalUsd > 0 && midPrice > 0) {
+    const rawQty = meta.minNotionalUsd / midPrice;
+    let nominalMinQty: number;
+    if (meta.qtyStep > 0) {
+      nominalMinQty = Math.ceil(rawQty / meta.qtyStep) * meta.qtyStep;
+    } else {
+      nominalMinQty = rawQty;
+    }
+    return Math.max(base, nominalMinQty);
+  }
+  return base;
 }
 
 // ── Rounding helpers ──────────────────────────────────────────────
