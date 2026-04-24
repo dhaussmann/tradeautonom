@@ -1,6 +1,14 @@
 # V2 — Cloudflare-native architecture
 
-Status: **planning + proof-of-concept**. V1 (Photon-VM Docker stack) continues to run in parallel.
+Status: **OMS-v2 live (Phases A–E complete), UserContainer-v2 live on
+`user-v2.defitool.de` (Phases F.0–F.2 complete: feasibility proven, baked
+image, Python engine running against OMS-v2, R2 persistence code layered
+in pending manual R2 API token setup)**. V1 (Photon-VM Docker stack)
+continues to run in parallel; no V1 user is routed to V2 yet.
+
+See `docs/v2-oms-cloudflare-native.md` for OMS-v2 details.
+The UserContainer-v2 implementation lives at
+`deploy/cf-containers/user-v2/`.
 
 ## Why V2
 
@@ -155,23 +163,91 @@ V2 users hit `https://oms-v2.defitool.de` (or similar subdomain).
 
 Photon-OMS continues to run as long as any V1 user exists.
 
-### Phase 4 — UserContainer-v2 as Cloudflare Containers
+### Phase F — UserContainer-v2 as Cloudflare Containers
 
-Python container (same image as V1 `tradeautonom:v3`, but:
+Implemented under `deploy/cf-containers/user-v2/`. The container runs the
+**exact same V1 Python engine** (`app/*`, `main.py`, `requirements.txt`)
+with no code forks — V1 and V2 share one trading engine. The only
+differences from V1:
 
-- No `/app/data` volume (disk is ephemeral on CF Containers)
-- Bot state in Durable Object SQLite via `DurableObjectBotStateStore` (Phase 1)
-- `OMS_URL` env var points to V2-OMS subdomain
-- `sleepAfter` tuned based on active bot state (e.g. `"7d"` if any HOLDING, else `"10m"`)
+1. Code is **baked into the image** instead of mounted read-only from
+   `/opt/tradeautonom-v3/app`. `wrangler deploy` rebuilds and rolls out.
+   `APP_RELOAD=0` disables uvicorn's hot-reload.
+2. `/app/data` is **ephemeral**. `app/cloud_persistence.py` syncs it
+   to/from R2 (`tradeautonom-user-state/<user_id>.tar.gz`) on cold start
+   and every 30 s when files change, plus a final flush on SIGTERM.
+3. `FN_OPT_SHARED_MONITOR_URL=https://oms-v2.defitool.de` — bots
+   subscribe to OMS-v2 instead of V1 Photon OMS.
+4. One `Container` DO instance per user, addressed via
+   `getContainer(env.USER_CONTAINER, idFromName(user_id))`.
 
-One Durable Object per user, addressed via `getContainer(env.USER_CONTAINER, idFromName(user_id))`.
+Key files:
+- `deploy/cf-containers/user-v2/container/Dockerfile` — Python 3.11 +
+  tini + pinned V1 deps + baked `app/`, `static/`, `main.py`. Build
+  context is the repo root (`image_build_context: "../../.."`) so COPY
+  picks up the canonical paths, not duplicates.
+- `deploy/cf-containers/user-v2/container/entrypoint.sh` — restores
+  `/app/data` from R2 before `exec python main.py`. No-op when
+  `V2_CLOUD_PERSISTENCE=0` (V1).
+- `deploy/cf-containers/user-v2/src/user-container.ts` — `Container` DO
+  class, `defaultPort=8000`, `sleepAfter="30m"`, `instance_type="standard-1"`,
+  `max_instances=25`, baseline env vars.
+- `deploy/cf-containers/user-v2/src/index.ts` — smoke-test Worker;
+  accepts `/u/<user_id>/...`, forwards to the matching DO. This is a
+  temporary route until Phase F.3 integrates the real auth-cookie
+  routing into `deploy/cloudflare/src/index.ts`.
+- `app/cloud_persistence.py` — R2 restore/flush module; guarded by
+  `settings.v2_cloud_persistence`; boto3 talks to R2's S3-compatible
+  endpoint.
+- `app/server.py::lifespan` — starts the background flush task on app
+  startup, awaits a final flush on shutdown.
+- `app/config.py` — adds `v2_cloud_persistence`, `v2_flush_interval_s`,
+  `user_id`, `r2_bucket`, `r2_endpoint`, `r2_access_key_id`, `r2_secret`,
+  `app_reload`.
 
-### Phase 5 — Migration tooling + rollout
+Status per sub-phase:
+- **F.0 (feasibility PoC)** — complete. Confirmed that x10 Starknet,
+  `pysdk.grvt_ccxt`, `curl_cffi`, WebSocket to OMS-v2 all work under CF
+  Containers' Linux userspace. Found + fixed: `x10-python-trading-starknet`
+  reorganised its package in 1.4.0 breaking V1 imports → pinned 1.3.1 in
+  `requirements.txt` plus other versions matching the live V1 container.
+  PoC deleted after F.1 landed.
+- **F.1 (container + Worker wiring)** — complete. Deployed to
+  `user-v2.defitool.de`. Verified:
+    - Cold start ~4 s from fresh request
+    - `/health` → `{"status":"ok","grvt_env":"prod"}`
+    - `/auth/setup` + `/auth/unlock` work; vault survives within a single
+      instance's lifetime
+    - `/fn/status` returns live prices pulled from OMS-v2 (Extended SOL-USD,
+      GRVT SOL_USDT_Perp)
+    - `/fn/bots` starts the real BotRegistry cleanly
+- **F.2 (R2 persistence)** — code complete, not yet activated. Needs an
+  R2 API token (dashboard-only step) and the `V2_CLOUD_PERSISTENCE=1`
+  env var set. Until then the container still works (same as V1 on first
+  boot before any user state existed) but state is lost if CF recycles
+  the instance. The module is designed as a strict no-op without creds,
+  so shipping the code first is safe.
 
-- Admin CLI / UI to export bot state from V1 → V2 for a given user.
-- Per-user flag flip.
-- Monitoring: compare V1 vs V2 trade outcomes side-by-side.
-- When no `photon` users remain, decommission Photon VM.
+### Phase F.3 — Main-Worker routing (pending)
+
+- D1 migration `0006_add_backend_column.sql`: `ALTER TABLE user ADD
+  COLUMN backend TEXT NOT NULL DEFAULT 'photon';`
+- `deploy/cloudflare/src/index.ts::handleUserApiProxy` gets a
+  `backend === "cf"` branch that calls
+  `env.USER_CONTAINER_V2.fetch(request)` instead of the Photon
+  orchestrator path.
+- Admin UI toggle + migration script (`scripts/migrate_user_to_cf.py`)
+  that stops V1 container, rsyncs `app-data/` to local tmp, tars +
+  uploads to R2, flips the D1 flag.
+- Pre-flight check: block the flip if `/fn/bots` shows any non-IDLE
+  state.
+
+### Phase F.4+ — Canary rollout + decommissioning
+
+- First flip: one test user with a small number of simulated bots.
+- Observe 24–72 h.
+- Widen the rollout one user at a time as confidence builds.
+- When no `backend='photon'` users remain, decommission the Photon VM.
 
 ## V1 constraints to preserve
 

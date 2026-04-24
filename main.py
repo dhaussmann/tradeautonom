@@ -15,11 +15,16 @@ logging.basicConfig(
 
 if __name__ == "__main__":
     settings = Settings()
-    uvicorn.run(
-        "app.server:app",
-        host=settings.app_host,
-        port=settings.app_port,
-        reload=True,
-        reload_dirs=["/app/app"],
-        log_level="info",
-    )
+    # Auto-reload is enabled on V1 (shared-mount hot-reload from
+    # /opt/tradeautonom-v3/app) but not on V2 Cloudflare Containers where
+    # code is baked into the image. Set APP_RELOAD=0 in the container env
+    # to disable. Default True preserves V1 behaviour.
+    run_kwargs: dict = {
+        "host": settings.app_host,
+        "port": settings.app_port,
+        "log_level": "info",
+    }
+    if settings.app_reload:
+        run_kwargs["reload"] = True
+        run_kwargs["reload_dirs"] = ["/app/app"]
+    uvicorn.run("app.server:app", **run_kwargs)

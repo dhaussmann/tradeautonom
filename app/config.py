@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     # App server
     app_host: str = "0.0.0.0"
     app_port: int = 8000
+    # Uvicorn auto-reload. True on V1 (shared-mount hot-reload via
+    # /opt/tradeautonom-v3/app → /app/app:ro). False on V2 Cloudflare
+    # Containers where code is baked into the image.
+    app_reload: bool = True
 
     # Trading safety
     default_slippage_pct: float = 0.5
@@ -144,5 +148,18 @@ class Settings(BaseSettings):
 
     # ── Execution log (per-chunk AI training data) ─────────────
     execution_log_enabled: bool = True        # Enable per-chunk execution logging to D1
+
+    # ── V2 Cloudflare Containers persistence ────────────────────
+    # Only used when running under Cloudflare Containers (ephemeral disk).
+    # app/cloud_persistence.py reads these + restores /app/data from R2 at
+    # startup and periodically tars+uploads on change. See
+    # docs/v2-cf-containers-architecture.md. V1 (Photon) ignores all of these.
+    v2_cloud_persistence: bool = False        # master switch
+    v2_flush_interval_s: float = 30.0         # periodic upload cadence
+    user_id: str = ""                         # container's user id (R2 key prefix)
+    r2_bucket: str = ""
+    r2_endpoint: str = ""                     # https://<account>.r2.cloudflarestorage.com
+    r2_access_key_id: str = ""
+    r2_secret: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

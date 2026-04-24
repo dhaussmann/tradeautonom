@@ -335,7 +335,27 @@ async def lifespan(app: FastAPI):
         logger.info("History ingest task started (interval=%ds, url=%s)",
                     _settings.history_ingest_interval_s, _settings.history_ingest_url)
 
+    # V2 only: cloud persistence background flush. No-op on V1 (flag guarded).
+    # restore_sync() is expected to have already run in entrypoint.sh BEFORE
+    # this process was started, so /app/data/ is already populated.
+    _cloud_flush_task = None
+    if _settings and getattr(_settings, "v2_cloud_persistence", False):
+        try:
+            from app.cloud_persistence import start_background_flush
+            _cloud_flush_task = await start_background_flush()
+        except Exception as exc:
+            logger.warning("cloud_persistence: start_background_flush failed (%s) — continuing without it", exc)
+
     yield
+
+    if _cloud_flush_task and not _cloud_flush_task.done():
+        # Final flush before shutdown so the latest state persists.
+        try:
+            from app.cloud_persistence import flush as _cp_flush
+            await _cp_flush(reason="lifespan_shutdown")
+        except Exception as exc:
+            logger.warning("cloud_persistence: final flush failed (%s)", exc)
+        _cloud_flush_task.cancel()
 
     if _history_ingest_task and not _history_ingest_task.done():
         _history_ingest_task.cancel()

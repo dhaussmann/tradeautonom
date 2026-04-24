@@ -1,0 +1,48 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "account_id": "e52977b75e8923af6487772b5e91c2b8",
+  "name": "user-v2",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "user-v2.defitool.de", "zone_name": "defitool.de", "custom_domain": true }
+  ],
+  "observability": { "enabled": true },
+
+  // UserContainer-v2 — one per-user Python trading engine.
+  // `image_build_context` points back to the repo root so the Dockerfile can
+  // `COPY app/`, `static/`, `main.py`, `requirements.txt` from their canonical
+  // locations instead of us duplicating them into the container/ directory.
+  //
+  // instance_type "standard" = 1 vCPU / 4 GB RAM (CF default); more than
+  // enough for the V1 peak (max 1 GiB cgroup on Photon). We'll revisit
+  // sizing after Phase F.2 state restore overhead is measured.
+  //
+  // max_instances 25: enough for current production user count (~8) with
+  // room to grow; bump when we onboard more.
+  "containers": [
+    {
+      "class_name": "UserContainer",
+      "image": "./container/Dockerfile",
+      "image_build_context": "../../..",
+      "instance_type": "standard-1",
+      "max_instances": 25
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_CONTAINER",
+        "class_name": "UserContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["UserContainer"]
+    }
+  ]
+}

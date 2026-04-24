@@ -1,8 +1,8 @@
 {
-  "name": "user-v2-poc",
+  "name": "user-v2",
   "version": "0.1.0",
   "private": true,
-  "description": "Phase F.0 feasibility PoC for UserContainer-v2. See docs/v2-cf-containers-architecture.md.",
+  "description": "TradeAutonom V2 UserContainer — Cloudflare-native per-user backend. See docs/v2-cf-containers-architecture.md.",
   "scripts": {
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
