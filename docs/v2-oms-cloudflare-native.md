@@ -1,6 +1,10 @@
 # V2 OMS — Cloudflare-native architecture
 
-Status: **planning + PoC**. Not yet deployed.
+Status: **Phase A deployed** (Extended + AggregatorDO + /ws bot protocol).
+Live: `https://oms-v2.defitool.de` — source under `deploy/cf-containers/oms-v2/`.
+
+Remaining phases: B (GRVT + Nado + Variational + auto-discovery),
+C (ArbScannerDO + /ws/arb DNA-bot protocol), D (canary rollout).
 
 ## What OMS does today (V1, Python, Photon VM)
 

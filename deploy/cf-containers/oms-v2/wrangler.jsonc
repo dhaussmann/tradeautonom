@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "account_id": "e52977b75e8923af6487772b5e91c2b8",
+  "name": "oms-v2",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-23",
+  "compatibility_flags": ["nodejs_compat"],
+  // Production endpoint for V2 OMS. workers.dev left enabled as a fallback.
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "oms-v2.defitool.de", "zone_name": "defitool.de", "custom_domain": true }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  // Durable Object bindings. Each DO is a singleton accessed via idFromName.
+  // More ExchangeOms classes (Grvt, Nado, Variational) will be added in later phases.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EXTENDED_OMS",
+        "class_name": "ExtendedOms"
+      },
+      {
+        "name": "AGGREGATOR_DO",
+        "class_name": "AggregatorDO"
+      }
+    ]
+  },
+  // SQLite storage for DO classes.
+  // - ExtendedOms uses SQLite storage only for future state (current: in-memory).
+  // - AggregatorDO uses SQLite for tracked-symbol set + subscription metadata.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ExtendedOms", "AggregatorDO"]
+    }
+  ]
+}
