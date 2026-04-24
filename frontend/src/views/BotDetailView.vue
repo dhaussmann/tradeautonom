@@ -221,7 +221,7 @@ function toggleTooltip(key: string, e: Event) {
 function closeTooltip() { activeTooltip.value = null }
 
 const TOOLTIPS: Record<string, string> = {
-  fn_opt_depth_spread: 'Berechnet den realen Ausführungsspread über VWAP-Fill-Preise statt nur Best-Bid/Ask. Blockiert einen Chunk wenn der zusätzliche Slippage den Schwellenwert (bps) überschreitet — wartet dann bis das Buch tief genug ist.',
+  fn_opt_depth_spread: 'Zusätzliches VWAP-Gate vor jedem Chase-Round. Simuliert den realen Ausführungs-Spread über die aktuelle Orderbuch-Tiefe für die Chunk-Größe. Blockiert den Round, wenn der VWAP-Exec-Spread außerhalb des Min/Max-Spread-Fensters liegt, und wartet, bis das Buch tief genug wird. Der Limit-Preis bleibt BBO ± Offset-Ticks — Depth Spread verändert nur das Timing, nicht den Preis.',
   fn_opt_ohi_monitoring: 'Orderbook Health Index: bewertet die Qualität beider Orderbücher vor jedem Chunk (0–100%). Setzt sich zusammen aus Spread-Enge (40%), Tiefe in USD (30%) und Symmetrie Bid/Ask (30%). Unter dem Mindestwert wird der Chunk übersprungen.',
   fn_opt_funding_history: 'Prüft historische Funding-Rate-Konsistenz via fundingrate.de API. Ein niedriger Konsistenz-Score bedeutet das die Spread-Opportunität instabil war — der Bot blockt den Entry bis der Score über dem Threshold liegt.',
   fn_opt_dynamic_sizing: 'Berechnet die Positionsgröße automatisch aus verfügbarem Kapital, Liquidität beider Orderbücher und dem Max-Slippage-Budget. Verhindert zu große Orders die das Buch bewegen würden.',
@@ -682,10 +682,13 @@ onUnmounted(() => {
                 <div v-if="activeTooltip === 'fn_opt_depth_spread'" :class="$style.tooltipBox">{{ TOOLTIPS.fn_opt_depth_spread }}</div>
               </div>
             </div>
-            <Typography size="text-xs" color="tertiary">VWAP-Fill statt BBO — blockiert Chunk bei zu hohem Slippage</Typography>
+            <Typography size="text-xs" color="tertiary">VWAP-Gate zusätzlich zum BBO-Gate — blockiert Round, wenn Exec-Spread außerhalb [min, max]</Typography>
           </div>
-          <!-- Max Slippage -->
-          <div :class="$style.flagItem">
+          <!-- Max Slippage — hidden when Depth Spread is ON.
+               The field stays in config (used as an upper-bound safety cap
+               inside the Depth Spread gate), but it's not the primary knob
+               anymore when VWAP-Window is active. -->
+          <div v-if="!status.config?.fn_opt_depth_spread" :class="$style.flagItem">
             <div :class="$style.flagHeader">
               <Typography size="text-sm" weight="semibold">Max Slippage</Typography>
               <div :class="$style.flagInput">
@@ -701,7 +704,7 @@ onUnmounted(() => {
                 <Typography size="text-xs" color="tertiary">bps</Typography>
               </div>
             </div>
-            <Typography size="text-xs" color="tertiary">Max zusätzlicher Slippage über BBO hinaus (für Depth Spread)</Typography>
+            <Typography size="text-xs" color="tertiary">Oberer Sicherheits-Cap für Slippage über BBO hinaus (wird vom Depth-Spread-Gate zusätzlich geprüft)</Typography>
           </div>
           <!-- OHI Monitoring -->
           <div :class="$style.flagItem">

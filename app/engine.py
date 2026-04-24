@@ -1166,13 +1166,28 @@ class FundingArbEngine:
         }
 
     def _compute_depth_analysis_for_status(self) -> dict | None:
-        """Return depth spread analysis for status — uses cached value when executing, live calc when idle."""
+        """Return depth spread analysis for status.
+
+        While a chunk is actively being processed (_current_chunk_state is
+        set), return the cached analysis from the state-machine gate so the
+        UI shows the exact numbers the gate saw. Otherwise (IDLE, HOLDING,
+        or between chunks), compute a live analysis from the current
+        DataLayer orderbooks so the widget reflects the current market —
+        stale values from a previous execution must not leak through.
+        """
         if not self.config.fn_opt_depth_spread:
             return None
         if not self._data_layer or not self.config.instrument_a or not self.config.instrument_b:
             return None
-        # During execution: use the last cached analysis from state machine
-        if self._state_machine and self._state_machine.last_depth_analysis is not None:
+        # Cache is only valid while a chunk is in flight (state machine
+        # stores the most recent gate result there). _current_chunk_state is
+        # None outside of _execute_single_chunk, so this naturally gates on
+        # active execution without needing a separate "is_executing" flag.
+        actively_executing = (
+            self._state_machine is not None
+            and getattr(self._state_machine, "_current_chunk_state", None) is not None
+        )
+        if actively_executing and self._state_machine.last_depth_analysis is not None:
             a = self._state_machine.last_depth_analysis
             return {
                 "bbo_spread_pct": a.bbo_spread_pct,
@@ -1184,7 +1199,9 @@ class FundingArbEngine:
                 "long_bbo": a.long_bbo,
                 "short_bbo": a.short_bbo,
             }
-        # IDLE: compute live from current orderbooks
+        # Not executing — compute live from current orderbooks. This also
+        # covers the case where a previous execution left a stale cached
+        # value: we fall through to the live path instead of returning it.
         try:
             long_snap = self._data_layer.get_orderbook(self.config.long_exchange, self.config.instrument_a)
             short_snap = self._data_layer.get_orderbook(self.config.short_exchange, self.config.instrument_b)
