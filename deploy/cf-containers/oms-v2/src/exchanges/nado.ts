@@ -1,18 +1,33 @@
 /**
- * NadoOms — outbound WebSocket to Nado gateway with:
- *   - REST /symbols discovery → product_id mapping
- *   - REST /query(market_liquidity) snapshot per tracked product BEFORE WS
- *   - WS /v1/subscribe with one subscribe frame per product_id
- *   - Delta-application with x18 divisor (1e18)
- *   - Sequence-gap detection via max_timestamp / last_max_timestamp; on gap, reconnect + re-snapshot
+ * NadoOms — Nado orderbook state + fan-out, with the upstream WebSocket
+ * terminated in a Node.js relay container (not in the Worker).
  *
- * Reference: deploy/monitor/monitor_service.py::_run_nado_ws_all
+ * WHY A CONTAINER?
+ *   Nado's subscription gateway (wss://gateway.prod.nado.xyz/v1/subscribe)
+ *   REQUIRES `Sec-WebSocket-Extensions: permessage-deflate`. Cloudflare
+ *   Workers' outbound WebSocket client does not negotiate extensions,
+ *   so connecting directly returns HTTP 403:
+ *     { "reason": "Invalid compression headers: 'Sec-WebSocket-Extensions'
+ *                  must include 'permessage-deflate'", "block": true }
+ *   See docs/v2-oms-cloudflare-native.md for the full rationale.
  *
- * Caveat: Photon OMS uses permessage-deflate extension. Cloudflare Workers
- * WebSocket client does not document deflate support. We try without; if Nado
- * sends compressed frames we'll fail to parse and have to switch to a gateway.
- * Most production WS feeds negotiate deflate as optional, so raw JSON is
- * typically served if the client doesn't advertise the extension.
+ * DATA FLOW:
+ *   [NadoOms DO]  --WS to container-- [NadoRelayContainer]  --WS (+deflate)-- [Nado]
+ *
+ *   1. On startup / on newly-tracked product_ids:
+ *      - REST /query(market_liquidity) snapshot per product (x18 → float)
+ *      - open WS to NadoRelayContainer at /ws
+ *      - send {op:"resubscribe_all", product_ids:[...]}
+ *   2. Container holds upstream WS with deflate + 30s ping, re-subscribes
+ *      upstream, forwards every parsed event as {type:"event",event:<raw>}
+ *   3. NadoOms applies delta logic to its local book state and fans out
+ *      to AggregatorDO via RPC (same as other exchanges).
+ *
+ * The container is a "dumb" transport — no book state lives there.
+ *
+ * Reference (Python V1 source of truth): deploy/monitor/monitor_service.py
+ * (lines 1635-1869). The delta / seq-gap / snapshot semantics below match
+ * that implementation.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -20,17 +35,17 @@ import type { Env, BookSnapshot } from "../types";
 
 const X18_DIVISOR = 1e18;
 const ALARM_INTERVAL_MS = 30_000;
-const SUB_PACE_MS = 50;
+const STALE_RELAY_MS = 120_000;
 
-// CF Workers fetch() requires https:// even for WebSocket upgrades.
-const WS_URLS: Record<string, string> = {
-  mainnet: "https://gateway.prod.nado.xyz/v1/subscribe",
-  testnet: "https://gateway.sepolia.nado.xyz/v1/subscribe",
-};
 const GATEWAY_URLS: Record<string, string> = {
   mainnet: "https://gateway.prod.nado.xyz",
   testnet: "https://gateway.sepolia.nado.xyz",
 };
+
+/** Relay container binding name; `.idFromName("singleton")` keeps one instance. */
+const RELAY_SINGLETON = "singleton";
+/** Path inside the container where it serves the internal WS endpoint. */
+const RELAY_WS_PATH = "/ws";
 
 interface SideBook {
   bidLevels: Map<string, [number, number]>;
@@ -59,26 +74,33 @@ export class NadoOms extends DurableObject<Env> {
   private snapshotTs: Map<number, string> = new Map();
   private lastMaxTs: Map<number, string> = new Map();
 
-  private ws: WebSocket | null = null;
-  private wsState: "connected" | "disconnected" | "connecting" = "disconnected";
+  /** WebSocket to the NadoRelayContainer. */
+  private relayWs: WebSocket | null = null;
+  private relayState: "connected" | "connecting" | "disconnected" = "disconnected";
+  /** Whether the relay container's UPSTREAM socket to Nado is up. */
+  private upstreamConnected: boolean = false;
   private reconnectAttempts = 0;
+  /** Last JSON event (including hello / upstream_connected) from relay. */
   private lastMessageMs: number | null = null;
+  /** Last actual Nado book_depth event (for staleness). */
+  private lastEventMs: number | null = null;
   private startedAt: number = Date.now();
-  private pendingReconnect: boolean = false;
+  private pendingResync: boolean = false;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    this.nadoEnv = "mainnet"; // could be made configurable via env vars later
+    this.nadoEnv = "mainnet";
     state.blockConcurrencyWhile(async () => {
       const stored = (await state.storage.get<string[]>("tracked")) ?? [];
       for (const s of stored) this.trackedSymbols.add(s);
-      const storedPids = (await state.storage.get<Record<string, number>>("product_ids")) ?? {};
+      const storedPids =
+        (await state.storage.get<Record<string, number>>("product_ids")) ?? {};
       for (const [sym, pid] of Object.entries(storedPids)) {
         this.productIds.set(sym, pid);
         this.productToSymbol.set(pid, sym);
       }
       if (this.trackedSymbols.size > 0) {
-        await this.ensureWs();
+        await this.ensureRelay();
       }
       const current = await state.storage.getAlarm();
       if (current === null) {
@@ -96,9 +118,8 @@ export class NadoOms extends DurableObject<Env> {
   }
 
   /**
-   * Add symbols to track. We need product_ids; these are passed from the
-   * auto-discovery Worker which already calls /symbols. This keeps the DO
-   * from having to re-fetch /symbols every time a market is added.
+   * Add symbols to track. Passed from the auto-discovery Worker which has
+   * already resolved product_ids via Nado `/symbols`.
    */
   async ensureTracking(
     entries: Array<{ symbol: string; product_id: number }>,
@@ -117,8 +138,8 @@ export class NadoOms extends DurableObject<Env> {
       const pidMap: Record<string, number> = {};
       for (const [s, p] of this.productIds) pidMap[s] = p;
       await this.ctx.storage.put("product_ids", pidMap);
-      this.pendingReconnect = true;
-      await this.ensureWs();
+      this.pendingResync = true;
+      await this.ensureRelay();
     }
     return { ok: true, added };
   }
@@ -135,9 +156,11 @@ export class NadoOms extends DurableObject<Env> {
     if (path === "/health") {
       return this.json({
         status: "ok",
-        ws_state: this.wsState,
+        relay_state: this.relayState,
+        upstream_connected: this.upstreamConnected,
         reconnect_attempts: this.reconnectAttempts,
         last_message_ms: this.lastMessageMs,
+        last_event_ms: this.lastEventMs,
         tracked_symbols: this.trackedSymbols.size,
         markets_with_data: this.books.size,
         product_id_cache: this.productIds.size,
@@ -148,46 +171,99 @@ export class NadoOms extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    await this.ensureWs();
+    await this.ensureRelay();
     await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
   }
 
-  // ── WS lifecycle ────────────────────────────────────────────────
+  // ── Relay lifecycle ─────────────────────────────────────────────
 
-  private async ensureWs(): Promise<void> {
-    if (this.wsState === "connecting") return;
+  /**
+   * Ensure there's a live WebSocket to the relay container. Also performs
+   * the REST snapshot step BEFORE the relay is connected, so the first
+   * deltas can be applied on top of a fresh book.
+   */
+  private async ensureRelay(): Promise<void> {
     if (this.trackedSymbols.size === 0) return;
+    if (this.relayState === "connecting") return;
 
-    if (this.ws && this.wsState === "connected" && !this.pendingReconnect) {
-      if (this.lastMessageMs && Date.now() - this.lastMessageMs > 120_000) {
-        console.warn("NADO WS stale, closing");
-        try { this.ws.close(); } catch { /* ignore */ }
-        this.ws = null;
-        this.wsState = "disconnected";
-      } else {
-        return;
+    // Already connected and not stale → just (re)send the desired subscription.
+    if (this.relayWs && this.relayState === "connected" && !this.pendingResync) {
+      const stale =
+        this.lastMessageMs !== null &&
+        Date.now() - this.lastMessageMs > STALE_RELAY_MS;
+      if (!stale) return;
+      console.warn("NADO relay stale, reconnecting");
+      try {
+        this.relayWs.close();
+      } catch {
+        /* ignore */
       }
+      this.relayWs = null;
+      this.relayState = "disconnected";
     }
 
-    if (this.pendingReconnect && this.ws) {
-      try { this.ws.close(); } catch { /* ignore */ }
-      this.ws = null;
-      this.wsState = "disconnected";
-      this.pendingReconnect = false;
+    if (this.pendingResync && this.relayWs) {
+      try {
+        this.relayWs.close();
+      } catch {
+        /* ignore */
+      }
+      this.relayWs = null;
+      this.relayState = "disconnected";
+      this.pendingResync = false;
     }
 
-    this.wsState = "connecting";
+    this.relayState = "connecting";
     this.reconnectAttempts += 1;
 
-    const gateway = GATEWAY_URLS[this.nadoEnv] ?? GATEWAY_URLS.mainnet;
-    const wsUrl = WS_URLS[this.nadoEnv] ?? WS_URLS.mainnet;
-    console.log("NADO opening WS", {
-      attempt: this.reconnectAttempts,
-      symbols: this.trackedSymbols.size,
-      url: wsUrl,
-    });
+    // 1) Snapshot every tracked product via REST before deltas start.
+    await this.takeRestSnapshots();
 
-    // 1) Snapshot every tracked symbol via REST before opening WS.
+    // 2) Open WS to the relay container.
+    try {
+      const id = this.env.NADO_RELAY.idFromName(RELAY_SINGLETON);
+      const stub = this.env.NADO_RELAY.get(id);
+      // Container Durable Objects accept plain http:// URLs; the scheme is
+      // not validated.
+      const req = new Request(`http://nado-relay${RELAY_WS_PATH}`, {
+        headers: { Upgrade: "websocket" },
+      });
+      const resp = await stub.fetch(req);
+      if (resp.status !== 101 || !resp.webSocket) {
+        const body = await resp.text().catch(() => "");
+        console.error("NADO relay upgrade failed", {
+          status: resp.status,
+          body: body.slice(0, 300),
+        });
+        this.relayState = "disconnected";
+        return;
+      }
+      const ws = resp.webSocket;
+      ws.accept();
+      this.relayWs = ws;
+      this.relayState = "connected";
+
+      ws.addEventListener("message", (e) => this.onRelayMessage(e));
+      ws.addEventListener("close", (e) => this.onRelayClose(e));
+      ws.addEventListener("error", (e) => this.onRelayError(e));
+
+      // 3) Tell the relay which product_ids to subscribe to.
+      const pids = Array.from(this.productIds.values());
+      ws.send(
+        JSON.stringify({ op: "resubscribe_all", product_ids: pids }),
+      );
+      console.log("NADO relay connected", { pids: pids.length });
+    } catch (err) {
+      console.error(
+        "NADO relay open threw",
+        err instanceof Error ? err.message : err,
+      );
+      this.relayState = "disconnected";
+    }
+  }
+
+  private async takeRestSnapshots(): Promise<void> {
+    const gateway = GATEWAY_URLS[this.nadoEnv] ?? GATEWAY_URLS.mainnet;
     for (const symbol of this.trackedSymbols) {
       const pid = this.productIds.get(symbol);
       if (pid === undefined) continue;
@@ -205,14 +281,18 @@ export class NadoOms extends DurableObject<Env> {
           }),
         });
         if (!resp.ok) {
-          console.warn("NADO snapshot failed", { symbol, pid, status: resp.status });
+          console.warn("NADO snapshot failed", {
+            symbol,
+            pid,
+            status: resp.status,
+          });
           this.snapshotTs.set(pid, "0");
           this.lastMaxTs.set(pid, "0");
           continue;
         }
         const body = (await resp.json()) as any;
         const data = body?.data ?? {};
-        const snapTs: string = data.timestamp ?? "0";
+        const snapTs: string = String(data.timestamp ?? "0");
         this.snapshotTs.set(pid, snapTs);
         this.lastMaxTs.set(pid, "0");
 
@@ -230,61 +310,24 @@ export class NadoOms extends DurableObject<Env> {
         book.updates += 1;
         this.fanOut(this.toSnapshot(symbol, book));
       } catch (err) {
-        console.warn("NADO snapshot threw", { symbol, err: String(err) });
+        console.warn("NADO snapshot threw", {
+          symbol,
+          err: String(err),
+        });
         this.snapshotTs.set(pid, "0");
         this.lastMaxTs.set(pid, "0");
       }
     }
-
-    // 2) Open WS
-    try {
-      const resp = await fetch(wsUrl, {
-        headers: { Upgrade: "websocket", "User-Agent": "tradeautonom-oms-v2/0.1" },
-      });
-      if (resp.status !== 101 || !resp.webSocket) {
-        const bodyPreview = await resp.text().catch(() => "");
-        console.error("NADO WS upgrade failed", {
-          status: resp.status,
-          statusText: resp.statusText,
-          bodyPreview: bodyPreview.slice(0, 200),
-        });
-        this.wsState = "disconnected";
-        return;
-      }
-      const ws = resp.webSocket;
-      ws.accept();
-      this.ws = ws;
-      this.wsState = "connected";
-
-      // 3) Subscribe per product_id with pacing
-      for (const symbol of this.trackedSymbols) {
-        const pid = this.productIds.get(symbol);
-        if (pid === undefined) continue;
-        ws.send(
-          JSON.stringify({
-            method: "subscribe",
-            stream: { type: "book_depth", product_id: pid },
-            id: pid,
-          }),
-        );
-        await sleep(SUB_PACE_MS);
-      }
-      console.log("NADO subscribed", { products: this.trackedSymbols.size });
-
-      ws.addEventListener("message", (e) => this.onMessage(e));
-      ws.addEventListener("close", (e) => this.onClose(e));
-      ws.addEventListener("error", (e) => this.onError(e));
-    } catch (err) {
-      console.error("NADO WS open threw", err instanceof Error ? err.message : err);
-      this.wsState = "disconnected";
-    }
   }
 
-  private onMessage(event: MessageEvent): void {
+  // ── Relay WS event handlers ─────────────────────────────────────
+
+  private onRelayMessage(event: MessageEvent): void {
     this.lastMessageMs = Date.now();
-    const raw = typeof event.data === "string"
-      ? event.data
-      : new TextDecoder().decode(event.data as ArrayBuffer);
+    const raw =
+      typeof event.data === "string"
+        ? event.data
+        : new TextDecoder().decode(event.data as ArrayBuffer);
 
     let msg: any;
     try {
@@ -293,21 +336,59 @@ export class NadoOms extends DurableObject<Env> {
       return;
     }
 
-    // Normalize envelope: either top-level {bids, asks, product_id, ...} or {data: {...}}
-    const envelope = msg.data && typeof msg.data === "object" ? msg.data : msg;
-    if (!envelope || (envelope.bids === undefined && envelope.asks === undefined)) return;
+    if (msg?.type === "hello") {
+      console.log("NADO relay hello", {
+        relay_version: msg.relay_version,
+      });
+      return;
+    }
+    if (msg?.type === "upstream_connected") {
+      this.upstreamConnected = true;
+      console.log("NADO upstream connected");
+      return;
+    }
+    if (msg?.type === "upstream_disconnected") {
+      this.upstreamConnected = false;
+      console.warn("NADO upstream disconnected", { reason: msg.reason });
+      for (const b of this.books.values()) b.connected = false;
+      return;
+    }
+    if (msg?.type === "event") {
+      this.lastEventMs = Date.now();
+      this.onNadoEvent(msg.event);
+      return;
+    }
+  }
 
-    const pid: number | undefined = envelope.product_id;
+  private onNadoEvent(event: unknown): void {
+    if (!event || typeof event !== "object") return;
+    const msg = event as Record<string, unknown>;
+
+    // Normalize envelope: either top-level {bids,asks,product_id,...} or {data:{...}}
+    const envelope =
+      msg.data && typeof msg.data === "object"
+        ? (msg.data as Record<string, unknown>)
+        : msg;
+    if (
+      !envelope ||
+      (envelope.bids === undefined && envelope.asks === undefined)
+    ) {
+      return;
+    }
+
+    const pid = typeof envelope.product_id === "number"
+      ? envelope.product_id
+      : undefined;
     if (pid === undefined) return;
     const symbol = this.productToSymbol.get(pid);
     if (!symbol || !this.trackedSymbols.has(symbol)) return;
 
-    const msgMaxTs: string = String(envelope.max_timestamp ?? "0");
-    const msgLastMaxTs: string = String(envelope.last_max_timestamp ?? "0");
+    const msgMaxTs = String(envelope.max_timestamp ?? "0");
+    const msgLastMaxTs = String(envelope.last_max_timestamp ?? "0");
     const snapTs = this.snapshotTs.get(pid) ?? "0";
     const last = this.lastMaxTs.get(pid) ?? "0";
 
-    // Drop events at or before our snapshot timestamp.
+    // Drop events at or before the snapshot timestamp (REST already covered them).
     if (msgMaxTs !== "0" && snapTs !== "0" && msgMaxTs <= snapTs) return;
 
     // Sequence continuity check.
@@ -317,9 +398,13 @@ export class NadoOms extends DurableObject<Env> {
         expected_last_max: last,
         got_last_max: msgLastMaxTs,
       });
-      // Trigger full reconnect + re-snapshot
-      this.pendingReconnect = true;
-      try { this.ws?.close(); } catch { /* ignore */ }
+      // Full resync: close relay, reconnect, re-snapshot.
+      this.pendingResync = true;
+      try {
+        this.relayWs?.close();
+      } catch {
+        /* ignore */
+      }
       return;
     }
 
@@ -343,34 +428,43 @@ export class NadoOms extends DurableObject<Env> {
     const agg = this.env.AGGREGATOR_DO.get(
       this.env.AGGREGATOR_DO.idFromName("aggregator"),
     );
-    agg.onBookUpdate(snap).catch(() => { /* drop */ });
+    agg.onBookUpdate(snap).catch(() => {
+      /* drop */
+    });
   }
 
-  private onClose(event: CloseEvent): void {
-    console.warn("NADO WS closed", { code: event.code, reason: event.reason });
-    this.ws = null;
-    this.wsState = "disconnected";
+  private onRelayClose(event: CloseEvent): void {
+    console.warn("NADO relay closed", {
+      code: event.code,
+      reason: event.reason,
+    });
+    this.relayWs = null;
+    this.relayState = "disconnected";
+    this.upstreamConnected = false;
     for (const b of this.books.values()) b.connected = false;
   }
 
-  private onError(event: Event): void {
-    console.error("NADO WS error", event.type);
+  private onRelayError(event: Event): void {
+    console.error("NADO relay error", event.type);
   }
 
   private toSnapshot(market: string, book: SideBook): BookSnapshot {
-    const bids: Array<[number, number]> = Array.from(book.bidLevels.values()).sort(
-      (a, b) => b[0] - a[0],
-    );
-    const asks: Array<[number, number]> = Array.from(book.askLevels.values()).sort(
-      (a, b) => a[0] - b[0],
-    );
+    const bids: Array<[number, number]> = Array.from(
+      book.bidLevels.values(),
+    ).sort((a, b) => b[0] - a[0]);
+    const asks: Array<[number, number]> = Array.from(
+      book.askLevels.values(),
+    ).sort((a, b) => a[0] - b[0]);
     return {
       exchange: "nado",
       symbol: market,
       bids: bids.slice(0, 10),
       asks: asks.slice(0, 10),
       timestamp_ms: book.ts_ms,
-      connected: book.connected && this.wsState === "connected",
+      connected:
+        book.connected &&
+        this.relayState === "connected" &&
+        this.upstreamConnected,
       updates: book.updates,
       last_seq: 0,
     };
@@ -405,8 +499,4 @@ function applyNadoLevels(
       sideMap.set(key, [price, size]);
     }
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -1,6 +1,6 @@
 # V2 OMS — Cloudflare-native architecture
 
-Status: **Phase B partially deployed**. Live: `https://oms-v2.defitool.de`.
+Status: **Phase B complete**. Live: `https://oms-v2.defitool.de`.
 
 Source under `deploy/cf-containers/oms-v2/`.
 
@@ -8,25 +8,108 @@ Working:
 - Extended (114 markets, all-markets shared stream)
 - GRVT (90 markets, single subscribe frame, snapshot-style updates)
 - Variational (97 markets, 1.2s REST polling, 3-tier synthetic book)
+- Nado (52 markets via `NadoRelayContainer` — a tiny Node.js Cloudflare
+  Container that holds the `permessage-deflate` WebSocket to Nado and
+  forwards events to `NadoOms` DO via a plain WebSocket on port 8080).
 - AggregatorDO (hibernation WS, V1 bot protocol)
 - Auto-discovery cron (every 15 min) — 117 cross-exchange token pairs
 
-Blocked:
-- Nado requires `Sec-WebSocket-Extensions: permessage-deflate` on the
-  subscribe upgrade. Cloudflare Workers `fetch()` does not negotiate
-  deflate, so Nado gateway rejects the upgrade with 403
-  "Invalid compression headers". Options to resolve:
-    1. Add a tiny relay Worker on a different host that accepts the
-       compressed frames, inflates them, and forwards plain JSON to
-       NadoOms (complex; needs persistent WS host outside Workers).
-    2. Run NadoOms as a small CF Container (Python) that keeps the
-       deflate-capable `websockets` client. Mixes container + DO but
-       isolates the problem.
-    3. Wait for Cloudflare to add deflate negotiation to Workers WS
-       client and re-enable NadoOms then.
+Remaining phases: C (ArbScannerDO + /ws/arb DNA-bot protocol),
+D (canary rollout).
 
-Remaining phases: C (ArbScannerDO + /ws/arb DNA-bot protocol,
-deferred until Nado is available), D (canary rollout).
+## The Nado deflate problem and why we use a container
+
+Nado's subscription gateway (`wss://gateway.prod.nado.xyz/v1/subscribe`)
+REQUIRES `Sec-WebSocket-Extensions: permessage-deflate` in the upgrade
+request. This is documented explicitly
+(<https://docs.nado.xyz/developer-resources/api/subscriptions>) and
+enforced server-side — a connection attempt without it returns HTTP 403:
+
+```json
+{
+  "reason": "Invalid compression headers: 'Sec-WebSocket-Extensions' must include 'permessage-deflate'",
+  "block": true
+}
+```
+
+Cloudflare Workers' outbound WebSocket client (via
+`fetch(url, { headers: { Upgrade: "websocket" } })`) does NOT advertise
+or negotiate any `Sec-WebSocket-Extensions`, so the upgrade is rejected
+and the Worker never sees any Nado frame.
+
+Options considered:
+  1. **Raw TCP + TLS + WebSocket framing + DEFLATE implemented in the
+     Worker** using `cloudflare:sockets`. Rejected — 500+ LOC including
+     RFC 7692 sliding-window semantics, high bug risk, ongoing maintenance.
+  2. **Python relay on Photon VM (`192.168.133.100`)**. Rejected —
+     reintroduces a Photon host in the V2 data path; contradicts the
+     CF-native goal.
+  3. **Cloudflare Container holding the upstream WebSocket with deflate**.
+     Chosen. Small Node.js service using the `ws` library (native
+     `permessage-deflate` support). Stays inside Cloudflare. Same
+     deploy pipeline as the Worker (`wrangler deploy`).
+  4. Snapshot-only (no WebSocket). Rejected — 5-second polling staleness
+     breaks cross-exchange arbitrage detection.
+
+## Nado data flow
+
+```
+                  ┌──────────────────────────────────────┐
+                  │  Cloudflare Worker (oms-v2)          │
+                  │                                      │
+                  │  NadoOms DO                          │
+                  │  • REST /query snapshot per product  │
+                  │  • book state + delta merge          │
+                  │  • seq-gap detection                 │
+                  │  • fan-out to AggregatorDO           │
+                  │                                      │
+                  │         WebSocket ▼                  │
+                  │                                      │
+                  │  NadoRelayContainer (CF Container)   │
+                  │  • Node.js 20 + `ws`                 │
+                  │  • 1 upstream WS with deflate        │
+                  │  • 30s ping (required by Nado)       │
+                  │  • auto-reconnect + re-subscribe     │
+                  │  • forwards raw JSON events          │
+                  └──────────────┬───────────────────────┘
+                                 │ wss:// + permessage-deflate + 30s ping
+                                 ▼
+                    wss://gateway.prod.nado.xyz/v1/subscribe
+```
+
+Container is stateless w.r.t. books — all book-state, delta merging, and
+fan-out remain in `NadoOms` DO, matching the pattern used for the other
+three exchanges. The container is a "dumb transport" whose sole job is
+to overcome the deflate-negotiation limitation.
+
+### Relay protocol (DO ↔ Container, internal WebSocket)
+
+DO → Container (control):
+  - `{op:"subscribe", product_id:N}` — add one product to upstream
+  - `{op:"unsubscribe", product_id:N}` — remove one product
+  - `{op:"resubscribe_all", product_ids:[N1,N2,...]}` — replace the full
+    tracked set (sent on fresh DO-to-container connect)
+
+Container → DO (events):
+  - `{type:"hello", relay_version, started_at_ms}` — sent on DO connect
+  - `{type:"upstream_connected", at_ms}` — upstream to Nado opened
+  - `{type:"upstream_disconnected", at_ms, reason}` — upstream lost;
+    container is auto-reconnecting in the background
+  - `{type:"event", at_ms, event:<raw Nado JSON>}` — forwarded book_depth
+    envelope from Nado with x18 price/size strings preserved
+
+### Container operational notes
+
+- `max_instances: 1` — one relay, one upstream WS. Prevents fan-out race.
+- `sleepAfter: "14d"` — the relay is a long-lived streamer, not on-demand.
+- `instance_type: "basic"` — near-idle (inflate + forward); 256 MB is ample.
+- Source: `deploy/cf-containers/oms-v2/container/nado-relay/`
+- Worker binding class: `NadoRelayContainer`
+  (`deploy/cf-containers/oms-v2/src/nado-relay-container.ts`)
+- `wrangler.jsonc` — see `containers:[...]` + migration tag `v3`
+- Health: container `GET /health` returns `{upstream:{connected,...}}`.
+  DO `/nado/health` exposes `relay_state`, `upstream_connected`,
+  `last_event_ms` for full-path visibility.
 
 ## What OMS does today (V1, Python, Photon VM)
 

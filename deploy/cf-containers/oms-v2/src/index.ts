@@ -24,9 +24,17 @@ import { GrvtOms } from "./exchanges/grvt";
 import { NadoOms } from "./exchanges/nado";
 import { VariationalOms } from "./exchanges/variational";
 import { AggregatorDO } from "./aggregator";
+import { NadoRelayContainer } from "./nado-relay-container";
 import type { Env } from "./types";
 
-export { ExtendedOms, GrvtOms, NadoOms, VariationalOms, AggregatorDO };
+export {
+  ExtendedOms,
+  GrvtOms,
+  NadoOms,
+  VariationalOms,
+  AggregatorDO,
+  NadoRelayContainer,
+};
 
 type ExchangeBindingKey = "extended" | "grvt" | "nado" | "variational";
 function exchangeStub(env: Env, key: ExchangeBindingKey): DurableObjectStub {

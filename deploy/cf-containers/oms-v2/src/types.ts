@@ -7,6 +7,7 @@ import type { GrvtOms } from "./exchanges/grvt";
 import type { NadoOms } from "./exchanges/nado";
 import type { VariationalOms } from "./exchanges/variational";
 import type { AggregatorDO } from "./aggregator";
+import type { NadoRelayContainer } from "./nado-relay-container";
 
 export interface Env {
   EXTENDED_OMS: DurableObjectNamespace<ExtendedOms>;
@@ -14,6 +15,11 @@ export interface Env {
   NADO_OMS: DurableObjectNamespace<NadoOms>;
   VARIATIONAL_OMS: DurableObjectNamespace<VariationalOms>;
   AGGREGATOR_DO: DurableObjectNamespace<AggregatorDO>;
+  /**
+   * Node.js container holding the permessage-deflate WebSocket to Nado.
+   * See src/nado-relay-container.ts and container/nado-relay/.
+   */
+  NADO_RELAY: DurableObjectNamespace<NadoRelayContainer>;
 }
 
 export interface BookSnapshot {

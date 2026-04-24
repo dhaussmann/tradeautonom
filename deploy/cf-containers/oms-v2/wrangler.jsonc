@@ -17,6 +17,21 @@
   "triggers": {
     "crons": ["*/15 * * * *"]
   },
+  // Nado requires `Sec-WebSocket-Extensions: permessage-deflate` which
+  // Cloudflare Workers cannot negotiate. The NadoRelayContainer runs Node.js
+  // `ws` and bridges DO ↔ Nado. One always-on instance.
+  //   - Image: ./container/nado-relay/Dockerfile
+  //   - Source: ./container/nado-relay/src/
+  //   - Binding: NADO_RELAY (see durable_objects.bindings below)
+  //   - Migration tag v3: new_sqlite_classes includes NadoRelayContainer
+  "containers": [
+    {
+      "class_name": "NadoRelayContainer",
+      "image": "./container/nado-relay/Dockerfile",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
@@ -38,6 +53,10 @@
       {
         "name": "AGGREGATOR_DO",
         "class_name": "AggregatorDO"
+      },
+      {
+        "name": "NADO_RELAY",
+        "class_name": "NadoRelayContainer"
       }
     ]
   },
@@ -49,6 +68,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["GrvtOms", "NadoOms", "VariationalOms"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["NadoRelayContainer"]
     }
   ]
 }

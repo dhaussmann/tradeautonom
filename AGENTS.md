@@ -18,7 +18,7 @@ Multi-exchange arbitrage trading bot (FastAPI backend, Vue 3 SPA frontend, Cloud
 | Nado OMS watchdog | `docs/NADO_WATCHDOG_WEBSOCKET.md` |
 | GRVT endpoints | `.claude/rules/grvt_api.md` |
 | Recent fixes to avoid regressing | `docs/WEBSOCKET_REFACTOR_FIXES.md`, `RELEASENOTES.md` |
-| V2 on Cloudflare (Phase A live, Extended-only) | `docs/v2-cf-containers-architecture.md`, `docs/v2-oms-cloudflare-native.md`, `deploy/cf-containers/oms-v2/` (prod), `deploy/cf-containers/proof-of-concept/` (research) |
+| V2 on Cloudflare (Phase B live: all 4 exchanges) | `docs/v2-cf-containers-architecture.md`, `docs/v2-oms-cloudflare-native.md`, `deploy/cf-containers/oms-v2/` (prod), `deploy/cf-containers/proof-of-concept/` (research) |
 | **Do not treat as current reference** | `docs/delta-neutral-algorithm.docx.md` (design spec), `docs/tradeautonom-integrationsplan-v2.docx.md` (plan), `docs/FIX_USER_CONTAINERS.md` (proposal), `docs/V4_WEB_DEVELOPER_GUIDE.md` (external API doc) |
 
 ## 2. Entry points (not obvious from filenames)
@@ -105,7 +105,7 @@ Host is a **Photon OS VM** (`photon-machine`, 192.168.133.100), not Synology. Ol
 
 **Canonical endpoints:**
 - Extended account stream: `wss://api.starknet.extended.exchange/stream.extended.exchange/v1/account` (header `X-Api-Key`)
-- Nado: `wss://gateway.prod.nado.xyz/v1/subscribe` (not `v1/v1/...` — Bug 2)
+- Nado: `wss://gateway.prod.nado.xyz/v1/subscribe` (not `v1/v1/...` — Bug 2). **Requires `Sec-WebSocket-Extensions: permessage-deflate`** (HTTP 403 otherwise). Also requires 30s WS ping. V2-OMS cannot connect directly from a Worker because CF Workers do not negotiate extensions; in V2 this is solved by `NadoRelayContainer` (Node.js `ws` library, `deploy/cf-containers/oms-v2/container/nado-relay/`). Do NOT attempt to re-introduce a direct `fetch(wss://...)` path in `NadoOms` DO.
 - GRVT: `wss://market-data.grvt.io/ws/full` + `wss://trades.grvt.io/ws/full`
 
 ## 9. Execution / safety invariants
