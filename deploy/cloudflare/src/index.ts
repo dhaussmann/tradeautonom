@@ -121,6 +121,45 @@ export default {
       return jsonResponse({ injected, user_id: body.user_id });
     }
 
+    // ── TEMP: Admin recycle V2 container — stops the user's Container DO
+    //    so the next request cold-starts with fresh envVars. Useful after
+    //    changing envVars in user-container.ts (e.g. toggling
+    //    EXTENDED_BUILDER_ENABLED) because `wrangler deploy` of Worker
+    //    config doesn't auto-restart warm Container instances.
+    //    Usage: POST /api/admin/recycle/<user_id>?token=INGEST_TOKEN
+    if (url.pathname.startsWith("/api/admin/recycle/") && request.method === "POST") {
+      const token = url.searchParams.get("token");
+      if (token !== env.INGEST_TOKEN) return jsonResponse({ error: "Forbidden" }, 403);
+      const recycleMatch = url.pathname.match(/^\/api\/admin\/recycle\/([^/]+)\/?$/);
+      if (!recycleMatch) return jsonResponse({ error: "Invalid recycle path" }, 400);
+      const targetUserId = recycleMatch[1]!;
+      const recycleReq = new Request(
+        `http://user-v2.internal/admin/recycle/${encodeURIComponent(targetUserId)}`,
+        {
+          method: "POST",
+          headers: {
+            "X-Internal-Token": env.V2_SHARED_TOKEN || "",
+          },
+        },
+      );
+      try {
+        const resp = await env.USER_V2.fetch(recycleReq);
+        const body = await resp.text();
+        return new Response(body, {
+          status: resp.status,
+          headers: { "content-type": "application/json" },
+        });
+      } catch (err) {
+        return jsonResponse(
+          {
+            error: "recycle_failed",
+            detail: err instanceof Error ? err.message : String(err),
+          },
+          502,
+        );
+      }
+    }
+
     // ── TEMP: Admin probe — proxy a GET to the user's current backend.
     //    Used for debugging V2 routing without needing a session cookie.
     //    Usage: GET /api/admin/probe/<user_id>/<backend_path>?token=...

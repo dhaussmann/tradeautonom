@@ -41,6 +41,13 @@ export class UserContainer extends Container<Env> {
   // Baseline env vars for every instance. Per-user overrides (USER_ID,
   // R2 credentials) will be injected at `.get()`-time via envVars(...)
   // once we wire the Worker to look up the user.
+  //
+  // NOTE: env vars are GLOBAL for all V2 users because CF Containers
+  // `envVars` is static per-class. Per-user overrides (e.g. different
+  // builder-id settings) would need a D1 `user_settings` table and a
+  // `/internal/apply-settings` POST on each Worker-proxied request,
+  // mirroring the existing `/internal/apply-keys` pattern. Not needed
+  // yet because V2 has a single test user (dhaussmann@outlook.com).
   envVars = {
     APP_HOST: "0.0.0.0",
     APP_PORT: "8000",
@@ -53,6 +60,11 @@ export class UserContainer extends Container<Env> {
     HISTORY_INGEST_INTERVAL_S: "300",
     // V2-CLOUD-PERSISTENCE flag — Phase F.2 will flip this to "1".
     V2_CLOUD_PERSISTENCE: "0",
+    // Extended builder-code routing disabled for all V2 users until we add
+    // a per-user override mechanism. V1 `tradeautonom-v3` has the same
+    // setting (EXTENDED_BUILDER_ENABLED=false in .env.container). The
+    // default in app/config.py is True — we're explicitly overriding here.
+    EXTENDED_BUILDER_ENABLED: "false",
   };
 
   override onStart(): void {
@@ -70,5 +82,33 @@ export class UserContainer extends Container<Env> {
         err: error instanceof Error ? error.message : String(error),
       }),
     );
+  }
+
+  /**
+   * Override fetch to handle an internal `/__recycle` path that stops the
+   * running container (so the next request cold-starts with fresh envVars).
+   * All other paths forward to the Python FastAPI on port 8000 as usual.
+   */
+  override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/__recycle") {
+      try {
+        await this.stop();
+        console.log(JSON.stringify({ evt: "user_container_recycled" }));
+        return new Response(
+          JSON.stringify({ status: "stopped", evt: "will_cold_start_on_next_request" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      } catch (err) {
+        return new Response(
+          JSON.stringify({
+            error: "stop_failed",
+            detail: err instanceof Error ? err.message : String(err),
+          }),
+          { status: 500, headers: { "content-type": "application/json" } },
+        );
+      }
+    }
+    return super.fetch(request);
   }
 }

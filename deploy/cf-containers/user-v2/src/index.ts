@@ -40,6 +40,51 @@ export default {
       );
     }
 
+    // Admin recycle endpoint: destroys the user's Container DO instance so
+    // the next request cold-starts with fresh envVars. Protected by the
+    // same shared-secret as normal calls.
+    //
+    // Need a recycle mechanism because `wrangler deploy` does NOT auto-
+    // restart warm container instances when only envVars (static Worker
+    // config) changes — it just marks the new config for the next cold-
+    // start. This endpoint explicitly stops + restarts the container.
+    const recycleMatch = url.pathname.match(/^\/admin\/recycle\/([A-Za-z0-9._-]+)\/?$/);
+    if (recycleMatch) {
+      const presented = request.headers.get("X-Internal-Token") ?? "";
+      const expected = env.V2_SHARED_TOKEN ?? "";
+      if (!expected || presented !== expected) {
+        return new Response(
+          JSON.stringify({ error: "Forbidden" }),
+          { status: 403, headers: { "content-type": "application/json" } },
+        );
+      }
+      const targetUserId = recycleMatch[1]!;
+      const ns = env.USER_CONTAINER;
+      const stub = ns.get(ns.idFromName(targetUserId));
+      try {
+        // Proxy a special /__recycle path into the DO itself. Handled
+        // inside UserContainer.fetch() below.
+        const recycleReq = new Request("http://user-v2.internal/__recycle", {
+          method: "POST",
+          headers: { "X-Internal-Token": expected },
+        });
+        const resp = await stub.fetch(recycleReq);
+        const body = await resp.text();
+        return new Response(body, {
+          status: resp.status,
+          headers: { "content-type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({
+            error: "recycle_failed",
+            detail: err instanceof Error ? err.message : String(err),
+          }),
+          { status: 500, headers: { "content-type": "application/json" } },
+        );
+      }
+    }
+
     const match = url.pathname.match(/^\/u\/([A-Za-z0-9._-]+)(\/.*)?$/);
     if (!match) {
       return new Response("Not found", { status: 404 });

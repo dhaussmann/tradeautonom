@@ -2691,6 +2691,29 @@ async def get_keys():
     }
 
 
+@app.get("/settings/runtime")
+async def get_runtime_settings():
+    """Return non-sensitive runtime config values. Useful for verifying which
+    env overrides are active (e.g. EXTENDED_BUILDER_ENABLED) without exposing
+    secrets. No auth required — none of these fields are sensitive.
+    """
+    return {
+        "grvt_env": _settings.grvt_env,
+        "app_host": _settings.app_host,
+        "app_port": _settings.app_port,
+        "app_reload": _settings.app_reload,
+        "extended_builder_enabled": _settings.extended_builder_enabled,
+        "extended_builder_id": _settings.extended_builder_id,
+        "extended_builder_fee": _settings.extended_builder_fee,
+        "fn_opt_shared_monitor_url": _settings.fn_opt_shared_monitor_url,
+        "fn_enabled": _settings.fn_enabled,
+        "arb_simulation_mode": _settings.arb_simulation_mode,
+        "fn_simulation_mode": _settings.fn_simulation_mode,
+        "v2_cloud_persistence": getattr(_settings, "v2_cloud_persistence", False),
+        "v2_headless": bool(os.environ.get("V2_HEADLESS")),
+    }
+
+
 @app.post("/settings/keys")
 async def update_keys(updates: dict):
     """Update API keys. Only non-empty values that differ from masked are saved."""
