@@ -39,11 +39,22 @@ interface Env {
   __STATIC_CONTENT: KVNamespace;
   NAS_BACKEND: Fetcher;
   OMS_BACKEND: Fetcher;
+  /**
+   * Phase F.3: service binding to the `user-v2` Worker (per-user CF
+   * Container backend). Routed to when D1 `user.backend = 'cf'`.
+   */
+  USER_V2: Fetcher;
   ORCHESTRATOR_ORIGIN: string;
   DB: D1Database;
   INGEST_TOKEN: string;
   BETTER_AUTH_SECRET: string;
   ORCH_TOKEN: string;
+  /**
+   * Shared secret used to authenticate calls from this Worker to the
+   * user-v2 Worker. Set via `wrangler secret put V2_SHARED_TOKEN` on BOTH
+   * Workers (same value).
+   */
+  V2_SHARED_TOKEN: string;
   ENCRYPTION_KEY: string;
   ADMIN_EMAILS: string;
   ACTIVITY_LOG: AnalyticsEngineDataset;
@@ -129,6 +140,15 @@ export default {
       const targetUserId = url.pathname.replace("/api/admin/users/", "");
       if (!targetUserId) return jsonResponse({ error: "user_id required" }, 400);
       return handleAdminDeleteUser(env, targetUserId);
+    }
+    // Phase F.3: per-user V1/V2 backend toggle.
+    //   POST /api/admin/user/:id/backend  { backend: "photon" | "cf", force?: bool }
+    if (url.pathname.match(/^\/api\/admin\/user\/[^/]+\/backend$/) && request.method === "POST") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
+      const targetUserId = url.pathname.match(/^\/api\/admin\/user\/([^/]+)\/backend$/)![1]!;
+      return handleAdminSetBackend(request, env, targetUserId);
     }
     if (url.pathname === "/api/admin/activity" && request.method === "GET") {
       const session = await getSession(request, env);
@@ -271,10 +291,96 @@ function jsonResponse(data: unknown, status = 200): Response {
 }
 
 // ─────────────────────────────────────────────────────────────
-// User API Proxy — routes to user's container via orchestrator
+// User backend resolver — Phase F.3 routing dispatcher
+// ─────────────────────────────────────────────────────────────
+
+type UserBackend = "photon" | "cf";
+
+/**
+ * Read `user.backend` from D1. Defaults to "photon" for users created
+ * before migration 0006 applied (the column has a NOT NULL DEFAULT, so
+ * this should only happen if the user row is missing entirely).
+ */
+async function getUserBackend(env: Env, userId: string): Promise<UserBackend> {
+  const row = await env.DB.prepare(
+    "SELECT backend FROM user WHERE id = ?"
+  ).bind(userId).first<{ backend: string }>();
+  return row?.backend === "cf" ? "cf" : "photon";
+}
+
+// ─────────────────────────────────────────────────────────────
+// User API Proxy — routes to user's container (Photon or CF)
 // ─────────────────────────────────────────────────────────────
 
 async function handleUserApiProxy(
+  request: Request,
+  url: URL,
+  env: Env,
+  userId: string,
+): Promise<Response> {
+  const backend = await getUserBackend(env, userId);
+  if (backend === "cf") {
+    return handleUserApiProxyV2(request, url, env, userId);
+  }
+  return handleUserApiProxyPhoton(request, url, env, userId);
+}
+
+/**
+ * V2 (Cloudflare Container) path. Forwards the request to the user's
+ * Container DO via the USER_V2 service binding. The DO is addressed via
+ * the `/u/<user_id>/<path>` convention implemented by the user-v2 Worker.
+ *
+ * No D1 `user_container` lookup — the Container DO is directly addressable
+ * by idFromName(user_id) inside the user-v2 Worker; no port provisioning.
+ */
+async function handleUserApiProxyV2(
+  request: Request,
+  url: URL,
+  env: Env,
+  userId: string,
+): Promise<Response> {
+  const backendPath = url.pathname.replace(/^\/api/, "") + url.search;
+  const targetUrl = `http://user-v2.internal/u/${encodeURIComponent(userId)}${backendPath}`;
+
+  const proxyHeaders = new Headers(request.headers);
+  proxyHeaders.delete("host");
+  proxyHeaders.set("X-Internal-Token", env.V2_SHARED_TOKEN || "");
+  proxyHeaders.set("X-User-Id", userId);
+
+  const proxyRequest = new Request(targetUrl, {
+    method: request.method,
+    headers: proxyHeaders,
+    body: request.body,
+    // @ts-expect-error — duplex is needed for streaming request bodies
+    duplex: "half",
+  });
+
+  try {
+    const response = await env.USER_V2.fetch(proxyRequest);
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+    });
+  } catch (err) {
+    return jsonResponse(
+      {
+        error: "V2 backend unreachable",
+        detail: err instanceof Error ? err.message : String(err),
+      },
+      502,
+    );
+  }
+}
+
+/**
+ * V1 (Photon) path — unchanged from the pre-F.3 implementation. Kept as a
+ * separate function so the branch at the top of handleUserApiProxy is
+ * obvious.
+ */
+async function handleUserApiProxyPhoton(
   request: Request,
   url: URL,
   env: Env,
@@ -554,6 +660,41 @@ async function autoInjectKeys(
   userId: string,
   secrets: Record<string, string>,
 ): Promise<boolean> {
+  const backend = await getUserBackend(env, userId);
+  if (backend === "cf") {
+    return autoInjectKeysV2(env, userId, secrets);
+  }
+  return autoInjectKeysPhoton(env, userId, secrets);
+}
+
+async function autoInjectKeysV2(
+  env: Env,
+  userId: string,
+  secrets: Record<string, string>,
+): Promise<boolean> {
+  const targetUrl = `http://user-v2.internal/u/${encodeURIComponent(userId)}/internal/apply-keys`;
+  const injectReq = new Request(targetUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Internal-Token": env.V2_SHARED_TOKEN || "",
+      "X-User-Id": userId,
+    },
+    body: JSON.stringify({ keys: secrets }),
+  });
+  try {
+    const resp = await env.USER_V2.fetch(injectReq);
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function autoInjectKeysPhoton(
+  env: Env,
+  userId: string,
+  secrets: Record<string, string>,
+): Promise<boolean> {
   // Look up the user's container
   const row = await env.DB.prepare(
     "SELECT port FROM user_container WHERE user_id = ? AND status = 'running'"
@@ -682,7 +823,7 @@ async function handleUpdateKeys(
 
 async function handleAdminListUsers(env: Env): Promise<Response> {
   const rows = await env.DB.prepare(
-    `SELECT u.id, u.name, u.email, u.createdAt,
+    `SELECT u.id, u.name, u.email, u.createdAt, u.backend,
             uc.container_name, uc.port, uc.status AS container_status
      FROM user u
      LEFT JOIN user_container uc ON u.id = uc.user_id
@@ -692,12 +833,99 @@ async function handleAdminListUsers(env: Env): Promise<Response> {
     name: string;
     email: string;
     createdAt: string;
+    backend: string | null;
     container_name: string | null;
     port: number | null;
     container_status: string | null;
   }>();
 
   return jsonResponse({ users: rows.results ?? [] });
+}
+
+/**
+ * Admin-only endpoint to flip a user between the V1 (Photon) and V2 (CF)
+ * backend. Pre-flight: if the user has any non-IDLE bot on the current
+ * backend, refuse unless `force=true` is passed in the body. This is
+ * a safety rail; migration tooling in Phase F.4 will orchestrate the
+ * state copy before flipping.
+ */
+async function handleAdminSetBackend(
+  request: Request,
+  env: Env,
+  targetUserId: string,
+): Promise<Response> {
+  let body: { backend?: string; force?: boolean };
+  try {
+    body = await request.json() as { backend?: string; force?: boolean };
+  } catch {
+    return jsonResponse({ error: "Invalid JSON" }, 400);
+  }
+  const target = body.backend === "cf" ? "cf" : body.backend === "photon" ? "photon" : null;
+  if (!target) {
+    return jsonResponse({ error: "backend must be 'photon' or 'cf'" }, 400);
+  }
+  const force = body.force === true;
+
+  // Pre-flight: read current bot state from the user's CURRENT backend.
+  // If bots are running, refuse unless forced.
+  if (!force) {
+    const preflight = await probeBotsIdle(env, targetUserId);
+    if (preflight.checked && !preflight.all_idle) {
+      return jsonResponse({
+        error: "Bots not idle",
+        detail: `Refusing to flip backend while bots are in non-IDLE state. Pass force=true to override. active_states=${JSON.stringify(preflight.states)}`,
+        preflight,
+      }, 409);
+    }
+  }
+
+  await env.DB.prepare(
+    "UPDATE user SET backend = ?, updatedAt = ? WHERE id = ?"
+  ).bind(target, new Date().toISOString(), targetUserId).run();
+
+  return jsonResponse({
+    status: "ok",
+    user_id: targetUserId,
+    backend: target,
+    forced: force,
+  });
+}
+
+/**
+ * Ask the user's currently-active backend for /fn/bots and check whether
+ * any reported bot has state != IDLE. Used as a guard rail before the
+ * backend flip. Best-effort: network errors or missing container count as
+ * "checked: false" so the flip still proceeds if the backend is unreachable.
+ */
+async function probeBotsIdle(
+  env: Env,
+  userId: string,
+): Promise<{ checked: boolean; all_idle: boolean; states: string[] }> {
+  try {
+    const backend = await getUserBackend(env, userId);
+    let resp: Response;
+    if (backend === "cf") {
+      const url = `http://user-v2.internal/u/${encodeURIComponent(userId)}/fn/bots`;
+      resp = await env.USER_V2.fetch(new Request(url, {
+        headers: {
+          "X-Internal-Token": env.V2_SHARED_TOKEN || "",
+          "X-User-Id": userId,
+        },
+      }));
+    } else {
+      const url = `${env.ORCHESTRATOR_ORIGIN}/orch/proxy/${userId}/fn/bots`;
+      resp = await env.NAS_BACKEND.fetch(new Request(url, {
+        headers: { "X-Orch-Token": env.ORCH_TOKEN },
+      }));
+    }
+    if (!resp.ok) return { checked: false, all_idle: true, states: [] };
+    const data = await resp.json() as { bots?: Array<{ state?: string }> };
+    const states = (data.bots ?? []).map((b) => String(b.state ?? "")).filter(Boolean);
+    const all_idle = states.every((s) => s === "IDLE" || s === "ERROR" || s === "");
+    return { checked: true, all_idle, states };
+  } catch {
+    return { checked: false, all_idle: true, states: [] };
+  }
 }
 
 async function handleAdminDeleteUser(env: Env, userId: string): Promise<Response> {

@@ -19,6 +19,8 @@ export interface AdminUser {
   name: string
   email: string
   createdAt: string
+  /** 'photon' (V1) | 'cf' (V2 Cloudflare Container). Null for users created before migration 0006. */
+  backend: 'photon' | 'cf' | null
   container_name: string | null
   port: number | null
   container_status: string | null
@@ -35,6 +37,22 @@ export async function fetchAdminUsers(): Promise<AdminUser[]> {
 
 export async function deleteAdminUser(userId: string): Promise<{ status: string }> {
   return request(`/admin/users/${userId}`, { method: 'DELETE' })
+}
+
+/**
+ * Flip a user between the V1 (Photon) and V2 (Cloudflare Container) backend.
+ * If the user's bots on the current backend aren't IDLE, the server will
+ * return 409 unless `force=true`.
+ */
+export async function setUserBackend(
+  userId: string,
+  backend: 'photon' | 'cf',
+  force = false,
+): Promise<{ status: string; backend: string; forced: boolean }> {
+  return request(`/admin/user/${userId}/backend`, {
+    method: 'POST',
+    body: JSON.stringify({ backend, force }),
+  })
 }
 
 // ── Activity Log ─────────────────────────────────────────────

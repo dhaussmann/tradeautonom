@@ -2931,8 +2931,14 @@ async def dna_positions():
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
+# V2 (Cloudflare Containers) is headless: no per-container UI, no static
+# files baked into the image. The user-facing frontend lives on
+# bot.defitool.de. When V2_HEADLESS=1 (set in the V2 Dockerfile) we skip
+# registering the /ui endpoint. V1 Photon containers don't set the flag
+# and keep serving /ui as before.
+if not os.environ.get("V2_HEADLESS"):
 
-@app.get("/ui")
-async def serve_ui():
-    """Serve the WebUI dashboard."""
-    return FileResponse(_STATIC_DIR / "index.html")
+    @app.get("/ui")
+    async def serve_ui():
+        """Serve the WebUI dashboard (V1 Photon only; V2 is headless)."""
+        return FileResponse(_STATIC_DIR / "index.html")

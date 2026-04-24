@@ -22,6 +22,16 @@
 			"service_id": "019d9287-7110-7172-9dec-2442103640b4"
 		}
 	],
+	// Phase F.3: per-user V2 backend. Routed via service binding so the
+	// user-v2 Worker stays internally reachable without exposing DO IDs.
+	// Users with D1 user.backend='cf' get routed here instead of the NAS
+	// orchestrator. V2_SHARED_TOKEN is set via `wrangler secret put`.
+	"services": [
+		{
+			"binding": "USER_V2",
+			"service": "user-v2"
+		}
+	],
 	"routes": [
 		{ "pattern": "bot.defitool.de/*", "zone_name": "defitool.de" }
 	],

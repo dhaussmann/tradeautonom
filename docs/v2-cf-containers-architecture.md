@@ -1,10 +1,13 @@
 # V2 — Cloudflare-native architecture
 
-Status: **OMS-v2 live (Phases A–E complete), UserContainer-v2 live on
-`user-v2.defitool.de` (Phases F.0–F.2 complete: feasibility proven, baked
-image, Python engine running against OMS-v2, R2 persistence code layered
-in pending manual R2 API token setup)**. V1 (Photon-VM Docker stack)
-continues to run in parallel; no V1 user is routed to V2 yet.
+Status: **OMS-v2 live (Phases A–E complete); UserContainer-v2 live on
+`user-v2.defitool.de`; backend-aware routing live on `bot.defitool.de`
+(Phases F.0–F.3 complete: feasibility proven, headless V2 image deployed,
+Python engine running against OMS-v2, R2 persistence code layered in
+pending manual R2 API token setup, D1 `user.backend` flag + main-Worker
+routing wired through service binding with shared-secret gate)**. V1
+(Photon-VM Docker stack) continues to run in parallel; no existing V1
+user has been flipped to V2.
 
 See `docs/v2-oms-cloudflare-native.md` for OMS-v2 details.
 The UserContainer-v2 implementation lives at
@@ -228,19 +231,87 @@ Status per sub-phase:
   the instance. The module is designed as a strict no-op without creds,
   so shipping the code first is safe.
 
-### Phase F.3 — Main-Worker routing (pending)
+### Phase F.3 — Main-Worker routing (complete)
 
-- D1 migration `0006_add_backend_column.sql`: `ALTER TABLE user ADD
-  COLUMN backend TEXT NOT NULL DEFAULT 'photon';`
-- `deploy/cloudflare/src/index.ts::handleUserApiProxy` gets a
-  `backend === "cf"` branch that calls
-  `env.USER_CONTAINER_V2.fetch(request)` instead of the Photon
-  orchestrator path.
-- Admin UI toggle + migration script (`scripts/migrate_user_to_cf.py`)
-  that stops V1 container, rsyncs `app-data/` to local tmp, tars +
-  uploads to R2, flips the D1 flag.
-- Pre-flight check: block the flip if `/fn/bots` shows any non-IDLE
-  state.
+Live. Users with `user.backend = 'cf'` in D1 route through the USER_V2
+service binding instead of the NAS orchestrator; everyone else stays on
+the V1 path exactly as before.
+
+Pieces:
+- **D1 migration `0006_add_backend_column.sql`**: adds
+  `user.backend TEXT NOT NULL DEFAULT 'photon'`. Applied to
+  `tradeautonom-history` remote DB; all 10 existing users default to
+  `'photon'` so V1 traffic is unchanged.
+- **Main Worker `deploy/cloudflare/src/index.ts`**:
+  - `getUserBackend(userId)` reads the D1 column.
+  - `handleUserApiProxy` splits into `handleUserApiProxyV2` (new) and
+    `handleUserApiProxyPhoton` (unchanged logic, renamed).
+  - `autoInjectKeys` splits the same way. The V2 variant posts
+    `/internal/apply-keys` to the user-v2 Worker via the USER_V2 service
+    binding, authenticated with `X-Internal-Token: $V2_SHARED_TOKEN`.
+  - New admin endpoint `POST /api/admin/user/:id/backend` with a
+    pre-flight that refuses the flip if any bot on the current backend
+    is non-IDLE (unless `force: true`).
+  - `/api/admin/users` now includes the `backend` column.
+- **Main Worker `wrangler.jsonc`**: adds `services: [{ binding: "USER_V2",
+  service: "user-v2" }]` and `V2_SHARED_TOKEN` as a Worker secret.
+- **user-v2 Worker**: shared-secret gate rejects requests missing the
+  `X-Internal-Token` header with 403. Root `/` remains reachable without
+  the header for quick "is the Worker alive?" checks. The header is
+  stripped before forwarding to the container so it never leaks into the
+  Python app.
+- **V2 container image is now headless**: `static/` directory removed
+  from the Dockerfile COPY, and `V2_HEADLESS=1` env var tells
+  `app/server.py` to skip the `/ui` FastAPI endpoint registration. V1
+  containers don't set the flag and keep serving `/ui` as before.
+- **Frontend `AdminView.vue`**: new "Backend" column showing V1 / V2 per
+  user with a "Flip" button. Pre-flight errors propagate from the server
+  and prompt the admin to force if bots are not idle.
+
+Verified end-to-end after deploy:
+- V1 photon users continue to route through the NAS orchestrator.
+  `POST /api/admin/inject-keys` for a real V1 user returned
+  `{"injected": true}` with keys delivered to the Photon container.
+- A disposable test user created with `backend='cf'` was injected via
+  the same admin endpoint; the routing branch correctly delivered keys
+  to the CF Container via the USER_V2 service binding
+  (`{"injected": true}`).
+- `user-v2.defitool.de/u/<user_id>/...` without the shared token → 403,
+  as expected. With the token → continues to work.
+- Main Worker bindings confirmed on deploy: `USER_V2 (user-v2)` appears
+  in the bindings list alongside `NAS_BACKEND`, `OMS_BACKEND`, `DB`.
+
+Phase F.3 explicitly does NOT:
+- Flip any existing user to V2. All users remain `backend='photon'`
+  until migration tooling (F.5) runs.
+- Activate R2 persistence. That's F.4 and needs dashboard-only steps to
+  provision an R2 API token; without it, V2 container state is lost on
+  any recycle.
+
+### Phase F.4 — Activate R2 persistence (pending)
+
+- Dashboard: create an R2 API token with read/write to
+  `tradeautonom-user-state`.
+- `wrangler secret put R2_ACCESS_KEY_ID` and `R2_SECRET` on the user-v2
+  Worker.
+- Inject the creds + user-id into the Container env via `envVars(...)`
+  on the Container DO stub (so each user's container gets its own id).
+- Flip `V2_CLOUD_PERSISTENCE=1` in `user-container.ts`.
+- Redeploy user-v2 and verify a restart preserves `/app/data/`.
+
+### Phase F.5 — Migration tooling (pending)
+
+- `scripts/migrate_user_to_cf.py`:
+  1. Query `GET /fn/bots` via the current (V1) orchestrator; abort if
+     any bot is non-IDLE.
+  2. Stop the V1 container via the orchestrator.
+  3. rsync `/opt/tradeautonom-v3/data-<user_id>/app-data/` → local tmp.
+  4. Tar + gzip → upload as `s3://tradeautonom-user-state/<user_id>.tar.gz`.
+  5. Call `POST /api/admin/user/:id/backend {backend:"cf"}` (which now
+     routes through V2).
+  6. The first request after the flip triggers `restore_sync()` on the
+     fresh V2 container and the user is up.
+- Dry-run mode that previews without performing the stop / flip.
 
 ### Phase F.4+ — Canary rollout + decommissioning
 

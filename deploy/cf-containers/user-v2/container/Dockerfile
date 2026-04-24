@@ -41,14 +41,18 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # (boto3 is ~13 MB; cheap to include even before F.2 is wired up.)
 RUN pip install --no-cache-dir boto3==1.35.0
 
-# App code — exactly the V1 layout.
+# App code. V2 is HEADLESS — no static/ directory, no /ui route. The
+# user-facing Vue SPA lives on bot.defitool.de (see deploy/cloudflare/).
+# app/server.py skips the /ui registration when V2_HEADLESS=1.
 COPY app/ /app/app/
-COPY static/ /app/static/
 COPY main.py /app/main.py
 
 # Phase F.2 entrypoint: restores /app/data from R2 on cold start (no-op on V1).
 COPY deploy/cf-containers/user-v2/container/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Signal to app/server.py to skip the /ui static-file endpoint.
+ENV V2_HEADLESS=1
 
 EXPOSE 8000
 
