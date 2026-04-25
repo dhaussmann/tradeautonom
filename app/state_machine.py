@@ -437,6 +437,13 @@ class StateMachine:
             with open(self._STATE_FILE, "w") as fh:
                 json.dump(data, fh, indent=2)
             logger.debug("Saved fn position state to %s", self._STATE_FILE)
+            # Phase F.4 M3.C.1: position state changed (entry/exit/transition) —
+            # push to R2 promptly so a recycle doesn't strand the position.
+            try:
+                from app.cloud_persistence import request_flush_soon
+                request_flush_soon(reason=f"event:position_save:{self._bot_id or 'fn'}")
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("Failed to save fn position state: %s", exc)
 

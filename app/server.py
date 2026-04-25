@@ -2638,6 +2638,13 @@ async def auth_setup(body: dict):
     await _init_exchange_clients()
     _save_vault_session(password)
     logger.info("Auth setup complete — vault unlocked")
+    # Phase F.4 M3.C.1: brand-new auth.json + secrets.enc — push to R2 now
+    # so a recycle right after setup doesn't lose the user's password.
+    try:
+        from app.cloud_persistence import request_flush_soon
+        request_flush_soon(reason="event:auth_setup")
+    except Exception:
+        pass
     return {"status": "ok", "unlocked": True}
 
 
@@ -2696,6 +2703,12 @@ async def internal_apply_keys(body: dict):
             secrets.update({k: v for k, v in keys.items() if k in _MANAGED_KEYS and v})
             _save_secrets_encrypted(secrets, _current_password)
             logger.info("Keys re-injected + saved to secrets.enc — exchanges=%s", list(_exchange_clients.keys()))
+            # Phase F.4 M3.C.1: secrets.enc changed — push to R2 now.
+            try:
+                from app.cloud_persistence import request_flush_soon
+                request_flush_soon(reason="event:keys_reinject")
+            except Exception:
+                pass
         else:
             logger.info("Keys re-injected (vault was unlocked, no password for secrets.enc) — exchanges=%s", list(_exchange_clients.keys()))
         return {"status": "ok", "already_unlocked": True, "reinjected": True, "exchanges": list(_exchange_clients.keys())}
@@ -2953,6 +2966,12 @@ async def update_keys(updates: dict):
     _save_secrets_encrypted(secrets, _current_password)
     _reinit_exchange_clients()
     logger.info("API keys updated: %s", changed)
+    # Phase F.4 M3.C.1: secrets.enc changed — push to R2 now.
+    try:
+        from app.cloud_persistence import request_flush_soon
+        request_flush_soon(reason=f"event:keys_update:{','.join(changed)}")
+    except Exception:
+        pass
     return {"status": "ok", "changed": changed}
 
 

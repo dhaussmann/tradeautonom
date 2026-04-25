@@ -293,58 +293,130 @@ async def start_background_flush() -> Optional[asyncio.Task]:
     return task
 
 
+# M3.C.3: serialize flushes so an event-triggered call doesn't race with
+# the periodic loop. Without this, two concurrent uploads of nearly-
+# identical tars are wasteful and can confuse the dedup signature.
+_flush_lock = asyncio.Lock()
+
+
 async def flush(reason: str = "periodic") -> bool:
-    """Tar /app/data/ and upload via HTTP POST. Returns True if upload happened."""
+    """Tar /app/data/ and upload via HTTP POST. Returns True if upload happened.
+
+    Acquires _flush_lock so only one upload runs at a time. Caller is
+    responsible for not awaiting this from a critical hot path — use
+    request_flush_soon() for fire-and-forget event triggers.
+    """
     _Config.load()
     if not _Config.enabled:
         return False
     if not _all_creds_present():
         return False
-    try:
-        buf = _make_tarball()
-    except Exception as exc:
-        logger.warning("cloud_persistence: tar failed (%s) — flush aborted", exc)
-        return False
-    if buf is None:
-        return False
 
-    body = buf.getvalue()
-    size = len(body)
-    if size == 0:
-        return False
+    async with _flush_lock:
+        try:
+            buf = _make_tarball()
+        except Exception as exc:
+            logger.warning("cloud_persistence: tar failed (%s) — flush aborted", exc)
+            return False
+        if buf is None:
+            return False
 
-    url = f"{_endpoint_base()}/__state/flush?user_id={_Config.user_id}"
+        body = buf.getvalue()
+        size = len(body)
+        if size == 0:
+            return False
+
+        url = f"{_endpoint_base()}/__state/flush?user_id={_Config.user_id}"
+        try:
+            # Run the blocking HTTP in a thread pool so we don't block the loop.
+            loop = asyncio.get_event_loop()
+            resp_code = await loop.run_in_executor(None, _http_post, url, body)
+            if 200 <= resp_code < 300:
+                logger.info("cloud_persistence: flush ok reason=%s size=%d http=%d", reason, size, resp_code)
+                # Update dedup signature so periodic loop skips on next tick
+                global _last_flush_signature
+                _last_flush_signature = _signature_of(_DATA_DIR)
+                return True
+            logger.warning("cloud_persistence: flush HTTP %s — size=%d reason=%s", resp_code, size, reason)
+            return False
+        except Exception as exc:
+            logger.warning("cloud_persistence: flush upload failed (%s, %d bytes, reason=%s)", exc, size, reason)
+            return False
+
+
+def request_flush_soon(reason: str = "event") -> None:
+    """Fire-and-forget event-triggered flush.
+
+    Schedules a flush in the running event loop without blocking the
+    caller. Safe to call from anywhere a state-changing event happens
+    (auth setup/unlock, bot config save, position update). If
+    persistence is disabled or no event loop is running, this is a
+    no-op — never raises.
+    """
     try:
-        # Run the blocking HTTP in a thread pool so we don't block the loop.
-        loop = asyncio.get_event_loop()
-        resp_code = await loop.run_in_executor(None, _http_post, url, body)
-        if 200 <= resp_code < 300:
-            logger.info("cloud_persistence: flush ok reason=%s size=%d http=%d", reason, size, resp_code)
-            return True
-        logger.warning("cloud_persistence: flush HTTP %s — size=%d reason=%s", resp_code, size, reason)
-        return False
-    except Exception as exc:
-        logger.warning("cloud_persistence: flush upload failed (%s, %d bytes, reason=%s)", exc, size, reason)
-        return False
+        if not _Config.enabled:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return  # no loop in this thread — drop
+        if not loop.is_running():
+            return
+        loop.create_task(flush(reason=reason))
+    except Exception:
+        # Defensive: under no circumstances should a save-path failure
+        # propagate up and break the user's actual operation.
+        pass
+
+
+# M3.C.2: retry HTTP POST with exponential backoff on transient errors.
+# The Cloudflare edge can occasionally return 5xx or drop the TCP
+# connection; we retry up to 3 times with 1s/2s/4s backoff. 4xx (other
+# than 429) are not retried — they signal a config/code problem.
+_HTTP_POST_MAX_ATTEMPTS = 3
+_HTTP_POST_BACKOFF_S = (1.0, 2.0, 4.0)
+
+
+def _is_retriable_status(code: int) -> bool:
+    """5xx or 429 are worth retrying; everything else is permanent."""
+    return code == 429 or 500 <= code < 600
 
 
 def _http_post(url: str, body: bytes) -> int:
-    """Blocking HTTP POST with tar body. Returns status code."""
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/gzip",
-            "X-Internal-Token": _Config.shared_token,
-            "User-Agent": _OUTBOUND_USER_AGENT,
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status
-    except urllib.error.HTTPError as exc:
-        return exc.code
+    """Blocking HTTP POST with tar body. Retries on 5xx/429/network errors.
+
+    Returns the final HTTP status code (or 0 for repeated network
+    errors). Only the periodic flush loop and the diagnostic endpoint
+    call this directly — callers should typically use flush() above.
+    """
+    last_code = 0
+    for attempt in range(1, _HTTP_POST_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/gzip",
+                "X-Internal-Token": _Config.shared_token,
+                "User-Agent": _OUTBOUND_USER_AGENT,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            last_code = exc.code
+            if not _is_retriable_status(exc.code):
+                return exc.code
+        except Exception:
+            last_code = 0  # network error
+        if attempt < _HTTP_POST_MAX_ATTEMPTS:
+            try:
+                import time as _time
+                _time.sleep(_HTTP_POST_BACKOFF_S[attempt - 1])
+            except Exception:
+                pass
+    return last_code
 
 
 def _http_post_with_body(url: str, body: bytes) -> tuple[int, str, str]:

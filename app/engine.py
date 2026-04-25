@@ -233,6 +233,14 @@ class FundingArbEngine:
             with open(self._timer_file, "w") as fh:
                 json.dump(data, fh, indent=2)
             logger.debug("Saved timer state to %s", self._timer_file)
+            # Phase F.4 M3.C.1: timer state changed — push to R2 soon. The
+            # _flush_lock + _signature_of dedup keeps this from spamming
+            # the Worker if multiple timer events fire in quick succession.
+            try:
+                from app.cloud_persistence import request_flush_soon
+                request_flush_soon(reason=f"event:timer_save:{self.config.job_id or 'fn'}")
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("Failed to save timer state: %s", exc)
 

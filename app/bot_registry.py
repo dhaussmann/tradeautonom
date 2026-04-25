@@ -370,6 +370,13 @@ class BotRegistry:
         with open(config_path, "w") as fh:
             json.dump(data, fh, indent=2)
         logger.debug("Saved config for bot '%s'", bot_id)
+        # Phase F.4 M3.C.1: trigger an event-driven flush so the new
+        # config lands in R2 immediately. Fire-and-forget; no-op on V1.
+        try:
+            from app.cloud_persistence import request_flush_soon
+            request_flush_soon(reason=f"event:bot_config_save:{bot_id}")
+        except Exception:
+            pass
 
     def _load_config(self, bot_id: str) -> EngineConfig:
         """Load bot config from disk."""
