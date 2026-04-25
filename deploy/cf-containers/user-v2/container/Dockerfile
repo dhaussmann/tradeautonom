@@ -52,7 +52,7 @@ RUN chmod +x /app/entrypoint.sh
 ENV V2_HEADLESS=1
 
 # Build cache-bust marker for Phase F.4 roll-out
-ENV V2_BUILD_TAG=blockC-real-taker-price-v15
+ENV V2_BUILD_TAG=blockD-plain-logs-v16
 
 EXPOSE 8000
 
