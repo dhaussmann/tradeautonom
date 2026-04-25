@@ -113,8 +113,28 @@ export class VariationalOms extends DurableObject<Env> {
 
   private async pollStats(): Promise<void> {
     if (this.trackedSymbols.size === 0) return;
-    const resp = await fetch(STATS_URL, {
-      headers: { "User-Agent": "tradeautonom-oms-v2/0.1" },
+    // Cache-bust the public stats endpoint. Variational's CF setup serves the
+    // response with `cache-control: public, s-maxage=60, max-age=30`, which
+    // means an unmodified GET hits the edge cache and returns up to 60-second
+    // stale snapshots — far worse than our 1.2s polling rhythm. Three layers
+    // of bypass:
+    //   1. `?_=<ts>` query param — CF treats unique URLs as different cache
+    //      keys, so each poll is a MISS and reaches origin.
+    //   2. `Cache-Control: no-cache` / `Pragma: no-cache` — RFC-compliant
+    //      revalidation hint to any intermediate proxy that respects them.
+    //   3. `cf.cacheTtl: 0` / `cacheEverything: false` — explicit instruction
+    //      to the Workers fetch layer not to consult its own cache.
+    // Variational's origin still only refreshes ~every 30-60s on its end, so
+    // this brings us as close to that native rate as possible without
+    // changing the upstream API contract.
+    const cacheBustUrl = `${STATS_URL}?_=${Date.now()}`;
+    const resp = await fetch(cacheBustUrl, {
+      headers: {
+        "User-Agent": "tradeautonom-oms-v2/0.1",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+      },
+      cf: { cacheTtl: 0, cacheEverything: false },
     });
     if (!resp.ok) {
       this.pollFailures += 1;
