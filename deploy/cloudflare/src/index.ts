@@ -698,19 +698,37 @@ async function handleOmsProxy(
   url: URL,
   env: Env,
 ): Promise<Response> {
+  // V2 migration: route Frontend's /api/oms/* (Cross-Exchange Arbitrage view
+  // and arb config) to the V2 OMS Worker (oms-v2.defitool.de) instead of the
+  // V1 NAS ta-monitor service on port 8099.
+  //
+  // The V1 service developed a Nado bid-staleness bug for many symbols
+  // (BTC, ETH, SOL, MON, ASTER, SUI, PUMP and others): the ask side updates
+  // live but the bid side is frozen at an old higher value, producing
+  // physically-impossible bid > ask states. The arb scanner happily turns
+  // those phantom spreads into "opportunities" with absurd profits (5%+),
+  // which is what the Cross-Exchange Arbitrage view was showing.
+  //
+  // OMS-v2 has correct, live Nado bid/ask via the NadoRelayContainer
+  // sidecar and is the same backend the V2 user-containers already poll
+  // for trading decisions (FN_OPT_SHARED_MONITOR_URL on user-v2). Routing
+  // the Frontend through the same backend eliminates the inconsistency.
+  //
+  // Endpoint shape (/arb/opportunities, /arb/config) is identical between
+  // V1 and V2 so this is a drop-in change. V2 returns a few extra config
+  // fields (excluded_tokens, variational fees) which the Frontend
+  // ArbConfig type ignores via TS structural typing.
+  //
+  // env.OMS_BACKEND (the V1 VPC service binding) is no longer used — leave
+  // it bound for now in case we need to revert quickly.
   const omsPath = url.pathname.replace(/^\/api\/oms/, "") + url.search;
-  const omsUrl = `${env.ORCHESTRATOR_ORIGIN.replace(/:\d+$/, "")}:8099${omsPath}`;
-
-  const proxyHeaders = new Headers();
-  proxyHeaders.set("Accept", "application/json");
-
-  const proxyRequest = new Request(omsUrl, {
-    method: "GET",
-    headers: proxyHeaders,
-  });
+  const omsUrl = `https://oms-v2.defitool.de${omsPath}`;
 
   try {
-    const response = await env.OMS_BACKEND.fetch(proxyRequest);
+    const response = await fetch(omsUrl, {
+      method: "GET",
+      headers: { "Accept": "application/json" },
+    });
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set("Access-Control-Allow-Origin", "*");
     responseHeaders.set("Cache-Control", "no-store");
@@ -720,7 +738,7 @@ async function handleOmsProxy(
       headers: responseHeaders,
     });
   } catch (err) {
-    return jsonResponse({ error: "OMS unreachable", detail: String(err) }, 502);
+    return jsonResponse({ error: "OMS-v2 unreachable", detail: String(err) }, 502);
   }
 }
 
