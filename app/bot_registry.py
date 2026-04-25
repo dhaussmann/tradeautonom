@@ -10,6 +10,7 @@ Bot configs are persisted to data/bots/{bot_id}/config.json.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from typing import Any, Optional
 from app.engine import EngineConfig, FundingArbEngine
 from app.shared_data_cache import SharedDataCache
 from app.shared_auth_ws_manager import SharedWebSocketManagerRegistry
+from app.symbol_resolver import resolve_variational_symbol
 
 logger = logging.getLogger("tradeautonom.bot_registry")
 
@@ -152,6 +154,49 @@ class BotRegistry:
 
     # ── CRUD ───────────────────────────────────────────────────────────
 
+    async def _pre_correct_variational_symbol(
+        self, bot_id: str, config: EngineConfig
+    ) -> bool:
+        """Phase F.4 / M9: rewrite stale Variational symbols on the config in
+        place BEFORE the registry subscribes the bot to feeds.
+
+        This must run before ``_subscribe_bot_symbols`` and ``_oms_data_layer.add_symbols``,
+        otherwise the DataLayer / OMS subscribes to the stale symbol and never
+        receives orderbook data.
+
+        Returns True if any field was corrected, so the caller can decide whether
+        to persist the updated config to disk.
+        """
+        for field, exch in (
+            ("instrument_a", config.long_exchange),
+            ("instrument_b", config.short_exchange),
+        ):
+            if exch != "variational":
+                continue
+            symbol = getattr(config, field)
+            try:
+                resolved, was_corrected, source = await resolve_variational_symbol(
+                    requested_symbol=symbol,
+                    oms_url=self._oms_url
+                    or getattr(config, "fn_opt_shared_monitor_url", "")
+                    or None,
+                    variational_client=self._clients.get("variational"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "BotRegistry: Variational symbol resolver errored for %s/%s: %s",
+                    bot_id, symbol, exc,
+                )
+                continue
+            if was_corrected:
+                setattr(config, field, resolved)
+                logger.warning(
+                    "BotRegistry: bot %s %s auto-corrected: %s → %s (source=%s)",
+                    bot_id, field, symbol, resolved, source,
+                )
+                return True
+        return False
+
     async def create_bot(self, bot_id: str, config: EngineConfig) -> FundingArbEngine:
         """Create a new bot, persist its config, start its engine."""
         if bot_id in self._bots:
@@ -162,6 +207,10 @@ class BotRegistry:
         # Ensure shared resources are initialized
         if self._shared_data_cache is None:
             await self._init_shared_resources()
+
+        # Phase F.4 / M9: rewrite stale Variational symbols before any
+        # subscription happens, so DataLayer/OMS subscribe to the live one.
+        await self._pre_correct_variational_symbol(bot_id, config)
 
         config.job_id = bot_id
         self._save_config(bot_id, config)
@@ -195,7 +244,8 @@ class BotRegistry:
             activity_forwarder=self._activity_forwarder,
             shared_data_cache=self._shared_data_cache,
             shared_ws_registry=self._shared_ws_registry,
-            oms_data_layer=getattr(self, '_oms_data_layer', None)
+            oms_data_layer=getattr(self, '_oms_data_layer', None),
+            persist_config_callback=self._save_config,
         )
 
         await engine.start()
@@ -288,6 +338,44 @@ class BotRegistry:
         if self._shared_data_cache is None:
             await self._init_shared_resources()
 
+        # Phase F.4 / M9: rewrite stale Variational symbols on every restored
+        # config before any auth-WS or OMS subscription happens. Without this,
+        # subscriptions go out for the (stale) symbol and never receive data.
+        # Persists the corrected config back to disk so the next restart loads
+        # the live symbol directly.
+        #
+        # Wrapped in a hard 10s total budget per bot so a stuck OMS lookup
+        # never blocks BotRegistry startup. If the budget fires, we just keep
+        # the bot's existing (possibly stale) symbol — the existing feed-error
+        # path will still surface the issue, just without auto-healing.
+        for bot_id, config in configs:
+            try:
+                corrected = await asyncio.wait_for(
+                    self._pre_correct_variational_symbol(bot_id, config),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "BotRegistry: Variational symbol auto-correction timed out for %s — "
+                    "skipping (bot will start with current config)",
+                    bot_id,
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "BotRegistry: Variational symbol auto-correction errored for %s: %s",
+                    bot_id, exc,
+                )
+                continue
+            if corrected:
+                try:
+                    self._save_config(bot_id, config)
+                except Exception as exc:
+                    logger.warning(
+                        "BotRegistry: failed to persist auto-corrected config for %s: %s",
+                        bot_id, exc,
+                    )
+
         # Subscribe all symbols to auth WS managers
         for bot_id, config in configs:
             await self._subscribe_bot_symbols(bot_id, config)
@@ -325,7 +413,8 @@ class BotRegistry:
                     activity_forwarder=self._activity_forwarder,
                     shared_data_cache=self._shared_data_cache,
                     shared_ws_registry=self._shared_ws_registry,
-                    oms_data_layer=getattr(self, '_oms_data_layer', None)
+                    oms_data_layer=getattr(self, '_oms_data_layer', None),
+                    persist_config_callback=self._save_config,
                 )
 
                 await engine.start()

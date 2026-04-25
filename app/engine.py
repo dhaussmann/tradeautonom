@@ -34,6 +34,7 @@ from app.state_machine import (
     MakerTakerConfig,
     StateMachine,
 )
+from app.symbol_resolver import resolve_variational_symbol
 
 logger = logging.getLogger("tradeautonom.engine")
 
@@ -172,6 +173,7 @@ class FundingArbEngine:
         shared_data_cache: Any | None = None,
         shared_ws_registry: Any | None = None,
         oms_data_layer: DataLayer | None = None,
+        persist_config_callback: Any | None = None,
     ) -> None:
         self.config = config
         self._clients = clients
@@ -181,6 +183,11 @@ class FundingArbEngine:
         self._shared_data_cache = shared_data_cache
         self._shared_ws_registry = shared_ws_registry
         self._oms_data_layer = oms_data_layer  # Shared OMS DataLayer
+
+        # Optional callback to persist config changes (e.g. after auto-correcting
+        # a stale Variational symbol on bot start). Signature: fn(bot_id, config).
+        # When None, in-memory config changes are not written to disk.
+        self._persist_config_callback = persist_config_callback
 
         # Determine which symbol maps to which exchange
         self._symbols_map = {
@@ -343,6 +350,11 @@ class FundingArbEngine:
         Optionally accepts a shared DataLayer (for multi-job setups).
         When using shared resources (shared_data_cache, shared_ws_registry), 
         the OMS DataLayer is used from BotRegistry.
+
+        Note: Variational symbol auto-correction (Phase F.4 / M9) runs in
+        ``BotRegistry`` BEFORE engine creation so DataLayer / OMS subscribe to
+        the live symbol from the start. We don't re-run the resolver here to
+        avoid an extra OMS round-trip on every container boot.
         """
         if self._started:
             return
@@ -539,6 +551,14 @@ class FundingArbEngine:
             self.config.instrument_b = instrument_b
             self._symbols_map[short_exch] = instrument_b
             logger.info("Instrument B overridden: %s", instrument_b)
+
+        # Phase F.4 / M9: auto-correct stale Variational symbols.
+        # Variational rotates funding intervals on listings (e.g. DOGE moves from
+        # 1h funding "P-DOGE-USDC-3600" to 8h "P-DOGE-USDC-28800"). Bots created
+        # before the rotation get stuck with no orderbook feed. Resolve against
+        # the live OMS-v2 mapping (or fall back to direct Variational stats) and
+        # repoint to the current symbol so the bot can self-heal.
+        await self._auto_correct_variational_symbol(long_exch, short_exch)
 
         # Step 0a: Verify exchange credentials (e.g. Variational JWT not expired)
         for exch_name in (long_exch, short_exch):
@@ -1447,6 +1467,75 @@ class FundingArbEngine:
         elif exchange == self.config.short_exchange:
             return self.config.instrument_b
         raise ValueError(f"Unknown exchange for symbol lookup: {exchange}")
+
+    async def _auto_correct_variational_symbol(
+        self, long_exch: str, short_exch: str
+    ) -> None:
+        """Detect & correct stale Variational symbols on bot start.
+
+        If either leg of the bot is on Variational and its symbol no longer maps
+        to a live feed (because Variational changed the funding interval for that
+        token), look up the current symbol via OMS-v2 ``/tracked`` and update
+        config + ``_symbols_map`` in place. The change is persisted to disk via
+        ``_persist_config_callback`` if provided so it survives the next restart.
+
+        Best-effort: any failure during resolution leaves the requested symbol
+        unchanged so the existing feed-error path can surface the issue.
+        """
+        # Determine which side, if any, is Variational.
+        if long_exch == "variational":
+            field = "instrument_a"
+            symbol = self.config.instrument_a
+            side_exch = long_exch
+        elif short_exch == "variational":
+            field = "instrument_b"
+            symbol = self.config.instrument_b
+            side_exch = short_exch
+        else:
+            return  # no Variational leg
+
+        try:
+            resolved, was_corrected, source = await resolve_variational_symbol(
+                requested_symbol=symbol,
+                oms_url=getattr(self.config, "fn_opt_shared_monitor_url", "") or None,
+                variational_client=self._clients.get("variational"),
+            )
+        except Exception as exc:
+            # Resolver should never raise, but be defensive: log and continue.
+            logger.warning(
+                "Variational symbol auto-correction errored for %s: %s",
+                symbol,
+                exc,
+            )
+            return
+
+        if not was_corrected:
+            return
+
+        # Update in-memory config and symbol map.
+        setattr(self.config, field, resolved)
+        self._symbols_map[side_exch] = resolved
+
+        msg = (
+            f"Variational symbol auto-corrected: {symbol} → {resolved} "
+            f"(source={source}; symbol no longer listed at requested funding "
+            f"interval, using current variant)"
+        )
+        self.log_activity("ENGINE", msg, level="warn")
+        logger.warning("Bot %s: %s", self.config.job_id, msg)
+
+        # Best-effort persistence: a stale on-disk config will re-trigger
+        # correction on next run, but persisting now means subsequent bot
+        # listings, status payloads, and reloads show the live symbol.
+        if self._persist_config_callback is not None:
+            try:
+                self._persist_config_callback(self.config.job_id, self.config)
+            except Exception as exc:
+                logger.warning(
+                    "Bot %s: failed to persist auto-corrected config: %s",
+                    self.config.job_id,
+                    exc,
+                )
 
     def _log_trade(self, action: str, result: ExecutionResult) -> None:
         """Append a trade entry to the log."""
