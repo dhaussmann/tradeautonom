@@ -60,6 +60,14 @@ _DATA_DIR = Path(os.environ.get("CLOUD_PERSISTENCE_DATA_DIR", "/app/data"))
 # frequently than this we coalesce — one upload at the end of the window.
 DEFAULT_FLUSH_INTERVAL_S = 30.0
 
+# User-Agent for outbound HTTPS calls to the user-v2 Worker. Cloudflare's
+# Bot-Fight-Mode on the defitool.de zone returns "error code: 1010" when
+# Python's default `Python-urllib/3.x` UA is detected, which blocks the
+# request before it reaches our Worker. A neutral non-bot UA bypasses
+# the BFM signature check while still letting the Worker authenticate
+# us via the X-Internal-Token header.
+_OUTBOUND_USER_AGENT = "tradeautonom-container/1.0"
+
 # Files under /app/data/ we refuse to include in the snapshot, even if
 # present. Keeps each user's tarball clean of logs, tmp, and other data
 # that doesn't belong in state restore.
@@ -174,6 +182,7 @@ def restore_sync() -> None:
     try:
         req = urllib.request.Request(url, headers={
             "X-Internal-Token": _Config.shared_token,
+            "User-Agent": _OUTBOUND_USER_AGENT,
         })
         with urllib.request.urlopen(req, timeout=30) as resp:
             status = resp.status
@@ -260,6 +269,7 @@ def _http_post(url: str, body: bytes) -> int:
         headers={
             "Content-Type": "application/gzip",
             "X-Internal-Token": _Config.shared_token,
+            "User-Agent": _OUTBOUND_USER_AGENT,
         },
     )
     try:
@@ -283,6 +293,7 @@ def _http_post_with_body(url: str, body: bytes) -> tuple[int, str, str]:
         headers={
             "Content-Type": "application/gzip",
             "X-Internal-Token": _Config.shared_token,
+            "User-Agent": _OUTBOUND_USER_AGENT,
         },
     )
     try:
