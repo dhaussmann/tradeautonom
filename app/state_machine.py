@@ -1644,10 +1644,11 @@ class StateMachine:
                                                 continue
                                             raise
                                     t_id = t_resp.get("id") or t_resp.get("order_id") or t_resp.get("digest")
-                                    t_filled = await self._check_taker_fill(taker_client, t_id, t_resp)
+                                    t_filled, t_avg = await self._check_taker_fill(taker_client, t_id, t_resp)
                                     if t_filled > 0:
                                         mid_loop_hedged += Decimal(str(t_filled))
-                                        self._log("FILL", f"Chunk {chunk_index}: mid-loop hedge FILLED qty={t_filled:.6f} (total mid-loop hedged={mid_loop_hedged})")
+                                        ap_str = f" @ ${t_avg:.4f}" if t_avg > 0 else ""
+                                        self._log("FILL", f"Chunk {chunk_index}: mid-loop hedge FILLED qty={t_filled:.6f}{ap_str} (total mid-loop hedged={mid_loop_hedged})")
                                     else:
                                         self._log("FILL", f"Chunk {chunk_index}: mid-loop hedge NOT FILLED — will retry at chunk end", level="warn")
                             except Exception as hedge_exc:
@@ -1755,11 +1756,15 @@ class StateMachine:
 
                 taker_order_id = taker_resp.get("id") or taker_resp.get("order_id") or taker_resp.get("digest")
                 chunk.taker_order_id = taker_order_id
+                # Provisional: set chunk.taker_price to the IOC limit. We
+                # overwrite below once we know the real fill VWAP.
                 chunk.taker_price = float(taker_price)
                 self._log("ORDER", f"Chunk {chunk_index}: taker IOC placed → id={taker_order_id}")
 
-                # Check taker fill (WS fill-event path)
-                taker_filled = await self._check_taker_fill(taker_client, taker_order_id, taker_resp)
+                # Check taker fill (WS fill-event path) — returns (qty, avg_price)
+                taker_filled, taker_avg_price = await self._check_taker_fill(
+                    taker_client, taker_order_id, taker_resp,
+                )
 
                 # ── Position-delta fallback: if WS fill events missed the fill,
                 # verify via position size change (works for all exchanges: Extended/GRVT/Nado
@@ -1776,10 +1781,22 @@ class StateMachine:
                         taker_filled = float(delta)
                         self._log("FILL", f"Chunk {chunk_index}: taker partial fill via position delta: Δ={delta:.6f} of {float(taker_hedge_qty):.6f}", level="warn")
 
+                # Overwrite chunk.taker_price with real VWAP if exchange/WS
+                # gave us one. Otherwise keep the IOC-limit fallback (and
+                # surface that we don't have a real price in the log).
+                if taker_avg_price > 0:
+                    chunk.taker_price = float(taker_avg_price)
+                    fill_price_note = f"@ ${taker_avg_price:.4f} (real VWAP)"
+                else:
+                    fill_price_note = (
+                        f"@ ${float(taker_price):.4f} (IOC limit — exchange did "
+                        f"not report avg fill price)"
+                    )
+
                 chunk.taker_filled_qty += taker_filled  # add to mid-loop hedged amount
 
                 if taker_filled > 0:
-                    self._log("FILL", f"Chunk {chunk_index}: TAKER FILLED qty={taker_filled:.6f} (total chunk taker={chunk.taker_filled_qty:.6f})")
+                    self._log("FILL", f"Chunk {chunk_index}: TAKER FILLED qty={taker_filled:.6f} {fill_price_note} (total chunk taker={chunk.taker_filled_qty:.6f})")
                 else:
                     chunk.error = "Taker IOC not filled — needs emergency unwind of maker fill"
                     self._log("FILL", f"Chunk {chunk_index}: TAKER NOT FILLED — emergency unwind needed", level="error")
@@ -1796,9 +1813,29 @@ class StateMachine:
         chunk.end_ts = time.time()
 
         duration_ms = (chunk.end_ts - chunk.start_ts) * 1000
-        self._log("CHUNK", f"Chunk {chunk_index} DONE: maker={chunk.maker_filled_qty:.6f}@{chunk.maker_price:.2f} taker={chunk.taker_filled_qty:.6f}@{chunk.taker_price:.2f} ({duration_ms:.0f}ms)")
+
+        # Realised cross-venue spread (long_price - short_price) / short_price * 100.
+        # Mirrors what the BBO/Depth Spread gates measured before placement so
+        # the user can see whether the trade hit the planned spread or drifted.
+        realised_spread_str = ""
+        if chunk.maker_filled_qty > 0 and chunk.taker_filled_qty > 0 and chunk.maker_price > 0 and chunk.taker_price > 0:
+            if config.maker_side == "buy":
+                long_p, short_p = chunk.maker_price, chunk.taker_price
+            else:
+                long_p, short_p = chunk.taker_price, chunk.maker_price
+            if short_p > 0:
+                realised_spread = (long_p - short_p) / short_p * 100
+                realised_spread_str = f", realised spread {realised_spread:+.4f}%"
+
+        self._log(
+            "CHUNK",
+            f"Chunk {chunk_index} DONE: maker={chunk.maker_filled_qty:.6f} @ "
+            f"${chunk.maker_price:.4f} on {config.maker_exchange}, "
+            f"taker={chunk.taker_filled_qty:.6f} @ ${chunk.taker_price:.4f} on "
+            f"{config.taker_exchange}{realised_spread_str} ({duration_ms:.0f}ms)",
+        )
         logger.info(
-            "Chunk %d done: maker=%.6f@%.2f taker=%.6f@%.2f (%.1fms)",
+            "Chunk %d done: maker=%.6f@%.4f taker=%.6f@%.4f (%.1fms)",
             chunk_index, chunk.maker_filled_qty, chunk.maker_price,
             chunk.taker_filled_qty, chunk.taker_price,
             duration_ms,
@@ -2081,7 +2118,7 @@ class StateMachine:
             )
 
             repair_id = resp.get("id") or resp.get("order_id") or resp.get("digest")
-            repair_filled = await self._check_taker_fill(taker_client, repair_id, resp)
+            repair_filled, _repair_avg = await self._check_taker_fill(taker_client, repair_id, resp)
 
             # Belt-and-suspenders: verify fill via position delta
             try:
@@ -2219,6 +2256,24 @@ class StateMachine:
         """Sum all WS fill events for a given order_id."""
         fills = self._fill_events.get(str(order_id), [])
         return sum(f.get("filled_qty", 0) for f in fills)
+
+    def _get_ws_filled_qty_and_vwap(self, order_id: str) -> tuple[float, float]:
+        """Compute (total_filled_qty, vwap_fill_price) from WS fill events.
+
+        Used by _check_taker_fill to capture the *actual* fill price (not the
+        IOC limit). Returns (0.0, 0.0) when no fills are seen yet.
+        """
+        fills = self._fill_events.get(str(order_id), [])
+        total_qty = 0.0
+        notional = 0.0
+        for f in fills:
+            q = float(f.get("filled_qty", 0) or 0)
+            p = float(f.get("price", 0) or 0)
+            if q > 0 and p > 0:
+                total_qty += q
+                notional += q * p
+        vwap = (notional / total_qty) if total_qty > 0 else 0.0
+        return total_qty, vwap
 
     # ── Fill waiting ──────────────────────────────────────────────────
 
@@ -2435,43 +2490,63 @@ class StateMachine:
                 self._log("DRIFT", f"Drift monitor: poll error ({exc})", level="warn")
                 logger.debug("Drift monitor poll error: %s", exc)
 
-    async def _check_taker_fill(self, client, order_id: str | None, resp: dict) -> float:
+    async def _check_taker_fill(
+        self, client, order_id: str | None, resp: dict,
+    ) -> tuple[float, float]:
         """Check taker IOC fill. WS-first with short timeout, REST as final fallback.
 
         IOC orders fill instantly, so WS events typically arrive within 100ms.
+
+        Returns (filled_qty, avg_price). avg_price is 0.0 when the exchange
+        did not report a fill price (e.g. Nado's order-status query only
+        returns filled_qty, not the VWAP). Callers should fall back to a
+        sensible price (typically the IOC limit) when avg_price is 0.
         """
-        # Some exchanges return traded_qty directly in the IOC response
+        # Some exchanges return traded_qty directly in the IOC response.
+        # Extended also returns avg_price right there for market orders.
         if resp.get("traded_qty", 0) > 0:
-            return float(resp["traded_qty"])
+            qty = float(resp["traded_qty"])
+            ap = float(resp.get("avg_price", 0) or 0)
+            return qty, ap
 
         oid = str(order_id) if order_id else None
 
         # For exchanges where IOC success = filled (e.g. NADO)
-        # Retry up to 5× with 500ms delay — matching engine may not update traded_qty instantly
+        # Retry up to 5× with 500ms delay — matching engine may not update
+        # traded_qty instantly. Nado does NOT return avg_price; the price
+        # for the position will have to be derived from fetch_positions
+        # delta on the caller side. Here we just report 0.0 as avg.
         if resp.get("status") in ("success", "FILLED", "CLOSED"):
             if oid:
                 for attempt in range(5):
                     try:
                         fill = await client.async_check_order_fill(oid)
                         fill_qty = float(fill.get("traded_qty", 0))
+                        ap = float(fill.get("avg_price", 0) or fill.get("average_price", 0) or 0)
                         if fill_qty > 0:
-                            logger.info("Taker fill (Nado) attempt=%d order=%s qty=%.6f", attempt, oid, fill_qty)
-                            return fill_qty
+                            logger.info(
+                                "Taker fill (post-IOC poll) attempt=%d order=%s qty=%.6f avg_price=%.6f",
+                                attempt, oid, fill_qty, ap,
+                            )
+                            return fill_qty, ap
                     except Exception:
                         pass
                     await asyncio.sleep(0.5)
-                logger.warning("Taker fill (Nado) order=%s: traded_qty still 0 after 5 attempts", oid)
-            return 0.0
+                logger.warning("Taker fill order=%s: traded_qty still 0 after 5 attempts", oid)
+            return 0.0, 0.0
 
         if not oid:
-            return 0.0
+            return 0.0, 0.0
 
         # ── WS-first fill detection ──
         # Check immediately (event may have arrived during order placement)
-        ws_qty = self._get_ws_filled_qty(oid)
+        ws_qty, ws_vwap = self._get_ws_filled_qty_and_vwap(oid)
         if ws_qty > 0:
-            logger.info("Taker fill via WS (instant): order=%s qty=%.6f", oid, ws_qty)
-            return ws_qty
+            logger.info(
+                "Taker fill via WS (instant): order=%s qty=%.6f vwap=%.6f",
+                oid, ws_qty, ws_vwap,
+            )
+            return ws_qty, ws_vwap
 
         # Wait up to 2s for WS fill event in short intervals
         deadline = time.time() + 2.0
@@ -2482,21 +2557,28 @@ class StateMachine:
                 await asyncio.wait_for(self._fill_event.wait(), timeout=min(0.1, remaining))
             except asyncio.TimeoutError:
                 pass
-            ws_qty = self._get_ws_filled_qty(oid)
+            ws_qty, ws_vwap = self._get_ws_filled_qty_and_vwap(oid)
             if ws_qty > 0:
-                logger.info("Taker fill via WS (waited): order=%s qty=%.6f", oid, ws_qty)
-                return ws_qty
+                logger.info(
+                    "Taker fill via WS (waited): order=%s qty=%.6f vwap=%.6f",
+                    oid, ws_qty, ws_vwap,
+                )
+                return ws_qty, ws_vwap
 
         # ── REST fallback (only if WS didn't deliver) ──
         try:
             fill = await client.async_check_order_fill(oid)
             fill_qty = float(fill.get("traded_qty", 0))
-            logger.info("Taker fill via REST fallback: order=%s status=%s traded_qty=%s", oid, fill.get("status"), fill_qty)
-            return fill_qty
+            ap = float(fill.get("avg_price", 0) or fill.get("average_price", 0) or 0)
+            logger.info(
+                "Taker fill via REST fallback: order=%s status=%s traded_qty=%s avg_price=%.6f",
+                oid, fill.get("status"), fill_qty, ap,
+            )
+            return fill_qty, ap
         except Exception as exc:
             logger.warning("Taker REST fill check error: order=%s error=%s", oid, exc)
 
-        return 0.0
+        return 0.0, 0.0
 
     # ── Market close for sub-minimum residual ────────────────────────
 
@@ -2545,7 +2627,7 @@ class StateMachine:
                     price=price, reduce_only=True,
                 )
                 oid = resp.get("id") or resp.get("order_id") or resp.get("digest")
-                filled = await self._check_taker_fill(client, oid, resp)
+                filled, _avg = await self._check_taker_fill(client, oid, resp)
                 return filled, None
             except Exception as exc:
                 return 0.0, str(exc)

@@ -260,12 +260,24 @@ class GrvtClient:
             status = state.get("status", "").upper() if state else ""
             traded = state.get("traded_size", ["0"])
             traded_qty = float(traded[0]) if traded else 0.0
+            # GRVT exposes the realized VWAP as `avg_fill_price` (list per leg).
+            avg_prices = state.get("avg_fill_price", [0]) if state else [0]
+            try:
+                avg_price = float(avg_prices[0]) if isinstance(avg_prices, list) and avg_prices else float(avg_prices or 0)
+            except (TypeError, ValueError):
+                avg_price = 0.0
             filled = status in ("FILLED", "CLOSED") or (status == "PENDING" and traded_qty > 0.0)
             logger.info(
-                "check_order_fill(%s): status=%s traded=%s filled=%s",
-                client_order_id, status, traded_qty, filled,
+                "check_order_fill(%s): status=%s traded=%s avg_price=%.6f filled=%s",
+                client_order_id, status, traded_qty, avg_price, filled,
             )
-            return {"filled": filled, "status": status, "traded_qty": traded_qty, "order": order}
+            return {
+                "filled": filled,
+                "status": status,
+                "traded_qty": traded_qty,
+                "avg_price": avg_price,
+                "order": order,
+            }
         except Exception as exc:
             logger.warning("check_order_fill(%s) error: %s", client_order_id, exc)
             return {"filled": False, "status": "ERROR", "error": str(exc)}
