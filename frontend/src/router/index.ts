@@ -77,6 +77,12 @@ const routes = [
     meta: { admin: true },
   },
   {
+    path: '/admin/persistence',
+    name: 'admin-persistence',
+    component: () => import('@/views/AdminPersistenceView.vue'),
+    meta: { admin: true },
+  },
+  {
     path: '/:pathMatch(.*)*',
     redirect: '/',
   },

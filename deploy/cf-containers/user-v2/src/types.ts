@@ -24,4 +24,13 @@ export interface Env {
    * /__state/flush POST.
    */
   STATE_BUCKET: R2Bucket;
+  /**
+   * Phase F.4 M6: Analytics Engine dataset for per-user persistence
+   * telemetry. Every /__state/flush + /__state/restore writes a single
+   * data point with: blobs=[event_kind, user_id, status]
+   *                  doubles=[byte_size, http_status_code]
+   * Queried by the main tradeautonom Worker's
+   * /api/admin/persistence-status endpoint via CF Analytics API.
+   */
+  PERSIST_LOG: AnalyticsEngineDataset;
 }

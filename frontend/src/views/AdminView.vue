@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { RouterLink } from 'vue-router'
 import {
   fetchAdminUsers,
   deleteAdminUser,
   setUserBackend,
   migrateUserToCf,
   migrateUserToPhoton,
+  fetchMigrationHistory,
 } from '@/lib/admin-api'
-import type { AdminUser, MigrateResult } from '@/lib/admin-api'
+import type { AdminUser, MigrateResult, MigrationAuditRow } from '@/lib/admin-api'
 import Typography from '@/components/ui/Typography.vue'
 import Button from '@/components/ui/Button.vue'
 
@@ -18,6 +20,17 @@ const deletingId = ref<string | null>(null)
 const flippingId = ref<string | null>(null)
 const migratingId = ref<string | null>(null)
 const migrationResult = ref<MigrateResult | null>(null)
+const migrationHistory = ref<MigrationAuditRow[]>([])
+const showHistory = ref(false)
+
+async function loadHistory() {
+  try {
+    const data = await fetchMigrationHistory(undefined, 10)
+    migrationHistory.value = data.rows
+  } catch {
+    // non-fatal — leave empty
+  }
+}
 
 onMounted(loadUsers)
 
@@ -156,6 +169,24 @@ async function tryMigrate(user: AdminUser, target: 'photon' | 'cf', force: boole
   if (idx >= 0) {
     users.value[idx] = { ...users.value[idx], backend: res.backend }
   }
+  // Refresh history so the new entry shows immediately
+  await loadHistory()
+}
+
+async function toggleHistory() {
+  showHistory.value = !showHistory.value
+  if (showHistory.value && migrationHistory.value.length === 0) {
+    await loadHistory()
+  }
+}
+
+function fmtTime(iso: string | null): string {
+  if (!iso) return '—'
+  try {
+    return new Date(iso).toLocaleTimeString('de-DE')
+  } catch {
+    return iso
+  }
 }
 
 function formatDate(iso: string): string {
@@ -186,7 +217,14 @@ function backendColor(backend: string | null): string {
 <template>
   <div :class="$style.page">
     <div :class="$style.header">
-      <Typography size="text-h5" weight="bold">Admin — Users</Typography>
+      <div>
+        <Typography size="text-h5" weight="bold">Admin — Users</Typography>
+        <div :class="$style.subnav">
+          <RouterLink to="/admin">Users</RouterLink>
+          <RouterLink to="/admin/activity">Activity Log</RouterLink>
+          <RouterLink to="/admin/persistence">V2 Persistence</RouterLink>
+        </div>
+      </div>
       <Button variant="outline" size="sm" @click="loadUsers" :loading="loading">Refresh</Button>
     </div>
 
@@ -311,6 +349,67 @@ function backendColor(backend: string | null): string {
       </details>
     </div>
 
+    <div :class="$style.historySection">
+      <Button variant="ghost" size="sm" @click="toggleHistory">
+        {{ showHistory ? '▼' : '▶' }} Migration history (last 10)
+      </Button>
+      <div v-if="showHistory && migrationHistory.length === 0" :class="$style.empty">
+        <Typography size="text-xs" color="tertiary">No migrations recorded yet.</Typography>
+      </div>
+      <div v-if="showHistory && migrationHistory.length > 0" :class="$style.historyTable">
+        <table :class="$style.table">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>User</th>
+              <th>Direction</th>
+              <th>Status</th>
+              <th>Tar size</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="h in migrationHistory" :key="h.id">
+              <td>
+                <Typography size="text-xs">{{ fmtTime(h.started_at) }}</Typography>
+              </td>
+              <td>
+                <Typography size="text-xs" color="tertiary">{{ h.user_id.slice(0, 12) }}…</Typography>
+              </td>
+              <td>
+                <Typography size="text-xs">
+                  {{ h.direction === 'to_cf' ? 'V1 → V2' : 'V2 → V1' }}
+                  <span v-if="h.forced" style="color:var(--color-warning,#eab308)">[forced]</span>
+                </Typography>
+              </td>
+              <td>
+                <span
+                  :class="$style.statusBadge"
+                  :style="{
+                    color: h.status === 'success' ? 'var(--color-success,#22c55e)'
+                      : h.status === 'failed' ? 'var(--color-error,#ef4444)'
+                      : 'var(--color-warning,#eab308)',
+                    borderColor: h.status === 'success' ? 'var(--color-success,#22c55e)'
+                      : h.status === 'failed' ? 'var(--color-error,#ef4444)'
+                      : 'var(--color-warning,#eab308)',
+                  }"
+                >
+                  {{ h.status }}
+                </span>
+              </td>
+              <td>
+                <Typography size="text-xs">{{ h.tar_bytes != null ? h.tar_bytes + ' B' : '—' }}</Typography>
+              </td>
+              <td>
+                <Typography v-if="h.error" size="text-xs" color="error">{{ h.error.slice(0, 100) }}</Typography>
+                <Typography v-else size="text-xs" color="tertiary">—</Typography>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <div :class="$style.footer">
       <Typography size="text-xs" color="tertiary">{{ users.length }} user(s) total</Typography>
     </div>
@@ -407,6 +506,45 @@ function backendColor(backend: string | null): string {
   align-items: center;
   gap: var(--space-2);
   flex-wrap: wrap;
+}
+
+.subnav {
+  display: flex;
+  gap: 16px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.subnav :global(a) {
+  color: var(--color-text-tertiary, #888);
+  text-decoration: none;
+  padding-bottom: 2px;
+  border-bottom: 2px solid transparent;
+}
+
+.subnav :global(a.router-link-active),
+.subnav :global(a.router-link-exact-active) {
+  color: var(--color-text-primary, #fff);
+  border-bottom-color: var(--color-primary, #7c3aed);
+}
+
+.subnav :global(a:hover) {
+  color: var(--color-text-secondary, #ccc);
+}
+
+.historySection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border, rgba(255,255,255,0.06));
+}
+
+.historyTable {
+  border: 1px solid var(--color-border, rgba(255,255,255,0.08));
+  border-radius: 6px;
+  overflow-x: auto;
 }
 
 .migrateResult {

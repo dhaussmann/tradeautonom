@@ -50,6 +50,16 @@
       "bucket_name": "tradeautonom-user-state"
     }
   ],
+  // Phase F.4 M6: Analytics Engine for per-user persistence telemetry.
+  // Every /__state/flush + /__state/restore writes one data point so the
+  // admin dashboard can show "last_flush_ts, last_restore_ts, tar_size,
+  // status" per user via the existing CF API.
+  "analytics_engine_datasets": [
+    {
+      "binding": "PERSIST_LOG",
+      "dataset": "tradeautonom-persistence"
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",

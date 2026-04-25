@@ -108,6 +108,67 @@ export async function migrateUserToPhoton(
   })
 }
 
+// ── Migration history (Phase F.4 M7) ────────────────────────
+
+export interface MigrationAuditRow {
+  id: number
+  user_id: string
+  direction: 'to_cf' | 'to_photon'
+  started_at: string
+  finished_at: string | null
+  status: 'in_progress' | 'success' | 'failed'
+  error: string | null
+  tar_bytes: number | null
+  forced: number
+  trace: string[]
+}
+
+export async function fetchMigrationHistory(
+  userId?: string,
+  limit = 20,
+): Promise<{ rows: MigrationAuditRow[] }> {
+  const qs = new URLSearchParams()
+  if (userId) qs.set('user_id', userId)
+  qs.set('limit', String(limit))
+  return request<{ rows: MigrationAuditRow[] }>(`/admin/migration-history?${qs.toString()}`)
+}
+
+// ── V2 Persistence Status (Phase F.4 M6) ────────────────────
+
+export interface PersistenceRow {
+  user_id: string
+  email: string
+  backend: 'photon' | 'cf'
+  r2_size_bytes: number | null
+  r2_uploaded_at: string | null
+  r2_age_s: number | null
+  last_flush_ts: string | null
+  last_flush_status: string | null
+  last_flush_size: number | null
+  last_restore_ts: string | null
+  last_restore_status: string | null
+  flushes_24h: number
+  flush_errors_24h: number
+  health: 'green' | 'yellow' | 'red' | 'idle'
+  health_reason: string
+}
+
+export interface PersistenceStatusResponse {
+  generated_at: string
+  summary: {
+    total_users: number
+    on_v2: number
+    green: number
+    yellow: number
+    red: number
+  }
+  rows: PersistenceRow[]
+}
+
+export async function fetchPersistenceStatus(): Promise<PersistenceStatusResponse> {
+  return request<PersistenceStatusResponse>('/admin/persistence-status')
+}
+
 // ── Activity Log ─────────────────────────────────────────────
 
 export interface ActivityLogEntry {

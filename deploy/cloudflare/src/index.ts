@@ -28,6 +28,7 @@ import {
 } from "./journal";
 import { handleExecutionLogIngest, handleExecutionLogQuery } from "./execution_log";
 import { handleActivityIngest, handleActivityQuery } from "./activity_log";
+import { handlePersistenceStatus } from "./persistence_status";
 import { createAuth } from "./auth";
 import { loadSecrets, saveSecrets, hasSecrets, maskKeys, filterUpdates } from "./lib/secrets";
 // @ts-expect-error — generated at build time by wrangler sites
@@ -35,7 +36,7 @@ import manifestJSON from "__STATIC_CONTENT_MANIFEST";
 
 const assetManifest = JSON.parse(manifestJSON);
 
-interface Env {
+export interface Env {
   __STATIC_CONTENT: KVNamespace;
   NAS_BACKEND: Fetcher;
   OMS_BACKEND: Fetcher;
@@ -249,11 +250,27 @@ export default {
       const targetUserId = url.pathname.match(/^\/api\/admin\/migrate-to-photon\/([^/]+)$/)![1]!;
       return handleAdminMigrateToPhoton(request, env, targetUserId);
     }
+    // Phase F.4 M7: migration history (last N attempts per user, or recent across all users)
+    //   GET /api/admin/migration-history?user_id=<id>&limit=20
+    if (url.pathname === "/api/admin/migration-history" && request.method === "GET") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
+      return handleAdminMigrationHistory(request, env);
+    }
     if (url.pathname === "/api/admin/activity" && request.method === "GET") {
       const session = await getSession(request, env);
       if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
       if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
       return handleActivityQuery(request, env.CF_ACCOUNT_ID, env.CF_API_TOKEN);
+    }
+    // Phase F.4 M6: V2 persistence status dashboard
+    //   GET /api/admin/persistence-status
+    if (url.pathname === "/api/admin/persistence-status" && request.method === "GET") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
+      return handlePersistenceStatus(env);
     }
 
     // ── Execution log ingest: no user auth, uses INGEST_TOKEN ──
@@ -1027,6 +1044,88 @@ async function probeBotsIdle(
   }
 }
 
+// ── Phase F.4 M7: migration audit logging ──────────────────────
+
+/**
+ * Insert a row in migration_audit when a migration starts. Returns the
+ * audit row id so the caller can update finished_at + status when done.
+ */
+async function startMigrationAudit(
+  env: Env,
+  userId: string,
+  direction: "to_cf" | "to_photon",
+  forced: boolean,
+): Promise<number> {
+  const startedAt = new Date().toISOString();
+  // Refuse to start a second migration if one is already in_progress for
+  // the same user — protects against accidental double-clicks.
+  const inflight = await env.DB.prepare(
+    "SELECT id FROM migration_audit WHERE user_id = ? AND status = 'in_progress' ORDER BY id DESC LIMIT 1"
+  ).bind(userId).first<{ id: number }>();
+  if (inflight) {
+    throw new Error(`Another migration for ${userId} is still in progress (audit id ${inflight.id}). Wait or mark it failed first.`);
+  }
+  const result = await env.DB.prepare(
+    "INSERT INTO migration_audit (user_id, direction, started_at, status, forced) VALUES (?, ?, ?, 'in_progress', ?)"
+  ).bind(userId, direction, startedAt, forced ? 1 : 0).run();
+  return Number(result.meta.last_row_id);
+}
+
+async function finishMigrationAudit(
+  env: Env,
+  auditId: number,
+  status: "success" | "failed",
+  trace: string[],
+  tarBytes: number | null,
+  errorMsg: string | null,
+): Promise<void> {
+  try {
+    await env.DB.prepare(
+      "UPDATE migration_audit SET finished_at = ?, status = ?, trace = ?, tar_bytes = ?, error = ? WHERE id = ?"
+    ).bind(
+      new Date().toISOString(),
+      status,
+      JSON.stringify(trace),
+      tarBytes,
+      errorMsg,
+      auditId,
+    ).run();
+  } catch (err) {
+    console.warn(`Failed to finalize migration_audit row ${auditId}:`, err);
+  }
+}
+
+async function handleAdminMigrationHistory(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const userId = url.searchParams.get("user_id") || "";
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "20"), 100);
+  let rows;
+  if (userId) {
+    rows = await env.DB.prepare(
+      "SELECT id, user_id, direction, started_at, finished_at, status, error, tar_bytes, forced, trace FROM migration_audit WHERE user_id = ? ORDER BY id DESC LIMIT ?"
+    ).bind(userId, limit).all();
+  } else {
+    rows = await env.DB.prepare(
+      "SELECT id, user_id, direction, started_at, finished_at, status, error, tar_bytes, forced, trace FROM migration_audit ORDER BY id DESC LIMIT ?"
+    ).bind(limit).all();
+  }
+  // Parse trace JSON for display
+  const data = (rows.results ?? []).map((r) => {
+    let traceArr: string[] = [];
+    try {
+      const t = (r as { trace?: string }).trace;
+      if (t) traceArr = JSON.parse(t);
+    } catch {
+      // fall through
+    }
+    return { ...r, trace: traceArr };
+  });
+  return jsonResponse({ rows: data });
+}
+
 /**
  * Phase F.4 M5: V1 (Photon) → V2 (CF) migration orchestrator.
  *
@@ -1060,22 +1159,33 @@ async function handleAdminMigrateToCf(
   }
   const force = body.force === true;
 
+  // M7: open audit row first — protects against concurrent migrations.
+  let auditId: number;
+  try {
+    auditId = await startMigrationAudit(env, targetUserId, "to_cf", force);
+    log(`audit row opened (id=${auditId})`);
+  } catch (err) {
+    return jsonResponse({
+      error: "Migration already in progress",
+      detail: err instanceof Error ? err.message : String(err),
+      trace,
+    }, 409);
+  }
+
+  let tarBytesForAudit: number | null = null;
+
   try {
     // Step 1: verify user is on Photon
     const userRow = await env.DB.prepare(
       "SELECT id, email, backend FROM user WHERE id = ?"
     ).bind(targetUserId).first<{ id: string; email: string; backend: string | null }>();
     if (!userRow) {
-      return jsonResponse({ error: "User not found", trace }, 404);
+      throw new Error("User not found in D1");
     }
     const currentBackend = userRow.backend ?? "photon";
     log(`current backend: ${currentBackend}`);
     if (currentBackend === "cf") {
-      return jsonResponse({
-        error: "Already on V2",
-        detail: `User ${userRow.email} is already on backend='cf'. Nothing to migrate.`,
-        trace,
-      }, 409);
+      throw new Error(`User ${userRow.email} is already on backend='cf'. Nothing to migrate.`);
     }
 
     // Step 2: IDLE check
@@ -1083,12 +1193,7 @@ async function handleAdminMigrateToCf(
       const preflight = await probeBotsIdle(env, targetUserId);
       log(`preflight: checked=${preflight.checked} all_idle=${preflight.all_idle} states=${JSON.stringify(preflight.states)}`);
       if (preflight.checked && !preflight.all_idle) {
-        return jsonResponse({
-          error: "Bots not idle",
-          detail: `Refusing to migrate — at least one Photon bot is mid-execution. Pause/abort it first or pass force=true.`,
-          preflight,
-          trace,
-        }, 409);
+        throw new Error(`Bots not idle: ${preflight.states.join(", ")}. Pass force=true to override.`);
       }
     }
 
@@ -1100,20 +1205,13 @@ async function handleAdminMigrateToCf(
     }));
     if (!exportResp.ok) {
       const errBody = await exportResp.text().catch(() => "");
-      return jsonResponse({
-        error: "Export failed",
-        detail: `Orchestrator returned HTTP ${exportResp.status}: ${errBody.slice(0, 500)}`,
-        trace,
-      }, 502);
+      throw new Error(`Export failed: orchestrator returned HTTP ${exportResp.status}: ${errBody.slice(0, 300)}`);
     }
     const tarBytes = await exportResp.arrayBuffer();
+    tarBytesForAudit = tarBytes.byteLength;
     log(`tar size: ${tarBytes.byteLength} bytes`);
     if (tarBytes.byteLength < 100) {
-      return jsonResponse({
-        error: "Export too small",
-        detail: `Orchestrator returned ${tarBytes.byteLength} bytes — implausibly small for a real /app/data snapshot.`,
-        trace,
-      }, 502);
+      throw new Error(`Export too small: ${tarBytes.byteLength} bytes — implausibly small for a real /app/data snapshot.`);
     }
 
     // Step 4: POST to user-v2 /__state/flush
@@ -1129,11 +1227,7 @@ async function handleAdminMigrateToCf(
     }));
     if (!flushResp.ok) {
       const errBody = await flushResp.text().catch(() => "");
-      return jsonResponse({
-        error: "Flush to R2 failed",
-        detail: `user-v2 returned HTTP ${flushResp.status}: ${errBody.slice(0, 500)}`,
-        trace,
-      }, 502);
+      throw new Error(`Flush to R2 failed: user-v2 returned HTTP ${flushResp.status}: ${errBody.slice(0, 300)}`);
     }
     const flushData = await flushResp.json() as { status?: string; size?: number };
     log(`R2 wrote ${flushData.size} bytes`);
@@ -1144,11 +1238,7 @@ async function handleAdminMigrateToCf(
       headers: { "X-Internal-Token": env.V2_SHARED_TOKEN || "" },
     }));
     if (!restoreResp.ok) {
-      return jsonResponse({
-        error: "R2 verification failed",
-        detail: `Restore-readback returned HTTP ${restoreResp.status} — uploaded but unreadable. Aborting before D1 flip.`,
-        trace,
-      }, 502);
+      throw new Error(`R2 verification failed: restore-readback returned HTTP ${restoreResp.status}. Aborting before D1 flip.`);
     }
     const verifyBytes = (await restoreResp.arrayBuffer()).byteLength;
     log(`verify read-back: ${verifyBytes} bytes`);
@@ -1187,6 +1277,7 @@ async function handleAdminMigrateToCf(
       log(`cf recycle error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
 
+    await finishMigrationAudit(env, auditId, "success", trace, tarBytesForAudit, null);
     return jsonResponse({
       status: "ok",
       user_id: targetUserId,
@@ -1197,12 +1288,16 @@ async function handleAdminMigrateToCf(
       photon_stopped: photonStopped,
       cf_recycled: cfRecycled,
       forced: force,
+      audit_id: auditId,
       trace,
     });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await finishMigrationAudit(env, auditId, "failed", trace, tarBytesForAudit, msg);
     return jsonResponse({
       error: "Migration failed",
-      detail: err instanceof Error ? err.message : String(err),
+      detail: msg,
+      audit_id: auditId,
       trace,
     }, 500);
   }
@@ -1239,22 +1334,33 @@ async function handleAdminMigrateToPhoton(
   }
   const force = body.force === true;
 
+  // M7: open audit row first.
+  let auditId: number;
+  try {
+    auditId = await startMigrationAudit(env, targetUserId, "to_photon", force);
+    log(`audit row opened (id=${auditId})`);
+  } catch (err) {
+    return jsonResponse({
+      error: "Migration already in progress",
+      detail: err instanceof Error ? err.message : String(err),
+      trace,
+    }, 409);
+  }
+
+  let tarBytesForAudit: number | null = null;
+
   try {
     // Step 1: verify user is on CF
     const userRow = await env.DB.prepare(
       "SELECT id, email, backend FROM user WHERE id = ?"
     ).bind(targetUserId).first<{ id: string; email: string; backend: string | null }>();
     if (!userRow) {
-      return jsonResponse({ error: "User not found", trace }, 404);
+      throw new Error("User not found in D1");
     }
     const currentBackend = userRow.backend ?? "photon";
     log(`current backend: ${currentBackend}`);
     if (currentBackend !== "cf") {
-      return jsonResponse({
-        error: "Not on V2",
-        detail: `User ${userRow.email} is on backend='${currentBackend}', not 'cf'. Nothing to roll back.`,
-        trace,
-      }, 409);
+      throw new Error(`User ${userRow.email} is on backend='${currentBackend}', not 'cf'. Nothing to roll back.`);
     }
 
     // Step 2: V2 IDLE check
@@ -1262,12 +1368,7 @@ async function handleAdminMigrateToPhoton(
       const preflight = await probeBotsIdle(env, targetUserId);
       log(`preflight: checked=${preflight.checked} all_idle=${preflight.all_idle} states=${JSON.stringify(preflight.states)}`);
       if (preflight.checked && !preflight.all_idle) {
-        return jsonResponse({
-          error: "Bots not idle",
-          detail: `Refusing to roll back — at least one CF bot is mid-execution. Pause/abort it first or pass force=true.`,
-          preflight,
-          trace,
-        }, 409);
+        throw new Error(`Bots not idle: ${preflight.states.join(", ")}. Pass force=true to override.`);
       }
     }
 
@@ -1294,20 +1395,13 @@ async function handleAdminMigrateToPhoton(
       headers: { "X-Internal-Token": env.V2_SHARED_TOKEN || "" },
     }));
     if (!restoreResp.ok) {
-      return jsonResponse({
-        error: "R2 download failed",
-        detail: `Restore returned HTTP ${restoreResp.status} — no V2 state to roll back. User may have never been on V2 long enough for a flush.`,
-        trace,
-      }, 404);
+      throw new Error(`R2 download failed: restore returned HTTP ${restoreResp.status}. User may have never been on V2 long enough for a flush.`);
     }
     const tarBytes = await restoreResp.arrayBuffer();
+    tarBytesForAudit = tarBytes.byteLength;
     log(`r2 tarball: ${tarBytes.byteLength} bytes`);
     if (tarBytes.byteLength < 100) {
-      return jsonResponse({
-        error: "R2 tarball too small",
-        detail: `R2 returned ${tarBytes.byteLength} bytes — implausibly small. Aborting before touching Photon.`,
-        trace,
-      }, 502);
+      throw new Error(`R2 tarball too small: ${tarBytes.byteLength} bytes — implausibly small. Aborting before touching Photon.`);
     }
 
     // Step 5: ensure Photon container exists
@@ -1315,11 +1409,7 @@ async function handleAdminMigrateToPhoton(
       "SELECT container_name FROM user_container WHERE user_id = ?"
     ).bind(targetUserId).first<{ container_name: string }>();
     if (!containerRow) {
-      return jsonResponse({
-        error: "Photon container missing",
-        detail: `No container registered for user ${targetUserId} on Photon. Admin must run 'deploy/v3/manage.sh create ${targetUserId}' first.`,
-        trace,
-      }, 412);
+      throw new Error(`Photon container missing: no container registered for user ${targetUserId}. Admin must run 'deploy/v3/manage.sh create ${targetUserId}' first.`);
     }
     log(`photon container: ${containerRow.container_name}`);
 
@@ -1335,11 +1425,7 @@ async function handleAdminMigrateToPhoton(
     }));
     if (!importResp.ok) {
       const errBody = await importResp.text().catch(() => "");
-      return jsonResponse({
-        error: "Photon import failed",
-        detail: `Orchestrator returned HTTP ${importResp.status}: ${errBody.slice(0, 500)}`,
-        trace,
-      }, 502);
+      throw new Error(`Photon import failed: orchestrator returned HTTP ${importResp.status}: ${errBody.slice(0, 300)}`);
     }
     log(`photon import OK`);
 
@@ -1375,6 +1461,7 @@ async function handleAdminMigrateToPhoton(
       log(`cf recycle error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
 
+    await finishMigrationAudit(env, auditId, "success", trace, tarBytesForAudit, null);
     return jsonResponse({
       status: "ok",
       user_id: targetUserId,
@@ -1383,12 +1470,16 @@ async function handleAdminMigrateToPhoton(
       tar_bytes: tarBytes.byteLength,
       photon_started: photonStarted,
       forced: force,
+      audit_id: auditId,
       trace,
     });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await finishMigrationAudit(env, auditId, "failed", trace, tarBytesForAudit, msg);
     return jsonResponse({
       error: "Rollback failed",
-      detail: err instanceof Error ? err.message : String(err),
+      detail: msg,
+      audit_id: auditId,
       trace,
     }, 500);
   }

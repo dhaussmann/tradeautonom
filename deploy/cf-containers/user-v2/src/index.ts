@@ -153,6 +153,29 @@ export default {
 
 // ── State bucket handlers ──────────────────────────────────────────
 
+// M6 helper — write a single Analytics Engine data point. Wrapped in
+// try/catch because AE writes are best-effort: a binding hiccup must
+// never break the actual flush/restore.
+function logPersistEvent(
+  env: Env,
+  event: "flush" | "restore",
+  userId: string,
+  status: "ok" | "not_found" | "error" | "forbidden" | "bad_request",
+  byteSize: number,
+  httpStatus: number,
+): void {
+  try {
+    if (!env.PERSIST_LOG) return;
+    env.PERSIST_LOG.writeDataPoint({
+      blobs: [event, userId, status],
+      doubles: [byteSize, httpStatus],
+      indexes: [userId.slice(0, 32)], // index by user for fast filtering
+    });
+  } catch {
+    // Swallow — telemetry must not break the data path
+  }
+}
+
 async function handleStateRestore(
   request: Request,
   url: URL,
@@ -160,14 +183,16 @@ async function handleStateRestore(
 ): Promise<Response> {
   const presented = request.headers.get("X-Internal-Token") ?? "";
   const expected = env.V2_SHARED_TOKEN ?? "";
+  const userId = url.searchParams.get("user_id") ?? "";
   if (!expected || presented !== expected) {
+    logPersistEvent(env, "restore", userId, "forbidden", 0, 403);
     return new Response(
       JSON.stringify({ error: "Forbidden" }),
       { status: 403, headers: { "content-type": "application/json" } },
     );
   }
-  const userId = url.searchParams.get("user_id") ?? "";
   if (!userId) {
+    logPersistEvent(env, "restore", "", "bad_request", 0, 400);
     return new Response(
       JSON.stringify({ error: "user_id required" }),
       { status: 400, headers: { "content-type": "application/json" } },
@@ -176,11 +201,13 @@ async function handleStateRestore(
   const key = `${userId}.tar.gz`;
   const obj = await env.STATE_BUCKET.get(key);
   if (!obj) {
+    logPersistEvent(env, "restore", userId, "not_found", 0, 404);
     return new Response(
       JSON.stringify({ error: "not found", user_id: userId }),
       { status: 404, headers: { "content-type": "application/json" } },
     );
   }
+  logPersistEvent(env, "restore", userId, "ok", obj.size, 200);
   return new Response(obj.body, {
     status: 200,
     headers: {
@@ -197,6 +224,7 @@ async function handleStateFlush(
 ): Promise<Response> {
   const presented = request.headers.get("X-Internal-Token") ?? "";
   const expected = env.V2_SHARED_TOKEN ?? "";
+  const userId = url.searchParams.get("user_id") ?? "";
   if (!expected || presented !== expected) {
     // Phase F.4 diagnostic: log masked tokens so we can diagnose mismatches
     // without leaking secrets.
@@ -205,8 +233,9 @@ async function handleStateFlush(
       evt: "state_flush_forbidden",
       presented: mask(presented),
       expected: mask(expected),
-      user_id: url.searchParams.get("user_id") ?? "",
+      user_id: userId,
     }));
+    logPersistEvent(env, "flush", userId, "forbidden", 0, 403);
     return new Response(
       JSON.stringify({
         error: "Forbidden",
@@ -216,14 +245,15 @@ async function handleStateFlush(
       { status: 403, headers: { "content-type": "application/json" } },
     );
   }
-  const userId = url.searchParams.get("user_id") ?? "";
   if (!userId) {
+    logPersistEvent(env, "flush", "", "bad_request", 0, 400);
     return new Response(
       JSON.stringify({ error: "user_id required" }),
       { status: 400, headers: { "content-type": "application/json" } },
     );
   }
   if (!request.body) {
+    logPersistEvent(env, "flush", userId, "bad_request", 0, 400);
     return new Response(
       JSON.stringify({ error: "body required" }),
       { status: 400, headers: { "content-type": "application/json" } },
@@ -239,11 +269,13 @@ async function handleStateFlush(
         userId,
       },
     });
+    logPersistEvent(env, "flush", userId, "ok", body.byteLength, 200);
     return new Response(
       JSON.stringify({ status: "ok", size: body.byteLength, key }),
       { status: 200, headers: { "content-type": "application/json" } },
     );
   } catch (err) {
+    logPersistEvent(env, "flush", userId, "error", 0, 500);
     return new Response(
       JSON.stringify({
         error: "put_failed",
