@@ -226,14 +226,30 @@ class StateMachine:
 
         Triggered manually by the user.
         """
-        self._log("ENGINE", f"=== ENTRY STARTED ===")
-        self._log("ENGINE", f"Config: maker={config.maker_exchange}:{config.maker_symbol} side={config.maker_side}")
-        self._log("ENGINE", f"Config: taker={config.taker_exchange}:{config.taker_symbol} side={config.taker_side}")
-        self._log("ENGINE", f"Config: qty={config.total_qty}, chunks={config.num_chunks}, interval={config.chunk_interval_s}s")
+        self._log("ENGINE", "=== ENTRY STARTED ===")
+        self._log(
+            "ENGINE",
+            f"Plan: open {config.total_qty} cross-venue position in "
+            f"{config.num_chunks} TWAP chunks ({config.chunk_interval_s}s apart)",
+        )
+        self._log(
+            "ENGINE",
+            f"Maker leg: {config.maker_exchange} {config.maker_side.upper()} "
+            f"{config.maker_symbol} (post-only limit)",
+        )
+        self._log(
+            "ENGINE",
+            f"Taker leg: {config.taker_exchange} {config.taker_side.upper()} "
+            f"{config.taker_symbol} (IOC hedge)",
+        )
 
         if self._state != JobState.IDLE:
             err_msg = f"Cannot enter: state is {self._state.value}, expected IDLE"
-            self._log("ENGINE", err_msg, level="error")
+            self._log(
+                "ENGINE",
+                f"Refusing entry — bot is in {self._state.value} state, must be IDLE first",
+                level="error",
+            )
             raise RuntimeError(err_msg)
 
         self._transition(JobState.ENTERING)
@@ -242,8 +258,11 @@ class StateMachine:
         self._long_symbol = config.taker_symbol if config.maker_side == "sell" else config.maker_symbol
         self._short_symbol = config.taker_symbol if config.maker_side == "buy" else config.maker_symbol
 
-        self._log("ENGINE", f"Long position: {self._long_exchange}:{self._long_symbol}")
-        self._log("ENGINE", f"Short position: {self._short_exchange}:{self._short_symbol}")
+        self._log(
+            "ENGINE",
+            f"Position layout: LONG on {self._long_exchange} ({self._long_symbol}), "
+            f"SHORT on {self._short_exchange} ({self._short_symbol})",
+        )
 
         result = await self._execute_maker_taker(config, action="ENTER")
 
@@ -253,22 +272,50 @@ class StateMachine:
         # Position qty already updated incrementally per chunk in _execute_maker_taker
         entry_duration_sec = result.end_ts - result.start_ts if result.end_ts else 0
         if result.success:
-            self._log("ENGINE", f"=== ENTRY SUCCESS === Duration: {entry_duration_sec:.1f}s, Final state: HOLDING")
+            self._log(
+                "ENGINE",
+                f"=== ENTRY SUCCESS === filled {result.total_maker_qty:.6f}/"
+                f"{result.total_taker_qty:.6f} in {entry_duration_sec:.1f}s "
+                f"({len(result.chunks)} chunks) — bot now HOLDING",
+            )
             self._transition(JobState.HOLDING)
         else:
-            self._log("ENGINE", f"=== ENTRY FAILED === Duration: {entry_duration_sec:.1f}s, Error: {result.error}")
-            self._log("ENGINE", f"Entry result: maker_qty={result.total_maker_qty:.6f}, taker_qty={result.total_taker_qty:.6f}, chunks={len(result.chunks)}")
+            self._log(
+                "ENGINE",
+                f"=== ENTRY FAILED === Reason: {result.error}. "
+                f"Filled so far: maker {result.total_maker_qty:.6f}, "
+                f"taker {result.total_taker_qty:.6f} across "
+                f"{len(result.chunks)} chunk(s) in {entry_duration_sec:.1f}s",
+                level="error",
+            )
             if result.total_maker_qty > 0 and result.total_taker_qty == 0:
-                self._log("ENGINE", "CRITICAL: Maker filled but taker did not — initiating emergency unwind", level="error")
+                self._log(
+                    "ENGINE",
+                    f"CRITICAL — maker leg has {result.total_maker_qty:.6f} open "
+                    f"but taker hedge never fired. Starting emergency unwind to "
+                    f"close the maker leg before going IDLE.",
+                    level="error",
+                )
                 logger.error("Entry failed: maker filled but taker did not — emergency unwind")
                 await self._emergency_unwind(config, result)
                 self._transition(JobState.IDLE)
             elif result.total_maker_qty == 0:
-                self._log("ENGINE", "Entry failed: No fills — returning to IDLE", level="warn")
+                self._log(
+                    "ENGINE",
+                    "No fills happened (maker never executed) — returning to IDLE. "
+                    "Check spread window or orderbook depth in the activity log above.",
+                    level="warn",
+                )
                 logger.warning("Entry failed: no fills — returning to IDLE")
                 self._transition(JobState.IDLE)
             else:
-                self._log("ENGINE", f"Entry partial: maker={result.total_maker_qty:.6f} taker={result.total_taker_qty:.6f} — holding partial position", level="warn")
+                self._log(
+                    "ENGINE",
+                    f"Partial entry — both legs filled, but less than the planned "
+                    f"{config.total_qty}. Holding the {result.total_maker_qty:.6f}/"
+                    f"{result.total_taker_qty:.6f} that did fill.",
+                    level="warn",
+                )
                 logger.warning("Entry partial: maker=%.6f taker=%.6f — holding partial position",
                                result.total_maker_qty, result.total_taker_qty)
                 self._transition(JobState.HOLDING)
@@ -300,7 +347,13 @@ class StateMachine:
                 config.taker_exchange, config.taker_symbol, taker_client, force_rest=True) if taker_client else Decimal("0")
             residual = max(maker_pos, taker_pos)
             if residual > Decimal("0.001"):
-                self._log("EXIT", f"Post-TWAP residual detected: maker={maker_pos:.6f} taker={taker_pos:.6f} — attempting final market-close")
+                self._log(
+                    "EXIT",
+                    f"Residual position detected after all TWAP chunks: "
+                    f"{maker_pos:.6f} on {config.maker_exchange}, "
+                    f"{taker_pos:.6f} on {config.taker_exchange}. "
+                    f"Firing one aggressive market-close on each side to close it out.",
+                )
                 logger.warning("Post-TWAP residual: maker=%.6f taker=%.6f — final market-close", maker_pos, taker_pos)
                 mc = await self._market_close_residual(config, residual, chunk_index=-1)
                 result.chunks.append(mc)
@@ -308,11 +361,26 @@ class StateMachine:
                 result.total_taker_qty += mc.taker_filled_qty
                 if mc.maker_filled_qty > 0 or mc.taker_filled_qty > 0:
                     self._update_position_incremental(config, "EXIT", mc.maker_filled_qty, mc.taker_filled_qty)
-                    self._log("EXIT", f"Final market-close result: maker={mc.maker_filled_qty:.6f} taker={mc.taker_filled_qty:.6f}")
+                    self._log(
+                        "EXIT",
+                        f"Residual market-close filled "
+                        f"{mc.maker_filled_qty:.6f} on maker side, "
+                        f"{mc.taker_filled_qty:.6f} on taker side. Position should now be flat.",
+                    )
                 elif mc.error:
-                    self._log("EXIT", f"Final market-close failed: {mc.error}", level="error")
+                    self._log(
+                        "EXIT",
+                        f"Residual market-close FAILED — {mc.error}. "
+                        f"Position may still be open; manual intervention required.",
+                        level="error",
+                    )
         except Exception as sweep_exc:
-            self._log("EXIT", f"Post-TWAP residual sweep failed: {sweep_exc}", level="error")
+            self._log(
+                "EXIT",
+                f"Could not check residual after TWAP — {sweep_exc}. "
+                f"Skipping market-close sweep; check positions manually.",
+                level="error",
+            )
             logger.error("Post-TWAP residual sweep error: %s", sweep_exc)
 
         # Position qty already updated incrementally per chunk in _execute_maker_taker
@@ -356,7 +424,13 @@ class StateMachine:
         and will exit cleanly when it sees state != ENTERING/EXITING.
         """
         if self._state in (JobState.ENTERING, JobState.EXITING, JobState.PAUSED_ENTERING, JobState.PAUSED_EXITING):
-            self._log("ENGINE", "Aborting execution — forcing state to IDLE", level="warn")
+            self._log(
+                "ENGINE",
+                f"ABORT requested — was {self._state.value}, forcing to IDLE. "
+                f"Any open maker order will be cancelled at the next chunk boundary; "
+                f"open positions stay (use Kill or manual close to flatten).",
+                level="warn",
+            )
             self._paused.set()  # unblock any paused waiter
             self._pre_pause_state = None
             self._transition(JobState.IDLE)
@@ -375,12 +449,20 @@ class StateMachine:
             self._pre_pause_state = JobState.ENTERING
             self._paused.clear()
             self._transition(JobState.PAUSED_ENTERING)
-            self._log("ENGINE", "Execution PAUSED (was ENTERING)")
+            self._log(
+                "ENGINE",
+                "Entry PAUSED — current chunk will finish, then wait for resume. "
+                "No new chunks will start until you click Resume.",
+            )
         elif self._state == JobState.EXITING:
             self._pre_pause_state = JobState.EXITING
             self._paused.clear()
             self._transition(JobState.PAUSED_EXITING)
-            self._log("ENGINE", "Execution PAUSED (was EXITING)")
+            self._log(
+                "ENGINE",
+                "Exit PAUSED — current chunk will finish, then wait for resume. "
+                "No new chunks will start until you click Resume.",
+            )
         else:
             logger.info("pause: state is %s — nothing to pause", self._state.value)
 
@@ -390,12 +472,12 @@ class StateMachine:
             self._transition(JobState.ENTERING)
             self._paused.set()
             self._pre_pause_state = None
-            self._log("ENGINE", "Execution RESUMED → ENTERING")
+            self._log("ENGINE", "Entry RESUMED — TWAP continues from where it paused")
         elif self._state == JobState.PAUSED_EXITING:
             self._transition(JobState.EXITING)
             self._paused.set()
             self._pre_pause_state = None
-            self._log("ENGINE", "Execution RESUMED → EXITING")
+            self._log("ENGINE", "Exit RESUMED — TWAP continues from where it paused")
         else:
             logger.info("resume: state is %s — nothing to resume", self._state.value)
 
@@ -562,7 +644,14 @@ class StateMachine:
         # Snapshot baseline positions BEFORE any chunks execute
         # so we compare only the delta this run creates, not leftover positions
         self._baseline_maker_size, self._baseline_taker_size = await self._snapshot_baseline_positions(config)
-        self._log("RISK", f"Baseline positions: {config.maker_exchange}={self._baseline_maker_size:.6f} {config.taker_exchange}={self._baseline_taker_size:.6f}")
+        self._log(
+            "RISK",
+            f"Baseline snapshot — recording position sizes BEFORE chunk 1 so "
+            f"every later gap-repair compares against this anchor (not against "
+            f"a moving target). {config.maker_exchange}: "
+            f"{self._baseline_maker_size:.6f}, {config.taker_exchange}: "
+            f"{self._baseline_taker_size:.6f}.",
+        )
 
         # ── Config summary (once before first chunk) ──
         self._log("INFO",
@@ -597,7 +686,13 @@ class StateMachine:
         except Exception:
             taker_min_size = 0.1
         min_repair_qty = max(taker_min_size, 0.02)  # at least 0.02 — exchanges often reject below this
-        self._log("RISK", f"Taker min order size: {taker_min_size} → min_repair_qty={min_repair_qty}")
+        self._log(
+            "RISK",
+            f"Repair threshold — taker exchange minimum order size is "
+            f"{taker_min_size}, so any gap smaller than {min_repair_qty} "
+            f"(2× min) gets accepted as dust instead of repaired (would be "
+            f"rejected by the exchange anyway).",
+        )
 
         base_chunk_qty = config.total_qty / config.num_chunks
         filled_so_far = Decimal("0")
@@ -691,15 +786,35 @@ class StateMachine:
                         if pre_maker_d is not None and pre_taker_d is not None:
                             if abs(pre_taker_d) > abs(pre_maker_d) + float(min_repair_qty):
                                 taker_behind = False
-                                self._log("RISK", f"Chunk {i}: pre-chunk taker already ahead — skipping pre-repair")
-                        if taker_behind:
-                            self._log("RISK", f"Chunk {i}: pre-chunk gap={pre_gap:.6f} — rebalancing before chunk start")
+                                self._log(
+                                    "RISK",
+                                    f"Chunk {i}: pre-chunk check — taker side is already "
+                                    f"ahead of maker side, no rebalance needed",
+                                )
+                            else:
+                                self._log(
+                                    "RISK",
+                                    f"Chunk {i}: pre-chunk imbalance of {pre_gap:.6f} "
+                                    f"detected — running a repair IOC on the taker side "
+                                    f"before the new chunk starts, so chunk 1 begins from "
+                                    f"a clean baseline",
+                                )
                             repair_ok = await self._repair_imbalance(config, i, ChunkResult(chunk_index=i, maker_exchange=config.maker_exchange, taker_exchange=config.taker_exchange, start_ts=time.time()), pre_gap)
                             if repair_ok:
                                 result.total_taker_qty += pre_gap
-                                self._log("RISK", f"Chunk {i}: pre-chunk rebalance OK — repaired {pre_gap:.6f}")
+                                self._log(
+                                    "RISK",
+                                    f"Chunk {i}: pre-chunk rebalance OK — closed "
+                                    f"the {pre_gap:.6f} gap on taker side",
+                                )
                             else:
-                                self._log("RISK", f"Chunk {i}: pre-chunk rebalance FAILED — proceeding anyway", level="warn")
+                                self._log(
+                                    "RISK",
+                                    f"Chunk {i}: pre-chunk rebalance did not close the "
+                                    f"gap — continuing with the chunk anyway, mid-chunk "
+                                    f"repair will catch up later",
+                                    level="warn",
+                                )
                 except Exception as exc:
                     self._log("RISK", f"Chunk {i}: pre-chunk balance check failed: {exc}", level="warn")
 
@@ -726,13 +841,28 @@ class StateMachine:
                                     parts.append(f"{k.replace('_score','')}={ohi_data[k]:.2f}")
                         detail = f" ({', '.join(parts)})" if parts else ""
                         passed = ohi_val >= config.min_ohi
-                        self._log("OHI", f"Chunk {i} {ohi_exch}:{ohi_sym} = {ohi_val:.2f}{detail} — {'OK' if passed else 'BELOW threshold'} (min {config.min_ohi})")
+                        verdict = "OK" if passed else "BELOW minimum"
+                        self._log(
+                            "OHI",
+                            f"Chunk {i}: orderbook health on {ohi_exch} {ohi_sym} = "
+                            f"{ohi_val:.2f}{detail} — {verdict} (you require ≥ {config.min_ohi})",
+                        )
                         if not passed:
                             ohi_ok = False
                     except Exception as ohi_exc:
-                        self._log("OHI", f"Chunk {i} {ohi_exch} — unavailable ({ohi_exc})", level="warn")
+                        self._log(
+                            "OHI",
+                            f"Chunk {i}: could not measure orderbook health on "
+                            f"{ohi_exch} ({ohi_exc}) — assuming OK",
+                            level="warn",
+                        )
                 if not ohi_ok:
-                    self._log("OHI", f"Chunk {i}: OHI below threshold — waiting 5s before retry", level="warn")
+                    self._log(
+                        "OHI",
+                        f"Chunk {i}: orderbook health below your minimum — waiting 5s "
+                        f"and re-checking before deciding whether to skip this chunk",
+                        level="warn",
+                    )
                     await asyncio.sleep(5.0)
                     # Re-check after wait; if still below, skip chunk but continue TWAP
                     skip_chunk = False
@@ -745,7 +875,13 @@ class StateMachine:
                             ohi_val = ohi_data.get("ohi", 0) if ohi_data else 0
                             if ohi_val < config.min_ohi:
                                 skip_chunk = True
-                                self._log("OHI", f"Chunk {i} {ohi_exch} still below threshold (OHI={ohi_val:.2f}) — skipping chunk", level="warn")
+                                self._log(
+                                    "OHI",
+                                    f"Chunk {i}: {ohi_exch} health still {ohi_val:.2f} "
+                                    f"(< minimum {config.min_ohi}) after the 5s wait — "
+                                    f"skipping this chunk and moving on to the next",
+                                    level="warn",
+                                )
                         except Exception:
                             pass
                     if skip_chunk:
@@ -810,7 +946,14 @@ class StateMachine:
                     effective_gap = max_repair
                 logger.info("REPAIR TRIGGERED chunk %d: effective_gap=%.6f (pos_gap=%s chunk_gap=%.6f) min_repair=%.6f",
                             i, effective_gap, pos_gap, chunk_gap, min_repair_qty)
-                self._log("RISK", f"Chunk {i}: effective gap={effective_gap:.6f} (exchange={pos_gap}, chunk={chunk_gap:.6f}) — repair IOC on taker side")
+                self._log(
+                    "RISK",
+                    f"Chunk {i}: position imbalance found — maker leg has "
+                    f"{effective_gap:.6f} more than taker leg (exchange "
+                    f"snapshot says {pos_gap}, chunk-level math says "
+                    f"{chunk_gap:.6f}). Firing a repair IOC on the taker side "
+                    f"to close the gap before the next chunk.",
+                )
                 repair_ok = False
                 remaining_gap = effective_gap
                 total_repaired = 0.0
@@ -843,10 +986,21 @@ class StateMachine:
                         repair_ok = True
                         self._log("RISK", f"Chunk {i}: positions balanced after partial repair (remaining={new_gap:.6f})" if new_gap else f"Chunk {i}: positions balanced after partial repair")
                         break
-                    self._log("RISK", f"Chunk {i}: repair attempt {attempt} — remaining_gap={remaining_gap:.6f} — retrying with fresh orderbook", level="warn")
+                    self._log(
+                        "RISK",
+                        f"Chunk {i}: repair attempt {attempt} only partially closed "
+                        f"the gap — {remaining_gap:.6f} still missing. Retrying with "
+                        f"a fresh orderbook snapshot.",
+                        level="warn",
+                    )
                     await asyncio.sleep(2.0)
                 if remaining_gap < min_repair_qty and not repair_ok:
-                    self._log("RISK", f"Chunk {i}: remaining gap {remaining_gap:.6f} below min repair qty {min_repair_qty} — accepting")
+                    self._log(
+                        "RISK",
+                        f"Chunk {i}: residual gap {remaining_gap:.6f} is below the "
+                        f"taker exchange min order size — accepting as dust (cannot "
+                        f"repair further, exchange would reject the order)",
+                    )
                     repair_ok = True
                 if repair_ok and total_repaired > 0:
                     result.total_taker_qty += total_repaired
@@ -1523,7 +1677,13 @@ class StateMachine:
 
             if filled.get("drift_cancelled"):
                 # Taker-drift-guard cancelled the maker order — re-run spread gates
-                self._log("DRIFT", f"Chunk {chunk_index} round {chase_round}: taker drift exceeded {config.max_taker_drift_bps}bps — maker cancelled, re-evaluating spread")
+                self._log(
+                    "DRIFT",
+                    f"Chunk {chunk_index} round {chase_round}: taker price drifted "
+                    f"more than {config.max_taker_drift_bps:.1f} bp from where it was "
+                    f"when we placed the maker — cancelling our maker order and "
+                    f"re-checking spread before placing a new one",
+                )
                 chase_round += 1
                 maker_order_id = None
                 # Re-fetch book for repricing
@@ -1539,13 +1699,23 @@ class StateMachine:
 
             if filled.get("filled"):
                 maker_filled_qty = Decimal(str(filled.get("traded_qty", 0)))
-                self._log("FILL", f"Chunk {chunk_index}: MAKER FILLED qty={maker_filled_qty} (round {chase_round})")
+                self._log(
+                    "FILL",
+                    f"Chunk {chunk_index} round {chase_round}: maker order FILLED "
+                    f"completely — got all {maker_filled_qty} executed at the limit "
+                    f"price. Now firing the taker IOC hedge.",
+                )
                 logger.info("Maker filled: qty=%.6f (round %d)", maker_filled_qty, chase_round)
                 break
             elif filled.get("traded_qty", 0) > 0:
                 # Partial fill — cancel remainder, then re-check actual filled qty
                 maker_filled_qty = Decimal(str(filled["traded_qty"]))
-                self._log("FILL", f"Chunk {chunk_index}: MAKER PARTIAL FILL qty={maker_filled_qty} — cancelling remainder")
+                self._log(
+                    "FILL",
+                    f"Chunk {chunk_index}: maker order PARTIALLY filled "
+                    f"({maker_filled_qty} so far) and timed out — cancelling the "
+                    f"unfilled remainder. The next chase-round will reprice and try again.",
+                )
                 logger.info("Maker partial fill: qty=%.6f — cancelling remainder", maker_filled_qty)
                 await maker_client.async_cancel_order(str(maker_order_id))
                 self._log("ORDER", f"Chunk {chunk_index}: cancelled remainder of {maker_order_id}")
@@ -1592,7 +1762,12 @@ class StateMachine:
                     post_cancel_qty = float(post_cancel.get("traded_qty", 0))
                     if post_cancel.get("filled") or post_cancel_qty > 0:
                         maker_filled_qty = Decimal(str(post_cancel_qty))
-                        self._log("FILL", f"Chunk {chunk_index}: order {maker_order_id} was FILLED before cancel! qty={maker_filled_qty}")
+                        self._log(
+                            "FILL",
+                            f"Chunk {chunk_index}: maker order {maker_order_id} actually "
+                            f"filled {maker_filled_qty} between our timeout decision and "
+                            f"the cancel reaching the exchange — accepting the fill",
+                        )
                         logger.info("Order filled before cancel: qty=%.6f", maker_filled_qty)
                         break
                 except Exception as exc:
@@ -1602,7 +1777,12 @@ class StateMachine:
                 ws_qty = self._get_ws_filled_qty(str(maker_order_id))
                 if ws_qty > 0:
                     maker_filled_qty = Decimal(str(ws_qty))
-                    self._log("FILL", f"Chunk {chunk_index}: WS detected fill after cancel! qty={maker_filled_qty}")
+                    self._log(
+                        "FILL",
+                        f"Chunk {chunk_index}: WS event reported a maker fill of "
+                        f"{maker_filled_qty} that arrived AFTER our cancel — accepting "
+                        f"the fill (exchange's filled-vs-cancelled race resolved in our favour)",
+                    )
                     break
 
                 # Before repricing: query actual exchange position to detect
@@ -2316,7 +2496,12 @@ class StateMachine:
             )
             drift_label = f"ON (max {config.max_taker_drift_bps}bps)"
 
-        self._log("WAIT", f"Waiting for maker fill: order={oid} timeout={timeout_s:.1f}s drift_guard={drift_label}")
+        self._log(
+            "WAIT",
+            f"Waiting for maker order {oid} to fill — up to {timeout_s:.1f}s, "
+            f"drift guard {drift_label}. WS fill events come through instantly; "
+            f"a 500ms REST poll is the fallback if WS is silent.",
+        )
 
         try:
             while time.time() < deadline:
@@ -2413,7 +2598,12 @@ class StateMachine:
                 if final.get("filled") or f_qty > 0:
                     self._log("FILL", f"Maker fill via REST (final check): qty={f_qty} status={f_status} ({total_wait:.1f}s)")
                 else:
-                    self._log("WAIT", f"Maker wait TIMEOUT after {total_wait:.1f}s — no fill (final status={f_status})")
+                    self._log(
+                        "WAIT",
+                        f"Maker wait TIMEOUT after {total_wait:.1f}s — no fill arrived "
+                        f"(final exchange status: {f_status}). Will cancel the order and "
+                        f"start the next chase-round (re-anchor to current best price).",
+                    )
                 return final
             except Exception:
                 self._log("WAIT", f"Maker wait TIMEOUT after {total_wait:.1f}s — no fill (final REST check failed)")
@@ -2478,12 +2668,21 @@ class StateMachine:
                         config.taker_exchange, config.taker_symbol,
                         drift_bps, baseline_mid, current_mid, config.max_taker_drift_bps,
                     )
-                    self._log("DRIFT",
-                              f"Taker drift {drift_bps:.1f}bps > {config.max_taker_drift_bps}bps "
-                              f"(base={baseline_mid:.4f} now={current_mid:.4f}) — cancelling maker")
+                    self._log(
+                        "DRIFT",
+                        f"Taker price drifted {drift_bps:.1f} bp away from baseline "
+                        f"(was ${baseline_mid:.4f}, now ${current_mid:.4f}, your limit "
+                        f"is {config.max_taker_drift_bps:.1f} bp) — cancelling the open "
+                        f"maker so the taker hedge would not lock in a worse spread",
+                    )
                     drift_triggered.set()
                     return
-                self._log("DRIFT", f"Drift monitor: mid={current_mid:.4f} drift={drift_bps:.1f}bps/{config.max_taker_drift_bps}bps — OK")
+                # Verbose every-second tick — keep terse so the log doesn't drown in it
+                self._log(
+                    "DRIFT",
+                    f"Taker mid ${current_mid:.4f}, drift {drift_bps:.1f}/"
+                    f"{config.max_taker_drift_bps:.1f} bp — within tolerance",
+                )
             except asyncio.CancelledError:
                 return
             except Exception as exc:
