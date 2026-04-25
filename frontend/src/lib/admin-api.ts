@@ -43,6 +43,9 @@ export async function deleteAdminUser(userId: string): Promise<{ status: string 
  * Flip a user between the V1 (Photon) and V2 (Cloudflare Container) backend.
  * If the user's bots on the current backend aren't IDLE, the server will
  * return 409 unless `force=true`.
+ *
+ * NOTE: This is the bare flip — it does NOT copy state. Prefer
+ * migrateUserToCf / migrateUserToPhoton which orchestrate state copy + flip.
  */
 export async function setUserBackend(
   userId: string,
@@ -52,6 +55,56 @@ export async function setUserBackend(
   return request(`/admin/user/${userId}/backend`, {
     method: 'POST',
     body: JSON.stringify({ backend, force }),
+  })
+}
+
+export interface MigrateResult {
+  status: string
+  user_id: string
+  email: string
+  backend: 'photon' | 'cf'
+  tar_bytes: number
+  r2_verify_bytes?: number
+  photon_stopped?: boolean
+  photon_started?: boolean
+  cf_recycled?: boolean
+  forced: boolean
+  trace: string[]
+}
+
+/**
+ * Phase F.4 M5: One-click V1 → V2 migration. Orchestrates everything:
+ * IDLE pre-flight, /app/data/ tar export from Photon, R2 upload via the
+ * user-v2 Worker, R2 round-trip verification, D1 backend flip, Photon
+ * container stop, CF container recycle.
+ *
+ * Returns a `trace` array with step-by-step progress for debug.
+ */
+export async function migrateUserToCf(
+  userId: string,
+  force = false,
+): Promise<MigrateResult> {
+  return request(`/admin/migrate-to-cf/${userId}`, {
+    method: 'POST',
+    body: JSON.stringify({ force }),
+  })
+}
+
+/**
+ * Phase F.4 M5: V2 → V1 rollback. Force-flushes V2, downloads the R2
+ * tarball, has the orchestrator extract it into the Photon container,
+ * flips D1 back to 'photon', restarts Photon container.
+ *
+ * Photon container must already exist; refuses with a clear message
+ * otherwise.
+ */
+export async function migrateUserToPhoton(
+  userId: string,
+  force = false,
+): Promise<MigrateResult> {
+  return request(`/admin/migrate-to-photon/${userId}`, {
+    method: 'POST',
+    body: JSON.stringify({ force }),
   })
 }
 

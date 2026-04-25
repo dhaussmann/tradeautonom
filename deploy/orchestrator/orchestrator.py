@@ -456,6 +456,195 @@ async def delete_container(user_id: str):
     return {"status": "deleted"}
 
 
+# ── Phase F.4 M5: state migration endpoints ────────────────────
+#
+# Pair with the user-v2 Worker /__state/{flush,restore} endpoints. The
+# Worker drives the flow: it asks the Orchestrator to package + return
+# the user's /app/data/, then POSTs the tarball to its own R2-backed
+# /__state/flush. For rollback (V2 → V1), the inverse happens.
+
+@app.get("/orch/export-state/{user_id}")
+async def export_state(user_id: str):
+    """Stream a tar.gz snapshot of /app/data/ from the user's container.
+
+    The container should be quiesced (all bots IDLE/HOLDING) before this
+    is called; we do NOT pause it ourselves because that would break
+    HOLDING bots and lose the persistent fill subscription. The Worker
+    is responsible for the IDLE pre-flight check.
+    """
+    info = state.get(user_id)
+    if not info:
+        raise HTTPException(404, f"No container registered for user {user_id}")
+    if not docker_client:
+        raise HTTPException(503, "Docker not available")
+    container_name = info["container_name"]
+    try:
+        c = docker_client.containers.get(container_name)
+    except docker.errors.NotFound:
+        raise HTTPException(404, f"Container {container_name} not in Docker")
+
+    # Use docker exec to tar /app/data — works for both running and
+    # stopped containers (docker exec on stopped fails, so we start
+    # briefly if needed).
+    started_for_export = False
+    if c.status != "running":
+        try:
+            c.start()
+            started_for_export = True
+            logger.info("export-state: started %s briefly for tar (was %s)", container_name, c.status)
+            await asyncio.sleep(2)
+        except Exception as e:
+            raise HTTPException(500, f"Could not start container for export: {e}")
+
+    try:
+        # exec_run with stream=True returns a generator of bytes — perfect
+        # for streaming a tar.gz back to the caller without buffering the
+        # whole archive in RAM (typical /app/data is < 5 MB but be safe).
+        # Force tar to ignore inflight writes (bot might still be writing
+        # position.json mid-stream); we accept the risk of a half-written
+        # file in exchange for not pausing the container.
+        exec_id = docker_client.api.exec_create(
+            container_name,
+            cmd=["tar", "czf", "-", "--warning=no-file-changed", "-C", "/app", "data"],
+            stdout=True,
+            stderr=False,
+        )["Id"]
+
+        def _stream():
+            for chunk in docker_client.api.exec_start(exec_id, stream=True):
+                yield chunk
+
+        return StreamingResponse(
+            _stream(),
+            media_type="application/gzip",
+            headers={
+                "X-User-Id": user_id,
+                "X-Container-Name": container_name,
+            },
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Export failed: {e}")
+    finally:
+        # Don't restore previous state immediately — the streaming response
+        # is still being consumed. The watchdog will catch any anomalies.
+        if started_for_export:
+            logger.info("export-state: container %s left running (started for export)", container_name)
+
+
+@app.post("/orch/import-state/{user_id}")
+async def import_state(user_id: str, request: Request):
+    """Receive a tar.gz blob and extract it into the user's container's
+    /app/data/. Used for V2 → V1 rollback migration.
+
+    Body: raw application/gzip tarball. The tarball MUST be rooted at
+    `/app/data/` files (no leading `data/` directory). _STATE_VERSION
+    files are stripped — they belong to V2 only.
+    """
+    info = state.get(user_id)
+    if not info:
+        raise HTTPException(404, f"No container registered for user {user_id}")
+    if not docker_client:
+        raise HTTPException(503, "Docker not available")
+    container_name = info["container_name"]
+    try:
+        c = docker_client.containers.get(container_name)
+    except docker.errors.NotFound:
+        raise HTTPException(404, f"Container {container_name} not in Docker")
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "Empty body — expected tar.gz")
+    logger.info("import-state: received %d bytes for %s", len(body), container_name)
+
+    # Stop the container so we can replace /app/data atomically.
+    was_running = c.status == "running"
+    if was_running:
+        try:
+            c.stop(timeout=10)
+        except Exception as e:
+            raise HTTPException(500, f"Could not stop container before import: {e}")
+
+    try:
+        # Stage the tarball into a tempfile, then cp it into the container
+        # and extract. We avoid put_archive() because it expects tar
+        # (uncompressed) and the v2 tar is gzip-compressed.
+        import tempfile
+        import shutil
+
+        tmp_path = f"/tmp/ta-import-{user_id[:8]}-{int(time.time())}.tar.gz"
+        with open(tmp_path, "wb") as f:
+            f.write(body)
+
+        # Start container briefly (stopped state can't exec) — we don't
+        # care about uvicorn coming up, just need the FS available.
+        c.start()
+        await asyncio.sleep(2)
+
+        try:
+            # Wipe old /app/data, recreate, extract new tar (skip
+            # _STATE_VERSION which is V2 metadata)
+            wipe_id = docker_client.api.exec_create(
+                container_name,
+                cmd=["sh", "-c", "rm -rf /app/data && mkdir -p /app/data"],
+            )["Id"]
+            docker_client.api.exec_start(wipe_id)
+
+            # docker cp the tarball into the container
+            with open(tmp_path, "rb") as f:
+                tar_bytes = f.read()
+            # Use docker put_archive with a proper tar wrapper around the
+            # gzip blob. Easier: just docker cp via the daemon.
+            # Use the exec approach: write to a known path inside.
+            mkdir_id = docker_client.api.exec_create(
+                container_name,
+                cmd=["mkdir", "-p", "/tmp"],
+            )["Id"]
+            docker_client.api.exec_start(mkdir_id)
+
+            # Copy via docker cp — the docker SDK doesn't expose a clean
+            # cp that takes raw bytes for gzip, so we shell out.
+            import subprocess
+            cp_proc = subprocess.run(
+                ["/usr/bin/docker", "cp", tmp_path, f"{container_name}:/tmp/restore.tar.gz"],
+                capture_output=True,
+                timeout=30,
+            )
+            if cp_proc.returncode != 0:
+                raise RuntimeError(f"docker cp failed: {cp_proc.stderr.decode(errors='replace')}")
+
+            extract_id = docker_client.api.exec_create(
+                container_name,
+                cmd=["sh", "-c",
+                     "cd /app/data && tar xzf /tmp/restore.tar.gz --exclude=_STATE_VERSION && rm -f /tmp/restore.tar.gz"],
+            )["Id"]
+            docker_client.api.exec_start(extract_id)
+
+            logger.info("import-state: extracted into %s:/app/data", container_name)
+
+            return {
+                "status": "ok",
+                "user_id": user_id,
+                "container_name": container_name,
+                "bytes_imported": len(body),
+            }
+        finally:
+            try:
+                shutil.os.remove(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        raise HTTPException(500, f"Import failed: {e}")
+    finally:
+        # If the container was running before, it's already running again
+        # (we started it for the extract). If it was stopped, stop it
+        # again — caller is responsible for starting it via /start.
+        if not was_running:
+            try:
+                c.stop(timeout=10)
+            except Exception:
+                pass
+
+
 @app.api_route("/orch/proxy/{user_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_to_container(user_id: str, path: str, request: Request):
     info = state.get(user_id)

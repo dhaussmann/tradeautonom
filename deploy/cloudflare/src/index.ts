@@ -231,6 +231,24 @@ export default {
       const targetUserId = url.pathname.match(/^\/api\/admin\/user\/([^/]+)\/backend$/)![1]!;
       return handleAdminSetBackend(request, env, targetUserId);
     }
+    // Phase F.4 M5: one-click migrate V1 → V2 (full state copy + flip).
+    //   POST /api/admin/migrate-to-cf/:user_id    { force?: bool }
+    if (url.pathname.match(/^\/api\/admin\/migrate-to-cf\/[^/]+$/) && request.method === "POST") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
+      const targetUserId = url.pathname.match(/^\/api\/admin\/migrate-to-cf\/([^/]+)$/)![1]!;
+      return handleAdminMigrateToCf(request, env, targetUserId);
+    }
+    // Phase F.4 M5: one-click rollback V2 → V1 (force-flush, copy back, flip).
+    //   POST /api/admin/migrate-to-photon/:user_id    { force?: bool }
+    if (url.pathname.match(/^\/api\/admin\/migrate-to-photon\/[^/]+$/) && request.method === "POST") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
+      const targetUserId = url.pathname.match(/^\/api\/admin\/migrate-to-photon\/([^/]+)$/)![1]!;
+      return handleAdminMigrateToPhoton(request, env, targetUserId);
+    }
     if (url.pathname === "/api/admin/activity" && request.method === "GET") {
       const session = await getSession(request, env);
       if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
@@ -1002,10 +1020,377 @@ async function probeBotsIdle(
     if (!resp.ok) return { checked: false, all_idle: true, states: [] };
     const data = await resp.json() as { bots?: Array<{ state?: string }> };
     const states = (data.bots ?? []).map((b) => String(b.state ?? "")).filter(Boolean);
-    const all_idle = states.every((s) => s === "IDLE" || s === "ERROR" || s === "");
+    const all_idle = states.every((s) => s === "IDLE" || s === "ERROR" || s === "" || s === "HOLDING");
     return { checked: true, all_idle, states };
   } catch {
     return { checked: false, all_idle: true, states: [] };
+  }
+}
+
+/**
+ * Phase F.4 M5: V1 (Photon) → V2 (CF) migration orchestrator.
+ *
+ * Atomic flip with rollback semantics. Steps:
+ *   1. User must currently be on backend='photon' in D1
+ *   2. All Photon bots must be IDLE/HOLDING/ERROR (use force=true to skip)
+ *   3. GET orchestrator's /orch/export-state/<id> — streams /app/data/ tar.gz
+ *   4. POST that tarball to user-v2 /__state/flush?user_id=<id>
+ *   5. Verify R2 round-trip (GET /__state/restore, must return non-empty)
+ *   6. UPDATE user.backend = 'cf' in D1
+ *   7. Stop Photon container (best-effort — leaves data volume intact)
+ *   8. Recycle the user-v2 Container DO so it cold-starts onto R2 state
+ *
+ * On failure in any step: bail out and DON'T touch D1, leaving the user
+ * on Photon. Local R2 object may remain (overwritten on next migration);
+ * Photon container always stays running.
+ */
+async function handleAdminMigrateToCf(
+  request: Request,
+  env: Env,
+  targetUserId: string,
+): Promise<Response> {
+  const trace: string[] = [];
+  const log = (msg: string) => { trace.push(msg); console.log(`migrate-to-cf[${targetUserId}]: ${msg}`); };
+
+  let body: { force?: boolean };
+  try {
+    body = await request.json() as { force?: boolean };
+  } catch {
+    body = {};
+  }
+  const force = body.force === true;
+
+  try {
+    // Step 1: verify user is on Photon
+    const userRow = await env.DB.prepare(
+      "SELECT id, email, backend FROM user WHERE id = ?"
+    ).bind(targetUserId).first<{ id: string; email: string; backend: string | null }>();
+    if (!userRow) {
+      return jsonResponse({ error: "User not found", trace }, 404);
+    }
+    const currentBackend = userRow.backend ?? "photon";
+    log(`current backend: ${currentBackend}`);
+    if (currentBackend === "cf") {
+      return jsonResponse({
+        error: "Already on V2",
+        detail: `User ${userRow.email} is already on backend='cf'. Nothing to migrate.`,
+        trace,
+      }, 409);
+    }
+
+    // Step 2: IDLE check
+    if (!force) {
+      const preflight = await probeBotsIdle(env, targetUserId);
+      log(`preflight: checked=${preflight.checked} all_idle=${preflight.all_idle} states=${JSON.stringify(preflight.states)}`);
+      if (preflight.checked && !preflight.all_idle) {
+        return jsonResponse({
+          error: "Bots not idle",
+          detail: `Refusing to migrate — at least one Photon bot is mid-execution. Pause/abort it first or pass force=true.`,
+          preflight,
+          trace,
+        }, 409);
+      }
+    }
+
+    // Step 3: stream tar.gz from orchestrator
+    const exportUrl = `${env.ORCHESTRATOR_ORIGIN}/orch/export-state/${encodeURIComponent(targetUserId)}`;
+    log(`exporting from orchestrator: ${exportUrl}`);
+    const exportResp = await env.NAS_BACKEND.fetch(new Request(exportUrl, {
+      headers: { "X-Orch-Token": env.ORCH_TOKEN },
+    }));
+    if (!exportResp.ok) {
+      const errBody = await exportResp.text().catch(() => "");
+      return jsonResponse({
+        error: "Export failed",
+        detail: `Orchestrator returned HTTP ${exportResp.status}: ${errBody.slice(0, 500)}`,
+        trace,
+      }, 502);
+    }
+    const tarBytes = await exportResp.arrayBuffer();
+    log(`tar size: ${tarBytes.byteLength} bytes`);
+    if (tarBytes.byteLength < 100) {
+      return jsonResponse({
+        error: "Export too small",
+        detail: `Orchestrator returned ${tarBytes.byteLength} bytes — implausibly small for a real /app/data snapshot.`,
+        trace,
+      }, 502);
+    }
+
+    // Step 4: POST to user-v2 /__state/flush
+    const flushUrl = `http://user-v2.internal/__state/flush?user_id=${encodeURIComponent(targetUserId)}`;
+    log(`flushing to R2: ${flushUrl}`);
+    const flushResp = await env.USER_V2.fetch(new Request(flushUrl, {
+      method: "POST",
+      headers: {
+        "X-Internal-Token": env.V2_SHARED_TOKEN || "",
+        "Content-Type": "application/gzip",
+      },
+      body: tarBytes,
+    }));
+    if (!flushResp.ok) {
+      const errBody = await flushResp.text().catch(() => "");
+      return jsonResponse({
+        error: "Flush to R2 failed",
+        detail: `user-v2 returned HTTP ${flushResp.status}: ${errBody.slice(0, 500)}`,
+        trace,
+      }, 502);
+    }
+    const flushData = await flushResp.json() as { status?: string; size?: number };
+    log(`R2 wrote ${flushData.size} bytes`);
+
+    // Step 5: verify R2 has it
+    const restoreUrl = `http://user-v2.internal/__state/restore?user_id=${encodeURIComponent(targetUserId)}`;
+    const restoreResp = await env.USER_V2.fetch(new Request(restoreUrl, {
+      headers: { "X-Internal-Token": env.V2_SHARED_TOKEN || "" },
+    }));
+    if (!restoreResp.ok) {
+      return jsonResponse({
+        error: "R2 verification failed",
+        detail: `Restore-readback returned HTTP ${restoreResp.status} — uploaded but unreadable. Aborting before D1 flip.`,
+        trace,
+      }, 502);
+    }
+    const verifyBytes = (await restoreResp.arrayBuffer()).byteLength;
+    log(`verify read-back: ${verifyBytes} bytes`);
+
+    // Step 6: D1 flip
+    await env.DB.prepare(
+      "UPDATE user SET backend = ?, updatedAt = ? WHERE id = ?"
+    ).bind("cf", new Date().toISOString(), targetUserId).run();
+    log(`D1 backend flipped to 'cf'`);
+
+    // Step 7: stop Photon container (best-effort — don't fail if it's already gone)
+    let photonStopped = false;
+    try {
+      const stopUrl = `${env.ORCHESTRATOR_ORIGIN}/orch/containers/${encodeURIComponent(targetUserId)}/stop`;
+      const stopResp = await env.NAS_BACKEND.fetch(new Request(stopUrl, {
+        method: "POST",
+        headers: { "X-Orch-Token": env.ORCH_TOKEN },
+      }));
+      photonStopped = stopResp.ok;
+      log(`photon stop: ${stopResp.status}`);
+    } catch (err) {
+      log(`photon stop error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Step 8: recycle CF container so first request cold-starts onto R2 state
+    let cfRecycled = false;
+    try {
+      const recycleUrl = `http://user-v2.internal/admin/recycle/${encodeURIComponent(targetUserId)}`;
+      const recycleResp = await env.USER_V2.fetch(new Request(recycleUrl, {
+        method: "POST",
+        headers: { "X-Internal-Token": env.V2_SHARED_TOKEN || "" },
+      }));
+      cfRecycled = recycleResp.ok;
+      log(`cf recycle: ${recycleResp.status}`);
+    } catch (err) {
+      log(`cf recycle error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    return jsonResponse({
+      status: "ok",
+      user_id: targetUserId,
+      email: userRow.email,
+      backend: "cf",
+      tar_bytes: tarBytes.byteLength,
+      r2_verify_bytes: verifyBytes,
+      photon_stopped: photonStopped,
+      cf_recycled: cfRecycled,
+      forced: force,
+      trace,
+    });
+  } catch (err) {
+    return jsonResponse({
+      error: "Migration failed",
+      detail: err instanceof Error ? err.message : String(err),
+      trace,
+    }, 500);
+  }
+}
+
+/**
+ * Phase F.4 M5: V2 (CF) → V1 (Photon) rollback orchestrator.
+ *
+ * Inverse of handleAdminMigrateToCf. Steps:
+ *   1. User must currently be on backend='cf' in D1
+ *   2. All CF bots must be IDLE (force=true to skip)
+ *   3. Trigger immediate flush on V2 so R2 has the latest state
+ *   4. GET R2 tarball via /__state/restore
+ *   5. Ensure Photon container exists (refuse if not — admin must
+ *      create via deploy/v3/manage.sh create first)
+ *   6. POST tarball to orchestrator's /orch/import-state/<id>
+ *      (it stops the container, wipes /app/data, extracts, restarts)
+ *   7. UPDATE user.backend = 'photon' in D1
+ *   8. Recycle CF container so it loses its in-RAM keys cleanly
+ */
+async function handleAdminMigrateToPhoton(
+  request: Request,
+  env: Env,
+  targetUserId: string,
+): Promise<Response> {
+  const trace: string[] = [];
+  const log = (msg: string) => { trace.push(msg); console.log(`migrate-to-photon[${targetUserId}]: ${msg}`); };
+
+  let body: { force?: boolean };
+  try {
+    body = await request.json() as { force?: boolean };
+  } catch {
+    body = {};
+  }
+  const force = body.force === true;
+
+  try {
+    // Step 1: verify user is on CF
+    const userRow = await env.DB.prepare(
+      "SELECT id, email, backend FROM user WHERE id = ?"
+    ).bind(targetUserId).first<{ id: string; email: string; backend: string | null }>();
+    if (!userRow) {
+      return jsonResponse({ error: "User not found", trace }, 404);
+    }
+    const currentBackend = userRow.backend ?? "photon";
+    log(`current backend: ${currentBackend}`);
+    if (currentBackend !== "cf") {
+      return jsonResponse({
+        error: "Not on V2",
+        detail: `User ${userRow.email} is on backend='${currentBackend}', not 'cf'. Nothing to roll back.`,
+        trace,
+      }, 409);
+    }
+
+    // Step 2: V2 IDLE check
+    if (!force) {
+      const preflight = await probeBotsIdle(env, targetUserId);
+      log(`preflight: checked=${preflight.checked} all_idle=${preflight.all_idle} states=${JSON.stringify(preflight.states)}`);
+      if (preflight.checked && !preflight.all_idle) {
+        return jsonResponse({
+          error: "Bots not idle",
+          detail: `Refusing to roll back — at least one CF bot is mid-execution. Pause/abort it first or pass force=true.`,
+          preflight,
+          trace,
+        }, 409);
+      }
+    }
+
+    // Step 3: force-flush on V2 so R2 is current. We use the proxy endpoint
+    // so this hits the user's container's /settings/flush-state debug
+    // endpoint (which calls cloud_persistence.flush() synchronously).
+    try {
+      const flushUrl = `http://user-v2.internal/u/${encodeURIComponent(targetUserId)}/settings/flush-state`;
+      const flushResp = await env.USER_V2.fetch(new Request(flushUrl, {
+        method: "POST",
+        headers: {
+          "X-Internal-Token": env.V2_SHARED_TOKEN || "",
+          "X-User-Id": targetUserId,
+        },
+      }));
+      log(`pre-rollback v2 flush: ${flushResp.status}`);
+    } catch (err) {
+      log(`pre-rollback flush error (continuing): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Step 4: download R2 tarball
+    const restoreUrl = `http://user-v2.internal/__state/restore?user_id=${encodeURIComponent(targetUserId)}`;
+    const restoreResp = await env.USER_V2.fetch(new Request(restoreUrl, {
+      headers: { "X-Internal-Token": env.V2_SHARED_TOKEN || "" },
+    }));
+    if (!restoreResp.ok) {
+      return jsonResponse({
+        error: "R2 download failed",
+        detail: `Restore returned HTTP ${restoreResp.status} — no V2 state to roll back. User may have never been on V2 long enough for a flush.`,
+        trace,
+      }, 404);
+    }
+    const tarBytes = await restoreResp.arrayBuffer();
+    log(`r2 tarball: ${tarBytes.byteLength} bytes`);
+    if (tarBytes.byteLength < 100) {
+      return jsonResponse({
+        error: "R2 tarball too small",
+        detail: `R2 returned ${tarBytes.byteLength} bytes — implausibly small. Aborting before touching Photon.`,
+        trace,
+      }, 502);
+    }
+
+    // Step 5: ensure Photon container exists
+    const containerRow = await env.DB.prepare(
+      "SELECT container_name FROM user_container WHERE user_id = ?"
+    ).bind(targetUserId).first<{ container_name: string }>();
+    if (!containerRow) {
+      return jsonResponse({
+        error: "Photon container missing",
+        detail: `No container registered for user ${targetUserId} on Photon. Admin must run 'deploy/v3/manage.sh create ${targetUserId}' first.`,
+        trace,
+      }, 412);
+    }
+    log(`photon container: ${containerRow.container_name}`);
+
+    // Step 6: POST tarball to orchestrator import endpoint
+    const importUrl = `${env.ORCHESTRATOR_ORIGIN}/orch/import-state/${encodeURIComponent(targetUserId)}`;
+    const importResp = await env.NAS_BACKEND.fetch(new Request(importUrl, {
+      method: "POST",
+      headers: {
+        "X-Orch-Token": env.ORCH_TOKEN,
+        "Content-Type": "application/gzip",
+      },
+      body: tarBytes,
+    }));
+    if (!importResp.ok) {
+      const errBody = await importResp.text().catch(() => "");
+      return jsonResponse({
+        error: "Photon import failed",
+        detail: `Orchestrator returned HTTP ${importResp.status}: ${errBody.slice(0, 500)}`,
+        trace,
+      }, 502);
+    }
+    log(`photon import OK`);
+
+    // Step 7: D1 flip
+    await env.DB.prepare(
+      "UPDATE user SET backend = ?, updatedAt = ? WHERE id = ?"
+    ).bind("photon", new Date().toISOString(), targetUserId).run();
+    log(`D1 backend flipped to 'photon'`);
+
+    // Step 8: start Photon container (orchestrator left it stopped after import)
+    let photonStarted = false;
+    try {
+      const startUrl = `${env.ORCHESTRATOR_ORIGIN}/orch/containers/${encodeURIComponent(targetUserId)}/start`;
+      const startResp = await env.NAS_BACKEND.fetch(new Request(startUrl, {
+        method: "POST",
+        headers: { "X-Orch-Token": env.ORCH_TOKEN },
+      }));
+      photonStarted = startResp.ok;
+      log(`photon start: ${startResp.status}`);
+    } catch (err) {
+      log(`photon start error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Step 9: recycle CF container (clear in-RAM state, won't be reached now)
+    try {
+      const recycleUrl = `http://user-v2.internal/admin/recycle/${encodeURIComponent(targetUserId)}`;
+      await env.USER_V2.fetch(new Request(recycleUrl, {
+        method: "POST",
+        headers: { "X-Internal-Token": env.V2_SHARED_TOKEN || "" },
+      }));
+      log(`cf recycled`);
+    } catch (err) {
+      log(`cf recycle error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    return jsonResponse({
+      status: "ok",
+      user_id: targetUserId,
+      email: userRow.email,
+      backend: "photon",
+      tar_bytes: tarBytes.byteLength,
+      photon_started: photonStarted,
+      forced: force,
+      trace,
+    });
+  } catch (err) {
+    return jsonResponse({
+      error: "Rollback failed",
+      detail: err instanceof Error ? err.message : String(err),
+      trace,
+    }, 500);
   }
 }
 

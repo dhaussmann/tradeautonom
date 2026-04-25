@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { fetchAdminUsers, deleteAdminUser, setUserBackend } from '@/lib/admin-api'
-import type { AdminUser } from '@/lib/admin-api'
+import {
+  fetchAdminUsers,
+  deleteAdminUser,
+  setUserBackend,
+  migrateUserToCf,
+  migrateUserToPhoton,
+} from '@/lib/admin-api'
+import type { AdminUser, MigrateResult } from '@/lib/admin-api'
 import Typography from '@/components/ui/Typography.vue'
 import Button from '@/components/ui/Button.vue'
 
@@ -10,6 +16,8 @@ const loading = ref(true)
 const error = ref<string | null>(null)
 const deletingId = ref<string | null>(null)
 const flippingId = ref<string | null>(null)
+const migratingId = ref<string | null>(null)
+const migrationResult = ref<MigrateResult | null>(null)
 
 onMounted(loadUsers)
 
@@ -81,6 +89,72 @@ async function trySetBackend(user: AdminUser, next: 'photon' | 'cf', force: bool
   const idx = users.value.findIndex((u) => u.id === user.id)
   if (idx >= 0) {
     users.value[idx] = { ...users.value[idx], backend: res.backend as 'photon' | 'cf' }
+  }
+}
+
+/**
+ * Phase F.4 M5: full migration including state copy. Unlike the bare
+ * "Flip" button, this orchestrates: state export from old backend,
+ * upload to new backend, verification, and only then the D1 flip. If
+ * any step fails, D1 stays unchanged.
+ */
+async function handleMigrate(user: AdminUser) {
+  const current = user.backend ?? 'photon'
+  const direction = current === 'cf' ? 'V1 (Photon)' : 'V2 (Cloudflare)'
+  const warn =
+    current === 'cf'
+      ? `Roll back "${user.email}" from V2 (CF) to ${direction}?\n\n` +
+        `Steps the server will run:\n` +
+        `  1. Verify all V2 bots are IDLE/HOLDING\n` +
+        `  2. Force-flush V2 state to R2\n` +
+        `  3. Download R2 tarball into the Photon container\n` +
+        `  4. Restart Photon container with restored state\n` +
+        `  5. Flip user.backend back to 'photon' in D1\n\n` +
+        `Photon container '${user.container_name || 'ta-' + user.id}' must already exist.\n\n` +
+        `Continue?`
+      : `Migrate "${user.email}" from V1 (Photon) to ${direction}?\n\n` +
+        `Steps the server will run:\n` +
+        `  1. Verify all Photon bots are IDLE/HOLDING\n` +
+        `  2. Tar /app/data/ from the Photon container\n` +
+        `  3. Upload tarball to R2 via the user-v2 Worker\n` +
+        `  4. Verify R2 round-trip\n` +
+        `  5. Flip user.backend to 'cf' in D1\n` +
+        `  6. Stop Photon container, recycle CF container\n\n` +
+        `Continue?`
+  if (!confirm(warn)) return
+
+  migratingId.value = user.id
+  migrationResult.value = null
+  try {
+    await tryMigrate(user, current === 'cf' ? 'photon' : 'cf', false)
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg.toLowerCase().includes('not idle')) {
+      const forceOk = confirm(`${msg}\n\nForce the migration anyway? This will copy state mid-execution and may leave bots in an inconsistent state.`)
+      if (forceOk) {
+        try {
+          await tryMigrate(user, current === 'cf' ? 'photon' : 'cf', true)
+        } catch (e2: unknown) {
+          alert(e2 instanceof Error ? e2.message : String(e2))
+        }
+      }
+    } else {
+      alert(msg)
+    }
+  } finally {
+    migratingId.value = null
+  }
+}
+
+async function tryMigrate(user: AdminUser, target: 'photon' | 'cf', force: boolean) {
+  const res = target === 'cf'
+    ? await migrateUserToCf(user.id, force)
+    : await migrateUserToPhoton(user.id, force)
+  migrationResult.value = res
+  // Reflect new backend in the row
+  const idx = users.value.findIndex((u) => u.id === user.id)
+  if (idx >= 0) {
+    users.value[idx] = { ...users.value[idx], backend: res.backend }
   }
 }
 
@@ -159,12 +233,25 @@ function backendColor(backend: string | null): string {
                   {{ (u.backend ?? 'photon') === 'cf' ? 'V2 (CF)' : 'V1 (Photon)' }}
                 </span>
                 <Button
+                  variant="solid"
+                  color="success"
+                  size="sm"
+                  :loading="migratingId === u.id"
+                  :disabled="!!migratingId || !!flippingId"
+                  @click="handleMigrate(u)"
+                  :title="(u.backend ?? 'photon') === 'cf' ? 'Roll back to V1 with state copy' : 'Migrate to V2 with state copy'"
+                >
+                  {{ (u.backend ?? 'photon') === 'cf' ? '↩ Migrate to V1' : 'Migrate to V2 →' }}
+                </Button>
+                <Button
                   variant="ghost"
                   size="sm"
                   :loading="flippingId === u.id"
+                  :disabled="!!migratingId || !!flippingId"
                   @click="handleFlipBackend(u)"
+                  title="Bare flip without copying state — for emergency only"
                 >
-                  Flip
+                  Flip (no copy)
                 </Button>
               </div>
             </td>
@@ -199,6 +286,29 @@ function backendColor(backend: string | null): string {
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <div v-if="migrationResult" :class="$style.migrateResult">
+      <div :class="$style.migrateHeader">
+        <Typography size="text-sm" weight="semibold" color="success">
+          ✓ Migration complete: {{ migrationResult.email }} → {{ migrationResult.backend === 'cf' ? 'V2 (CF)' : 'V1 (Photon)' }}
+        </Typography>
+        <Button variant="ghost" size="sm" @click="migrationResult = null">×</Button>
+      </div>
+      <div :class="$style.migrateMeta">
+        <span><strong>Tar size:</strong> {{ migrationResult.tar_bytes }} bytes</span>
+        <span v-if="migrationResult.r2_verify_bytes != null"><strong>R2 verify:</strong> {{ migrationResult.r2_verify_bytes }} bytes</span>
+        <span v-if="migrationResult.photon_stopped !== undefined"><strong>Photon stopped:</strong> {{ migrationResult.photon_stopped ? 'yes' : 'no' }}</span>
+        <span v-if="migrationResult.photon_started !== undefined"><strong>Photon started:</strong> {{ migrationResult.photon_started ? 'yes' : 'no' }}</span>
+        <span v-if="migrationResult.cf_recycled !== undefined"><strong>CF recycled:</strong> {{ migrationResult.cf_recycled ? 'yes' : 'no' }}</span>
+        <span v-if="migrationResult.forced"><strong style="color:var(--color-warning);">forced</strong></span>
+      </div>
+      <details :class="$style.migrateTrace">
+        <summary>Step-by-step trace ({{ migrationResult.trace.length }} steps)</summary>
+        <ol>
+          <li v-for="(line, i) in migrationResult.trace" :key="i">{{ line }}</li>
+        </ol>
+      </details>
     </div>
 
     <div :class="$style.footer">
@@ -296,6 +406,52 @@ function backendColor(backend: string | null): string {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.migrateResult {
+  border: 1px solid var(--color-success, #22c55e);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--color-success-bg, rgba(34, 197, 94, 0.05));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.migrateHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.migrateMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.migrateTrace {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.migrateTrace summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.migrateTrace ol {
+  margin: 8px 0 0 24px;
+  padding: 0;
+}
+
+.migrateTrace li {
+  margin: 2px 0;
+  list-style: decimal;
 }
 
 .footer {
