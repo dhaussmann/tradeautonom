@@ -126,7 +126,7 @@ const filteredRows = computed(() => {
   return [...rows].sort((a, b) => {
     if (sortKey.value === 'symbol') return dir * a.symbol.localeCompare(b.symbol)
     if (sortKey.value === 'volume') return dir * (a.volume24h - b.volume24h)
-    return dir * (Math.abs(a.bestApr) - Math.abs(b.bestApr))
+    return dir * (a.aprSpread - b.aprSpread)
   })
 })
 
@@ -442,7 +442,7 @@ async function submit() {
                     <tr>
                       <th :class="$style.thSort" @click="toggleSort('symbol')">Market {{ sortKey === 'symbol' ? (sortAsc ? '▲' : '▼') : '' }}</th>
                       <th :class="[$style.thSort, $style.thRight]" @click="toggleSort('volume')">Volume {{ sortKey === 'volume' ? (sortAsc ? '▲' : '▼') : '' }}</th>
-                      <th :class="[$style.thSort, $style.thRight]" @click="toggleSort('apr')">APR {{ sortKey === 'apr' ? (sortAsc ? '▲' : '▼') : '' }}</th>
+                      <th :class="[$style.thSort, $style.thRight]" @click="toggleSort('apr')" title="Funding-arb spread: max(APR) − min(APR) across the two selected exchanges">Spread {{ sortKey === 'apr' ? (sortAsc ? '▲' : '▼') : '' }}</th>
                       <th v-for="ex in selectedExchanges" :key="ex" :class="$style.thExchange">
                         <img :src="DEX_LOGOS[ex]" :alt="displayExchange(ex)" style="height: 16px" />
                       </th>
@@ -457,8 +457,8 @@ async function submit() {
                     >
                       <td :class="$style.tcell"><strong>{{ row.symbol }}</strong></td>
                       <td :class="[$style.tcell, $style.tcRight]">{{ fmtVol(row.volume24h) }}</td>
-                      <td :class="[$style.tcell, $style.tcRight]" :style="{ color: row.bestApr >= 0 ? '#22c55e' : '#ef4444' }">
-                        {{ (row.bestApr * 100).toFixed(2) }}%
+                      <td :class="[$style.tcell, $style.tcRight]" :style="{ color: row.aprSpread > 0 ? '#22c55e' : 'var(--color-text-tertiary)' }">
+                        {{ (row.aprSpread * 100).toFixed(2) }}%
                       </td>
                       <td v-for="ex in selectedExchanges" :key="ex" :class="[$style.tcell, $style.tcExchange]">
                         <span :style="{ color: (row.perExchange[ex]?.apr ?? 0) >= 0 ? '#22c55e' : '#ef4444' }">

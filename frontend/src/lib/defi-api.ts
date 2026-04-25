@@ -123,7 +123,15 @@ export async function fetchCommonTokens(
 export interface TokenTableRow {
   symbol: string
   volume24h: number
-  bestApr: number
+  /**
+   * Funding-arb spread: |max(APR) − min(APR)| across the selected exchanges.
+   *
+   * This is what the bot actually earns — collecting positive funding on the
+   * high-APR exchange while paying the low-APR exchange on the opposite leg.
+   * Always >= 0; sign is irrelevant in Step 1 (long/short assignment is
+   * decided in Step 2 from the per-exchange APRs).
+   */
+  aprSpread: number
   perExchange: Record<string, { apr: number; price: number | null; volume: number | null }>
 }
 
@@ -143,7 +151,8 @@ export async function fetchCommonTokensWithData(
   return common.map(sym => {
     const perExchange: TokenTableRow['perExchange'] = {}
     let totalVol = 0
-    let bestApr = 0
+    let maxApr = -Infinity
+    let minApr = Infinity
     for (let i = 0; i < exchanges.length; i++) {
       const entry = maps[i].get(sym)!
       perExchange[exchanges[i]] = {
@@ -152,9 +161,15 @@ export async function fetchCommonTokensWithData(
         volume: entry.volume_24h,
       }
       totalVol += entry.volume_24h ?? 0
-      if (Math.abs(entry.funding_rate_apr) > Math.abs(bestApr)) bestApr = entry.funding_rate_apr
+      if (entry.funding_rate_apr > maxApr) maxApr = entry.funding_rate_apr
+      if (entry.funding_rate_apr < minApr) minApr = entry.funding_rate_apr
     }
-    return { symbol: sym, volume24h: totalVol, bestApr, perExchange }
+    // Funding-arb spread is the gap between the highest- and lowest-APR
+    // exchange — that's what the bot captures by going long the cheap leg
+    // and short the expensive leg. Always non-negative.
+    const aprSpread =
+      Number.isFinite(maxApr) && Number.isFinite(minApr) ? maxApr - minApr : 0
+    return { symbol: sym, volume24h: totalVol, aprSpread, perExchange }
   }).sort((a, b) => a.symbol.localeCompare(b.symbol))
 }
 
