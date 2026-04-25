@@ -47,6 +47,7 @@ import logging
 import os
 import signal
 import tarfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -67,6 +68,16 @@ DEFAULT_FLUSH_INTERVAL_S = 30.0
 # the BFM signature check while still letting the Worker authenticate
 # us via the X-Internal-Token header.
 _OUTBOUND_USER_AGENT = "tradeautonom-container/1.0"
+
+# State-tar format version. Written into _STATE_VERSION as the first file
+# of every flush, checked at restore time. Bump if the tar layout changes
+# in a way that older containers can't safely consume (e.g. new mandatory
+# file format, encryption scheme change). The current container ignores
+# tarballs whose version is higher than _STATE_VERSION_CURRENT and treats
+# the state as missing — safer than crashing on unknown layout.
+_STATE_VERSION_FILENAME = "_STATE_VERSION"
+_STATE_VERSION_CURRENT = 1
+_STATE_VERSION_MIN_SUPPORTED = 1
 
 # Files under /app/data/ we refuse to include in the snapshot, even if
 # present. Keeps each user's tarball clean of logs, tmp, and other data
@@ -199,10 +210,67 @@ def restore_sync() -> None:
 
     size = len(body)
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # M2.B.3: validate the tar before touching the filesystem. If the file
+    # is corrupt (truncated, wrong magic, unreadable), bail out with a
+    # warning and leave /app/data untouched — the container will boot as
+    # if no state existed (auth/status will report setup_required and the
+    # user can re-onboard).
+    try:
+        # Validate by opening + listing members; this raises on corrupt tars
+        # before _safe_extract starts writing.
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as _tf_check:
+            members = _tf_check.getmembers()
+    except Exception as exc:
+        logger.error(
+            "cloud_persistence: tarball validation failed (%s) — refusing to "
+            "extract corrupt state; container starts with empty /app/data",
+            exc,
+        )
+        return
+
+    # M2.B.4: check the state-format version marker (if present). Tars that
+    # omit it predate the marker and are accepted as v1 for backwards
+    # compat. Tars that declare a version higher than we support are
+    # refused — better to start fresh than corrupt the user's data with a
+    # newer-than-expected layout.
+    declared_version: int | None = None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as _tf_ver:
+            try:
+                _f = _tf_ver.extractfile(_STATE_VERSION_FILENAME)
+                if _f is not None:
+                    declared_version = int(_f.read().decode("utf-8", errors="replace").strip())
+            except KeyError:
+                declared_version = None  # no marker → legacy tar
+    except Exception:
+        declared_version = None
+
+    if declared_version is not None:
+        if declared_version > _STATE_VERSION_CURRENT:
+            logger.error(
+                "cloud_persistence: tarball declares state version %d but "
+                "this container only supports up to %d — refusing to "
+                "extract; container starts with empty /app/data",
+                declared_version, _STATE_VERSION_CURRENT,
+            )
+            return
+        if declared_version < _STATE_VERSION_MIN_SUPPORTED:
+            logger.warning(
+                "cloud_persistence: tarball declares state version %d "
+                "(below minimum supported %d) — extracting anyway, may "
+                "miss newer fields",
+                declared_version, _STATE_VERSION_MIN_SUPPORTED,
+            )
+
     try:
         with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tf:
             _safe_extract(tf, _DATA_DIR)
-        logger.info("cloud_persistence: restore complete — %d bytes extracted to %s (http=%d)", size, _DATA_DIR, status)
+        logger.info(
+            "cloud_persistence: restore complete — %d bytes, %d members, "
+            "version=%s extracted to %s (http=%d)",
+            size, len(members), declared_version, _DATA_DIR, status,
+        )
     except Exception as exc:
         logger.error("cloud_persistence: tarball extraction failed: %s — state may be partial", exc)
 
@@ -385,17 +453,32 @@ def _signature_of(root: Path) -> tuple[int, int]:
 
 
 def _make_tarball() -> Optional[io.BytesIO]:
-    """Create an in-memory gzipped tar of _DATA_DIR, excluding transient bits."""
+    """Create an in-memory gzipped tar of _DATA_DIR, excluding transient bits.
+
+    The first file in every tar is _STATE_VERSION, which restore uses to
+    detect format compatibility. The rest is /app/data/* with the same
+    relative paths.
+    """
     if not _DATA_DIR.exists():
         return None
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        # M2.B.4: write the version marker first.
+        version_bytes = f"{_STATE_VERSION_CURRENT}\n".encode("utf-8")
+        version_info = tarfile.TarInfo(name=_STATE_VERSION_FILENAME)
+        version_info.size = len(version_bytes)
+        version_info.mtime = int(time.time())
+        tf.addfile(version_info, io.BytesIO(version_bytes))
+
         for p in sorted(_DATA_DIR.rglob("*")):
             if _is_excluded(p):
                 continue
             try:
                 arcname = str(p.relative_to(_DATA_DIR))
             except ValueError:
+                continue
+            # Skip a stale on-disk _STATE_VERSION (we wrote one above).
+            if arcname == _STATE_VERSION_FILENAME:
                 continue
             try:
                 tf.add(str(p), arcname=arcname, recursive=False)
@@ -413,9 +496,14 @@ def _is_excluded(p: Path) -> bool:
 
 
 def _safe_extract(tf: tarfile.TarFile, dest: Path) -> None:
-    """Safer tar extraction that refuses path-traversal entries."""
+    """Safer tar extraction that refuses path-traversal entries.
+
+    Skips _STATE_VERSION (metadata-only, not part of /app/data).
+    """
     dest_resolved = dest.resolve()
     for member in tf.getmembers():
+        if member.name == _STATE_VERSION_FILENAME:
+            continue
         target = (dest / member.name).resolve()
         if not str(target).startswith(str(dest_resolved)):
             logger.warning("cloud_persistence: refusing to extract %s (path traversal)", member.name)

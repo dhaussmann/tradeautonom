@@ -385,37 +385,52 @@ app.add_middleware(
 # the Worker forwards (it always sets X-User-Id + X-Internal-Token). On
 # first sight, inject them into cloud_persistence, restore state, and
 # start the background flush task.
+#
+# M2.B.2: an asyncio.Lock guards the bootstrap block so two concurrent
+# requests can't both fire restore_sync (which would race on /app/data
+# extraction and spawn duplicate flush tasks).
 _v2_state_bootstrapped = False
 _v2_flush_task: "asyncio.Task | None" = None
+_v2_bootstrap_lock = asyncio.Lock()
 
 
 @app.middleware("http")
 async def _v2_runtime_bootstrap(request, call_next):
     global _v2_state_bootstrapped, _v2_flush_task
     if not _v2_state_bootstrapped:
-        try:
-            user_id = request.headers.get("x-user-id", "") or request.headers.get("X-User-Id", "")
-            token = request.headers.get("x-internal-token", "") or request.headers.get("X-Internal-Token", "")
-            if user_id and token and _settings and getattr(_settings, "v2_cloud_persistence", False):
-                from app.cloud_persistence import (
-                    set_runtime_credentials,
-                    restore_sync,
-                    start_background_flush,
-                )
-                set_runtime_credentials(user_id, token)
-                # Restore in a thread so we don't block the request.
-                import asyncio as _asyncio
-                await _asyncio.get_event_loop().run_in_executor(None, restore_sync)
-                # Start the flush task now that creds are present.
-                if _v2_flush_task is None or _v2_flush_task.done():
-                    _v2_flush_task = await start_background_flush()
-                _v2_state_bootstrapped = True
-                logger.info(
-                    "cloud_persistence: runtime bootstrap complete user_id=%s flush_task=%s",
-                    user_id, bool(_v2_flush_task),
-                )
-        except Exception as exc:
-            logger.warning("cloud_persistence: runtime bootstrap failed: %s", exc)
+        # Fast path: only acquire the lock if we still need to bootstrap.
+        # Once _v2_state_bootstrapped is True, every other request skips
+        # the lock entirely.
+        async with _v2_bootstrap_lock:
+            # Re-check inside the lock — another coroutine may have
+            # finished the bootstrap while we were waiting for the lock.
+            if not _v2_state_bootstrapped:
+                try:
+                    user_id = request.headers.get("x-user-id", "") or request.headers.get("X-User-Id", "")
+                    token = request.headers.get("x-internal-token", "") or request.headers.get("X-Internal-Token", "")
+                    if user_id and token and _settings and getattr(_settings, "v2_cloud_persistence", False):
+                        from app.cloud_persistence import (
+                            set_runtime_credentials,
+                            restore_sync,
+                            start_background_flush,
+                        )
+                        set_runtime_credentials(user_id, token)
+                        # Restore in a thread so we don't block the loop.
+                        import asyncio as _asyncio
+                        bootstrap_t0 = time.time()
+                        await _asyncio.get_event_loop().run_in_executor(None, restore_sync)
+                        restore_ms = (time.time() - bootstrap_t0) * 1000
+                        # Start the flush task now that creds are present.
+                        if _v2_flush_task is None or _v2_flush_task.done():
+                            _v2_flush_task = await start_background_flush()
+                        _v2_state_bootstrapped = True
+                        logger.info(
+                            "cloud_persistence: runtime bootstrap complete user_id=%s "
+                            "flush_task=%s restore_ms=%.1f",
+                            user_id, bool(_v2_flush_task), restore_ms,
+                        )
+                except Exception as exc:
+                    logger.warning("cloud_persistence: runtime bootstrap failed: %s", exc)
     return await call_next(request)
 
 
@@ -2727,6 +2742,80 @@ async def get_keys():
         "grvt_trading_account_id": _mask(_settings.grvt_trading_account_id),
         "variational_jwt_token": _mask(_settings.variational_jwt_token),
     }
+
+
+@app.post("/settings/restore-state")
+async def trigger_restore_diagnose():
+    """Diagnostic — fetch the current R2 tarball without extracting it,
+    return metadata so we can verify what's actually stored remotely.
+    """
+    try:
+        import io as _io
+        import tarfile as _tar
+        import urllib.request, urllib.error
+        from app.cloud_persistence import (
+            _Config, _endpoint_base, _OUTBOUND_USER_AGENT,
+            _STATE_VERSION_FILENAME,
+        )
+        _Config.load()
+        if not _Config.enabled:
+            return {"ok": False, "result": "disabled"}
+        if not all([_Config.user_id, _Config.state_endpoint, _Config.shared_token]):
+            return {"ok": False, "result": "missing_creds"}
+
+        url = f"{_endpoint_base()}/__state/restore?user_id={_Config.user_id}"
+        diag = {"url": url}
+        try:
+            req = urllib.request.Request(url, headers={
+                "X-Internal-Token": _Config.shared_token,
+                "User-Agent": _OUTBOUND_USER_AGENT,
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            return {
+                "ok": False,
+                "http_status": exc.code,
+                "result": "http_error",
+                **diag,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "result": "exception", **diag}
+
+        diag["http_status"] = status
+        diag["body_bytes"] = len(body)
+
+        # Inspect the tarball
+        try:
+            with _tar.open(fileobj=_io.BytesIO(body), mode="r:gz") as tf:
+                members = []
+                for m in tf.getmembers():
+                    members.append({"name": m.name, "size": m.size})
+                diag["members"] = members
+                diag["member_count"] = len(members)
+                # Read version marker if present
+                try:
+                    f = tf.extractfile(_STATE_VERSION_FILENAME)
+                    if f is not None:
+                        diag["version_marker"] = f.read().decode("utf-8", errors="replace").strip()
+                    else:
+                        diag["version_marker"] = "absent (legacy tar)"
+                except KeyError:
+                    diag["version_marker"] = "absent"
+        except Exception as exc:
+            diag["tar_parse_error"] = str(exc)
+            # Show first few bytes for debugging
+            diag["body_hex_head"] = body[:32].hex()
+
+        return {"ok": True, "result": "fetched", **diag}
+    except Exception as exc:
+        import traceback as _tb
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "tb": _tb.format_exc().splitlines()[-6:],
+        }
 
 
 @app.post("/settings/flush-state")
