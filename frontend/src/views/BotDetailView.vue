@@ -270,9 +270,31 @@ function positionForExchange(exchange: string): import('@/types/account').Positi
     ? status.value.config.instrument_a
     : status.value.config.instrument_b
   if (!instrument) return null
-  return accountStore.positions.find(
+
+  // Primary: exact instrument match — works for Extended/GRVT/Nado where the
+  // symbol on a position is identical to the symbol in the bot config.
+  const exact = accountStore.positions.find(
     p => p.exchange === exchange && p.instrument === instrument
-  ) ?? null
+  )
+  if (exact) return exact
+
+  // Fallback for Variational: position objects carry a `funding_interval_s`
+  // captured when the position was opened, so a position opened during the
+  // 1h-funding era still says "P-XRP-USDC-3600" even though the live tradable
+  // instrument (and our bot config) is now "P-XRP-USDC-28800". Match by the
+  // `underlying` token instead. The Variational client populates `underlying`
+  // explicitly (e.g. "XRP", "DOGE") for exactly this case.
+  if (exchange === 'variational' && instrument.startsWith('P-')) {
+    const tokenMatch = instrument.match(/^P-([^-]+)-/)
+    const token = tokenMatch?.[1]
+    if (token) {
+      const byUnderlying = accountStore.positions.find(
+        p => p.exchange === exchange && p.underlying === token,
+      )
+      if (byUnderlying) return byUnderlying
+    }
+  }
+  return null
 }
 
 function fundingPerHour(exchange: string): string {

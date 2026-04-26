@@ -318,6 +318,22 @@ class VariationalClient:
                 return listing
         return None
 
+    def _find_listing_by_underlying(self, stats: dict, underlying: str) -> dict | None:
+        """Find a Variational listing by underlying token name (case-insensitive).
+
+        Used when a position object only carries an `underlying` field without
+        the full instrument metadata — specifically `funding_interval_s`. The
+        live stats listing always carries the current funding interval, so we
+        use it to canonicalise the symbol of returned position objects.
+        """
+        if not underlying:
+            return None
+        target = underlying.upper()
+        for listing in stats.get("listings", []):
+            if listing.get("ticker", "").upper() == target:
+                return listing
+        return None
+
     async def async_fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
         """Build synthetic orderbook from Variational quotes.
 
@@ -571,8 +587,31 @@ class VariationalClient:
             pi = pos.get("position_info", pos)
             inst = pi.get("instrument", {})
             underlying = inst.get("underlying", "") if isinstance(inst, dict) else str(inst)
-            fi = inst.get("funding_interval_s", 3600) if isinstance(inst, dict) else 3600
+            fi_raw = inst.get("funding_interval_s") if isinstance(inst, dict) else None
             settle = inst.get("settlement_asset", "USDC") if isinstance(inst, dict) else "USDC"
+
+            # Variational position objects sometimes carry only `underlying`
+            # without `funding_interval_s` — but the live /metadata/stats
+            # listing for that token always has the current value. Fall back
+            # to it so the resulting `full_symbol` matches what bot configs
+            # and the BotDetailView UI filter expect.
+            if fi_raw is None:
+                if not self._stats_cache or (time.time() - self._stats_cache_ts) > 30:
+                    try:
+                        await self._get_stats(force=True)
+                    except Exception:
+                        pass
+                listing_for_fi = self._find_listing_by_underlying(
+                    self._stats_cache, underlying,
+                )
+                fi = (
+                    int(listing_for_fi.get("funding_interval_s", 3600))
+                    if listing_for_fi
+                    else 3600
+                )
+            else:
+                fi = int(fi_raw)
+
             # Build full symbol matching the format used in config/jobs
             full_symbol = f"P-{underlying}-{settle}-{fi}"
 
@@ -606,9 +645,25 @@ class VariationalClient:
                 if listing:
                     mark_price = float(listing.get("mark_price", 0))
 
+            # Optional Variational-specific fields. The position object's
+            # `value` is the USD notional (negative for shorts) and
+            # `estimated_liquidation_price` is the liquidation level. We
+            # surface them so the BotDetailView UI can render them.
+            est_liq_raw = pos.get("estimated_liquidation_price")
+            est_liq = float(est_liq_raw) if est_liq_raw not in (None, "") else None
+            try:
+                value_usd = float(pos.get("value", 0))
+            except (TypeError, ValueError):
+                value_usd = 0.0
+
             result.append({
                 "symbol": full_symbol,
                 "instrument": full_symbol,
+                # `underlying` lets the frontend match positions by token name
+                # when the symbol's funding-interval suffix has drifted (e.g.
+                # bot config has "P-XRP-USDC-28800" but Variational position
+                # object still carries "P-XRP-USDC-3600" from open-time).
+                "underlying": underlying,
                 "size": abs(size),
                 "side": side_val,
                 "entry_price": entry_price,
@@ -616,6 +671,8 @@ class VariationalClient:
                 "unrealized_pnl": float(pos.get("upnl", 0)),
                 "realized_pnl": float(pos.get("rpnl", 0)),
                 "cumulative_funding": float(pos.get("cum_funding", 0)),
+                "est_liquidation_price": est_liq,
+                "value": value_usd,
                 "raw": pos,
             })
         return result
@@ -806,8 +863,23 @@ class VariationalClient:
             pi = pos.get("position_info", pos)
             inst = pi.get("instrument", {})
             underlying = inst.get("underlying", "") if isinstance(inst, dict) else str(inst)
-            fi = inst.get("funding_interval_s", 3600) if isinstance(inst, dict) else 3600
+            fi_raw = inst.get("funding_interval_s") if isinstance(inst, dict) else None
             settle = inst.get("settlement_asset", "USDC") if isinstance(inst, dict) else "USDC"
+
+            # Variational position objects sometimes carry only `underlying`
+            # without `funding_interval_s`. Use the live stats listing
+            # (already refreshed above) to canonicalise the symbol so it
+            # matches what bot configs and the BotDetailView UI filter expect.
+            if fi_raw is None:
+                listing_for_fi = self._find_listing_by_underlying(stats, underlying)
+                fi = (
+                    int(listing_for_fi.get("funding_interval_s", 3600))
+                    if listing_for_fi
+                    else 3600
+                )
+            else:
+                fi = int(fi_raw)
+
             full_symbol = f"P-{underlying}-{settle}-{fi}"
 
             size = float(pi.get("qty", pi.get("size", 0)))
@@ -837,9 +909,25 @@ class VariationalClient:
             if listing:
                 mark_price = float(listing.get("mark_price", 0))
 
+            # Optional Variational-specific fields. The position object's
+            # `value` is the USD notional (negative for shorts) and
+            # `estimated_liquidation_price` is the liquidation level. We
+            # surface them so the BotDetailView UI can render them.
+            est_liq_raw = pos.get("estimated_liquidation_price")
+            est_liq = float(est_liq_raw) if est_liq_raw not in (None, "") else None
+            try:
+                value_usd = float(pos.get("value", 0))
+            except (TypeError, ValueError):
+                value_usd = 0.0
+
             result.append({
                 "symbol": full_symbol,
                 "instrument": full_symbol,
+                # `underlying` lets the frontend match positions by token name
+                # when the symbol's funding-interval suffix has drifted (e.g.
+                # bot config has "P-XRP-USDC-28800" but Variational position
+                # object still carries "P-XRP-USDC-3600" from open-time).
+                "underlying": underlying,
                 "size": abs(size),
                 "side": side_val,
                 "entry_price": entry_price,
@@ -847,6 +935,8 @@ class VariationalClient:
                 "unrealized_pnl": float(pos.get("upnl", 0)),
                 "realized_pnl": float(pos.get("rpnl", 0)),
                 "cumulative_funding": float(pos.get("cum_funding", 0)),
+                "est_liquidation_price": est_liq,
+                "value": value_usd,
             })
         return result
 
