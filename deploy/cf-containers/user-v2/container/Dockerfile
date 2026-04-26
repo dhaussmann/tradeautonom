@@ -52,7 +52,7 @@ RUN chmod +x /app/entrypoint.sh
 ENV V2_HEADLESS=1
 
 # Build cache-bust marker for Phase F.4 roll-out
-ENV V2_BUILD_TAG=dna-config-no-persist-oms-v36
+ENV V2_BUILD_TAG=builders-enabled-v37
 
 EXPOSE 8000
 

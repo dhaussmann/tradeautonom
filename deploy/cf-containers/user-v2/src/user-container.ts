@@ -69,9 +69,21 @@ export class UserContainer extends Container<Env> {
     V2_CLOUD_PERSISTENCE: "1",
     V2_FLUSH_INTERVAL_S: "30",
     STATE_ENDPOINT: "https://user-v2.defitool.de",
-    // Extended builder-code routing disabled for all V2 users until we add
-    // a per-user override mechanism.
-    EXTENDED_BUILDER_ENABLED: "false",
+    // Extended builder-code routing for V2 users.
+    //
+    // All three envVars must be set together — ExtendedClient only attaches
+    // builder kwargs to orders when _builder_enabled AND _builder_id AND
+    // _builder_fee > 0 (see app/extended_client.py:119, _builder_kwargs).
+    //
+    // Pinned globally to a single builder identity for now; per-user
+    // override (e.g. via /internal/apply-keys) is a future enhancement.
+    //
+    // Fee is the fraction taken by the builder per order (0.0001 = 0.01% =
+    // 10 bps). Pydantic-settings reads the env var case-insensitively into
+    // Settings.extended_builder_fee (float).
+    EXTENDED_BUILDER_ENABLED: "true",
+    EXTENDED_BUILDER_ID: "222655",
+    EXTENDED_BUILDER_FEE: "0.0001",
   };
 
   override onStart(): void {
