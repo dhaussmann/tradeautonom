@@ -213,11 +213,17 @@ class DNABot:
             checks[exch_name] = result
 
         # ── OMS checks: health + per-exchange book sample ──
+        # OMS-v2 sits behind Cloudflare's bot-fight-mode which 403s the
+        # default Python-urllib User-Agent. Set a custom UA on every
+        # request so preflight works against the V2 OMS.
         oms_result: dict[str, Any] = {"health": False, "books": {}, "error": None}
         oms_url = self.config.oms_url.rstrip("/")
+        _oms_headers = {"User-Agent": "tradeautonom-dna/1.0"}
         # Health
         try:
-            req = urllib.request.Request(f"{oms_url}/health", method="GET")
+            req = urllib.request.Request(
+                f"{oms_url}/health", method="GET", headers=_oms_headers,
+            )
             resp = await asyncio.wait_for(
                 asyncio.to_thread(urllib.request.urlopen, req, None, 5), timeout=8,
             )
@@ -238,6 +244,7 @@ class DNABot:
             try:
                 req = urllib.request.Request(
                     f"{oms_url}/book/{exch_name}/{sym}", method="GET",
+                    headers=_oms_headers,
                 )
                 resp = await asyncio.wait_for(
                     asyncio.to_thread(urllib.request.urlopen, req, None, 5), timeout=8,
@@ -351,9 +358,20 @@ class DNABot:
 
     @staticmethod
     def _fetch_json(url: str) -> dict | None:
-        """Blocking HTTP GET returning parsed JSON dict."""
+        """Blocking HTTP GET returning parsed JSON dict.
+
+        Sets a non-default User-Agent because OMS-v2 sits behind
+        Cloudflare's bot-fight-mode which 403s the default
+        "Python-urllib/3.x" UA.
+        """
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "tradeautonom-dna/1.0",
+                },
+            )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return json.loads(resp.read())
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
@@ -369,7 +387,15 @@ class DNABot:
             )
             if data:
                 self._oms_fee_config = data
-                logger.info("DNA: cached OMS fee config: %s", data.get("min_profit_bps", {}))
+                # OMS-v2 returns the per-pair fee map under the key
+                # `min_profit_bps_by_pair` while V1's oms uses
+                # `min_profit_bps`. Read either so the log line is
+                # always informative.
+                fees = (
+                    data.get("min_profit_bps")
+                    or data.get("min_profit_bps_by_pair", {})
+                )
+                logger.info("DNA: cached OMS fee config: %s", fees)
         except Exception as exc:
             logger.warning("DNA: failed to fetch OMS config: %s", exc)
 
@@ -488,7 +514,14 @@ class DNABot:
             filt["min_profit_bps"] = self.config.custom_min_spread_bps
         elif mode == "half_neutral":
             if self._oms_fee_config:
-                min_bps_map = self._oms_fee_config.get("min_profit_bps", {})
+                # Schema-tolerant: V1 oms uses `min_profit_bps`, OMS-v2
+                # uses `min_profit_bps_by_pair`. Same content (per-pair
+                # bps map), different key name. Accept either.
+                min_bps_map = (
+                    self._oms_fee_config.get("min_profit_bps")
+                    or self._oms_fee_config.get("min_profit_bps_by_pair")
+                    or {}
+                )
                 if min_bps_map:
                     avg_threshold = sum(min_bps_map.values()) / len(min_bps_map)
                     filt["min_profit_bps"] = round(avg_threshold * 0.5, 2)

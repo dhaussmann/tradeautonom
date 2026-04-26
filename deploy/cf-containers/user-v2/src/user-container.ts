@@ -52,8 +52,14 @@ export class UserContainer extends Container<Env> {
     APP_HOST: "0.0.0.0",
     APP_PORT: "8000",
     APP_RELOAD: "0", // baked code — no uvicorn hot-reload
-    // OMS-v2 subscribe URL. V1 containers hardcoded Photon's 8099.
+    // OMS-v2 used by BOTH the funding-arb engine (DataLayer) AND the
+    // DNA arb scanner. They read the same OMS via two different
+    // settings, both of which we override here so V2 containers don't
+    // try to reach V1's NAS-internal http://192.168.133.100:8099 (the
+    // app-side defaults). DNA bot's URL handling auto-converts the
+    // https:// prefix to wss:// for the /ws/arb subscription.
     FN_OPT_SHARED_MONITOR_URL: "https://oms-v2.defitool.de",
+    DNA_OMS_URL: "https://oms-v2.defitool.de",
     GRVT_ENV: "prod",
     // History ingestion — same as V1 .env.container.
     HISTORY_INGEST_URL: "https://bot.defitool.de/api/history/ingest",
