@@ -1386,8 +1386,20 @@ class DNABot:
         except Exception as exc:
             logger.warning("DNA '%s': failed to load state: %s", self.config.bot_id, exc)
 
+    # Deployment-scoped fields that come from Settings/env at runtime and
+    # MUST NOT be restored from a (possibly stale) on-disk config dump.
+    # Persisting these would let an old value override a fresh redeploy
+    # — e.g. an oms_url written when the user was on V1 (NAS:8099) would
+    # forever shadow a new V2 DNA_OMS_URL env var.
+    _NEVER_PERSIST_CONFIG_KEYS: tuple[str, ...] = ("oms_url", "bot_id")
+
     def _load_config(self) -> None:
-        """Load persisted config from disk (merge into current config)."""
+        """Load persisted config from disk (merge into current config).
+
+        Skips deployment-scoped fields (`oms_url`, `bot_id`) so they
+        always come from Settings/env, not whatever value was last
+        flushed to disk.
+        """
         path = self._state_dir() / "config.json"
         if not path.exists():
             return
@@ -1395,6 +1407,8 @@ class DNABot:
             with open(path) as fh:
                 data = json.load(fh)
             for key, val in data.items():
+                if key in self._NEVER_PERSIST_CONFIG_KEYS:
+                    continue
                 if hasattr(self.config, key):
                     setattr(self.config, key, val)
             logger.info("DNA '%s': restored config from disk (simulation=%s, exit_mode=%s)",
@@ -1403,9 +1417,17 @@ class DNABot:
             logger.warning("DNA '%s': failed to load config: %s", self.config.bot_id, exc)
 
     def _save_config(self) -> None:
-        """Persist config to disk."""
+        """Persist config to disk (excluding deployment-scoped fields).
+
+        See _NEVER_PERSIST_CONFIG_KEYS — those come from env at runtime
+        and we deliberately drop them from the on-disk dump so they
+        can't shadow a future redeploy.
+        """
         path = self._state_dir() / "config.json"
-        data = asdict(self.config)
+        data = {
+            k: v for k, v in asdict(self.config).items()
+            if k not in self._NEVER_PERSIST_CONFIG_KEYS
+        }
         with open(path, "w") as fh:
             json.dump(data, fh, indent=2)
 
@@ -1418,6 +1440,7 @@ class DNABot:
             "bot_id": self.config.bot_id,
             "running": self._running,
             "config": {
+                "oms_url": self.config.oms_url,
                 "position_size_usd": self.config.position_size_usd,
                 "max_positions": self.config.max_positions,
                 "spread_mode": self.config.spread_mode,

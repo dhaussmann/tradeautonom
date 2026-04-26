@@ -125,6 +125,13 @@ export class UserContainer extends Container<Env> {
     if (url.pathname === "/__recycle") {
       try {
         await this.stop();
+        // Reset the started-with-env flag so the next ensureStarted()
+        // actually restarts the container with the freshest envVars
+        // (instead of treating "still started" as a no-op). Without
+        // this, recycled containers come back up with whatever env
+        // they originally booted with — even after we've redeployed
+        // the Worker with new envVars (e.g. DNA_OMS_URL).
+        this._startedWithEnv = false;
         console.log(JSON.stringify({ evt: "user_container_recycled" }));
         return new Response(
           JSON.stringify({ status: "stopped", evt: "will_cold_start_on_next_request" }),

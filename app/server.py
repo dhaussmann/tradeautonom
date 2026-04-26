@@ -109,6 +109,60 @@ _auto_trade_task: asyncio.Task | None = None
 _history_ingest_task: asyncio.Task | None = None
 
 
+def _build_dna_bot() -> None:
+    """Construct (or reconstruct) the DNA bot from current Settings.
+
+    Called from both _init_exchange_clients (first vault unlock) and
+    _reinit_exchange_clients (key re-injection). Without re-creating
+    the DNA bot on re-inject, a container that started before its
+    DNA_OMS_URL envVar reached the image keeps a stale oms_url
+    forever — preflight then times out trying to dial the V1 NAS.
+    """
+    global _dna_bot
+    if not _dna_import_ok:
+        logger.warning("DNA bot skipped — import failed")
+        _dna_bot = None
+        return
+    if not _settings:
+        _dna_bot = None
+        return
+    logger.info(
+        "_build_dna_bot called: settings.dna_oms_url=%s env.DNA_OMS_URL=%s",
+        getattr(_settings, "dna_oms_url", "?"),
+        os.environ.get("DNA_OMS_URL", "(unset)"),
+    )
+    try:
+        dna_config = DNAConfig(
+            bot_id="dna-default",
+            oms_url=_settings.dna_oms_url,
+            position_size_usd=_settings.dna_position_size_usd,
+            max_positions=_settings.dna_max_positions,
+            min_profit_bps=_settings.dna_min_profit_bps,
+            exchanges=_settings.dna_exchanges.split(","),
+            slippage_tolerance_pct=_settings.dna_slippage_tolerance_pct,
+            size_tolerance_pct=_settings.dna_size_tolerance_pct,
+            simulation=_settings.dna_simulation,
+            excluded_tokens=[
+                t.strip()
+                for t in _settings.dna_excluded_tokens.split(",")
+                if t.strip()
+            ],
+            auto_exclude_open_positions=_settings.dna_auto_exclude_open_positions,
+        )
+        _dna_bot = DNABot(
+            config=dna_config,
+            clients=_exchange_clients,
+            activity_forwarder=_activity_forwarder,
+        )
+        logger.info(
+            "DNA bot (re)initialized: %s (oms_url=%s simulation=%s)",
+            dna_config.bot_id, dna_config.oms_url, dna_config.simulation,
+        )
+    except Exception as exc:
+        logger.warning("DNA bot init failed (non-fatal): %s", exc)
+        _dna_bot = None
+
+
 async def _init_exchange_clients():
     """Initialize exchange clients and engines after vault unlock."""
     global _settings, _client, _extended_client, _executor, _arb_engine
@@ -213,28 +267,7 @@ async def _init_exchange_clients():
         _bot_registry = None
 
     # ── DNA Bot (Delta-Neutral Arbitrage) ────────────────────────
-    if not _dna_import_ok:
-        logger.warning("DNA bot skipped — import failed")
-    else:
-        try:
-            dna_config = DNAConfig(
-                bot_id="dna-default",
-                oms_url=_settings.dna_oms_url,
-                position_size_usd=_settings.dna_position_size_usd,
-                max_positions=_settings.dna_max_positions,
-                min_profit_bps=_settings.dna_min_profit_bps,
-                exchanges=_settings.dna_exchanges.split(","),
-                slippage_tolerance_pct=_settings.dna_slippage_tolerance_pct,
-                size_tolerance_pct=_settings.dna_size_tolerance_pct,
-                simulation=_settings.dna_simulation,
-                excluded_tokens=[t.strip() for t in _settings.dna_excluded_tokens.split(",") if t.strip()],
-                auto_exclude_open_positions=_settings.dna_auto_exclude_open_positions,
-            )
-            _dna_bot = DNABot(config=dna_config, clients=_exchange_clients, activity_forwarder=_activity_forwarder)
-            logger.info("DNA bot initialized: %s (simulation=%s)", dna_config.bot_id, dna_config.simulation)
-        except Exception as exc:
-            logger.warning("DNA bot init failed (non-fatal): %s", exc)
-            _dna_bot = None
+    _build_dna_bot()
 
     # ── Journal Collector (order/fill/funding/points history) ──────
     global _journal_collector
@@ -2579,6 +2612,22 @@ def _reinit_exchange_clients() -> None:
         )
     # Reinit executor (uses GRVT client)
     _executor = TradeExecutor(_client, _settings)
+    # Rebuild the DNA bot so it picks up settings refreshed via env vars
+    # since the first vault unlock (e.g. DNA_OMS_URL on V2 containers
+    # whose envVars rolled out after the container had already booted).
+    # The bot is non-running by default, so this is safe to call any time
+    # the user is not actively running DNA arb trades. If the user IS
+    # running, _dna_bot.running survives because we only swap the global
+    # after the new bot is built — but a running DNA bot would prefer a
+    # full /dna/stop + start; we don't auto-stop here.
+    if _dna_bot is None or not getattr(_dna_bot, "running", False):
+        _build_dna_bot()
+    else:
+        logger.info(
+            "DNA bot rebuild skipped: bot is currently running (oms_url=%s); "
+            "stop and restart to apply new settings",
+            getattr(_dna_bot.config, "oms_url", "?"),
+        )
     logger.info("Exchange clients reinitialized after key update")
 
 
@@ -3057,6 +3106,13 @@ async def get_runtime_settings():
         ),
         "v2_flush_interval_s": getattr(s, "v2_flush_interval_s", 0),
         "v2_build_tag": os.environ.get("V2_BUILD_TAG", ""),
+        # DNA bot OMS URL — exposed so we can verify the V2 envVar override
+        # actually propagated. Three flavours so we can spot drift between
+        # the global `_settings` (used by _build_dna_bot), a fresh
+        # Settings() reload, and the live env var.
+        "dna_oms_url": getattr(s, "dna_oms_url", ""),
+        "dna_oms_url_global": getattr(_settings, "dna_oms_url", "") if _settings else "",
+        "dna_oms_url_env": os.environ.get("DNA_OMS_URL", ""),
     }
 
 
@@ -3198,6 +3254,32 @@ async def dna_status():
     """DNA bot status: config, positions, activity."""
     bot = _require_dna_bot()
     return bot.get_status()
+
+
+@app.post("/dna/_force_rebuild")
+async def dna_force_rebuild():
+    """Diagnostic: force re-instantiate the DNA bot from current Settings.
+
+    Useful after a V2 envVar rollout where the bot was created against
+    stale defaults. Returns the before/after oms_url so the operator
+    can confirm the rebuild actually picked up new settings.
+    """
+    before = (
+        getattr(_dna_bot.config, "oms_url", "?") if _dna_bot else "(no bot)"
+    )
+    settings_url = getattr(_settings, "dna_oms_url", "?") if _settings else "?"
+    env_url = os.environ.get("DNA_OMS_URL", "(unset)")
+    _build_dna_bot()
+    after = (
+        getattr(_dna_bot.config, "oms_url", "?") if _dna_bot else "(no bot)"
+    )
+    return {
+        "before": before,
+        "after": after,
+        "settings_dna_oms_url": settings_url,
+        "env_DNA_OMS_URL": env_url,
+        "rebuilt": before != after,
+    }
 
 
 @app.get("/dna/preflight")
