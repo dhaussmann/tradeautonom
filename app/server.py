@@ -897,11 +897,12 @@ async def _history_ingest_loop():
                 if not _vault_unlocked or not _exchange_clients:
                     continue
 
-                # Build the same structure as /portfolio/stream
+                # Build the same structure as /portfolio/stream.
+                # Variational was previously skipped here as a 403-rate-limit
+                # workaround; that's obsolete now that the Variational client
+                # routes authenticated traffic through proxy.defitool.de.
                 exchanges: dict = {}
                 for exchange_name, client in _exchange_clients.items():
-                    if exchange_name == "variational":
-                        continue  # skip — reduce Cloudflare 403 trigger rate
                     entry: dict = {
                         "exchange": exchange_name,
                         "equity": 0.0,
@@ -988,10 +989,12 @@ async def portfolio_stream(request: Request, interval_ms: int = 3000):
     async def event_generator():
         while not await request.is_disconnected():
             try:
+                # Iterate ALL exchange clients including variational. The
+                # earlier skip was a 403-rate-limit workaround that's
+                # obsolete now that VariationalClient routes through
+                # proxy.defitool.de for authenticated calls.
                 exchanges = {}
                 for exchange_name, client in _exchange_clients.items():
-                    if exchange_name == "variational":
-                        continue  # skip — reduce Cloudflare 403 trigger rate
                     entry = {
                         "exchange": exchange_name,
                         "equity": 0.0,
@@ -1069,11 +1072,11 @@ async def portfolio_stream(request: Request, interval_ms: int = 3000):
 async def portfolio_pairs():
     """Build delta-neutral pairs from bot configs + token-name matching."""
 
-    # Step 1: Collect all open positions across exchanges
+    # Step 1: Collect all open positions across exchanges. Variational is
+    # included now that authenticated calls route through proxy.defitool.de
+    # — the earlier 403-rate-limit skip is no longer needed.
     all_positions: list[dict] = []
     for exchange_name, client in _exchange_clients.items():
-        if exchange_name == "variational":
-            continue  # skip — reduce Cloudflare 403 trigger rate
         try:
             summary = await asyncio.to_thread(client.get_account_summary)
             for p in summary.get("positions", []):
