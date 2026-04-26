@@ -784,12 +784,26 @@ async def account_summary():
 
 @app.get("/account/all")
 async def account_all():
-    """Return equity, balance and positions from all exchanges."""
-    result = []
-    for exchange_name, client in _exchange_clients.items():
-        entry = {"exchange": exchange_name, "equity": "0", "available": "0", "unrealized_pnl": "0", "positions": [], "error": None}
+    """Return equity, balance and positions from all exchanges.
+
+    Each exchange's get_account_summary() is a synchronous HTTPS call that
+    can take 1–2 seconds; running them serially with the sync method
+    directly inside this async handler used to block the event loop for
+    the full sum (~8s) and stalled every other endpoint (UI, /health,
+    /fn/bots/*) for the duration. We now fan out across exchanges with
+    asyncio.gather and use to_thread so the event loop stays responsive.
+    """
+    async def _fetch_one(exchange_name: str, client) -> dict:
+        entry = {
+            "exchange": exchange_name,
+            "equity": "0",
+            "available": "0",
+            "unrealized_pnl": "0",
+            "positions": [],
+            "error": None,
+        }
         try:
-            summary = client.get_account_summary()
+            summary = await asyncio.to_thread(client.get_account_summary)
             entry["equity"] = summary.get("total_equity", "0")
             entry["available"] = summary.get("available_balance", "0")
             entry["unrealized_pnl"] = summary.get("unrealized_pnl", "0")
@@ -799,8 +813,13 @@ async def account_all():
             entry["positions"] = positions
         except Exception as exc:
             entry["error"] = str(exc)
-        result.append(entry)
-    return result
+        return entry
+
+    return list(
+        await asyncio.gather(
+            *(_fetch_one(name, client) for name, client in _exchange_clients.items()),
+        )
+    )
 
 
 @app.get("/account/positions")
@@ -1072,45 +1091,66 @@ async def portfolio_stream(request: Request, interval_ms: int = 3000):
 async def portfolio_pairs():
     """Build delta-neutral pairs from bot configs + token-name matching."""
 
-    # Step 1: Collect all open positions across exchanges. Variational is
-    # included now that authenticated calls route through proxy.defitool.de
-    # — the earlier 403-rate-limit skip is no longer needed.
-    all_positions: list[dict] = []
-    for exchange_name, client in _exchange_clients.items():
+    # Step 1: Collect all open positions across exchanges, parallelised in
+    # two layers so a single user with several bots and several exchanges
+    # doesn't see this endpoint sit at 11–18 s while the UI freezes.
+    #
+    # Outer layer (asyncio.gather over exchanges) lets each exchange's
+    # get_account_summary() run concurrently. Inner layer (gather over
+    # positions of one exchange) parallelises the per-position
+    # cumulative-funding and funding-rate enrichments — those are
+    # cached but the first call after a cache-miss is a real HTTP call,
+    # which used to stack into ~16 s of sequential I/O.
+    async def _enrich_position(p: dict, exchange_name: str, client) -> dict:
+        symbol = p.get("instrument", p.get("symbol", ""))
+        size_val = float(p.get("size", 0))
+        side = p.get("side", "LONG" if size_val > 0 else "SHORT")
+        unrealized = float(p.get("unrealized_pnl", 0))
+        realized = float(p.get("realized_pnl", 0))
+        cum_funding = float(p.get("cumulative_realized_funding_payment", 0))
+        if not cum_funding:
+            cum_funding = float(p.get("cumulative_funding", 0))
+        if not cum_funding:
+            created_time = int(p.get("created_time", 0))
+            cum_funding = await _fetch_cumulative_funding(
+                client, exchange_name, symbol, start_time=created_time,
+            )
+        funding_data = await _fetch_funding_for_position(client, exchange_name, symbol)
+        return {
+            "exchange": exchange_name,
+            "instrument": symbol,
+            "token": _extract_token(symbol),
+            "side": side.upper(),
+            "size": abs(size_val),
+            "entry_price": float(p.get("entry_price", 0)),
+            "mark_price": float(p.get("mark_price", 0)),
+            "unrealized_pnl": unrealized,
+            "realized_pnl": realized,
+            "total_pnl": unrealized + realized,
+            "cumulative_funding": cum_funding,
+            "leverage": float(p.get("leverage", 0)),
+            "funding_rate": float(funding_data.get("funding_rate", 0)),
+        }
+
+    async def _fetch_exchange(exchange_name: str, client) -> list[dict]:
         try:
             summary = await asyncio.to_thread(client.get_account_summary)
-            for p in summary.get("positions", []):
-                symbol = p.get("instrument", p.get("symbol", ""))
-                size_val = float(p.get("size", 0))
-                side = p.get("side", "LONG" if size_val > 0 else "SHORT")
-                unrealized = float(p.get("unrealized_pnl", 0))
-                realized = float(p.get("realized_pnl", 0))
-                cum_funding = float(p.get("cumulative_realized_funding_payment", 0))
-                if not cum_funding:
-                    cum_funding = float(p.get("cumulative_funding", 0))
-                if not cum_funding:
-                    created_time = int(p.get("created_time", 0))
-                    cum_funding = await _fetch_cumulative_funding(client, exchange_name, symbol, start_time=created_time)
-
-                funding_data = await _fetch_funding_for_position(client, exchange_name, symbol)
-
-                all_positions.append({
-                    "exchange": exchange_name,
-                    "instrument": symbol,
-                    "token": _extract_token(symbol),
-                    "side": side.upper(),
-                    "size": abs(size_val),
-                    "entry_price": float(p.get("entry_price", 0)),
-                    "mark_price": float(p.get("mark_price", 0)),
-                    "unrealized_pnl": unrealized,
-                    "realized_pnl": realized,
-                    "total_pnl": unrealized + realized,
-                    "cumulative_funding": cum_funding,
-                    "leverage": float(p.get("leverage", 0)),
-                    "funding_rate": float(funding_data.get("funding_rate", 0)),
-                })
         except Exception as exc:
             logger.warning("portfolio_pairs: error fetching %s: %s", exchange_name, exc)
+            return []
+        positions = summary.get("positions", [])
+        if not positions:
+            return []
+        return list(
+            await asyncio.gather(
+                *(_enrich_position(p, exchange_name, client) for p in positions),
+            )
+        )
+
+    per_exchange = await asyncio.gather(
+        *(_fetch_exchange(name, client) for name, client in _exchange_clients.items()),
+    )
+    all_positions: list[dict] = [p for sub in per_exchange for p in sub]
 
     # Step 2: Build a bot-token lookup so we can tag pairs with bot source
     # Maps token (uppercase) -> bot_id for annotation purposes
