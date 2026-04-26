@@ -10,13 +10,14 @@ import {
   fetchJournalPositions,
 } from '@/lib/api'
 import Typography from '@/components/ui/Typography.vue'
-import Button from '@/components/ui/Button.vue'
 import DashboardStatCard from '@/components/dashboard/DashboardStatCard.vue'
-import PointsEfficiencyWidget from '@/components/dashboard/PointsEfficiencyWidget.vue'
 import BotMiniCard from '@/components/dashboard/BotMiniCard.vue'
 import BotCreateModal from '@/components/dashboard/BotCreateModal.vue'
-import FundingWidget from '@/components/dashboard/FundingWidget.vue'
-import type { BotCreateRequest } from '@/types/bot'
+import BotStateTiles, {
+  type BotStateFilter,
+} from '@/components/dashboard/BotStateTiles.vue'
+import AdvancedAnalyticsSection from '@/components/dashboard/AdvancedAnalyticsSection.vue'
+import type { BotCreateRequest, BotSummary } from '@/types/bot'
 import type {
   PointsRecord,
   JournalSummary,
@@ -31,6 +32,7 @@ const accountStore = useAccountStore()
 const showCreateModal = ref(false)
 const exchanges = ref<string[]>([])
 const actionLoading = ref<Record<string, string | null>>({})
+const stateFilter = ref<BotStateFilter>('ALL')
 let pollInterval: ReturnType<typeof setInterval> | null = null
 let analyticsPollInterval: ReturnType<typeof setInterval> | null = null
 
@@ -44,8 +46,23 @@ const positionStats = ref<PositionStats | null>(null)
 // ── Computed metrics ──────────────────────────────────
 
 const activeBots = computed(() =>
-  botsStore.bots.filter((b: any) => b.state !== 'IDLE').length
+  botsStore.bots.filter((b: BotSummary) => b.state !== 'IDLE').length
 )
+
+// Bot list filtered by selected state tile
+const filteredBots = computed<BotSummary[]>(() => {
+  const f = stateFilter.value
+  if (f === 'ALL') return botsStore.bots
+  return botsStore.bots.filter((b: BotSummary) => {
+    if (f === 'ENTERING') {
+      return b.state === 'ENTERING' || b.state === 'PAUSED_ENTERING'
+    }
+    if (f === 'EXITING') {
+      return b.state === 'EXITING' || b.state === 'PAUSED_EXITING'
+    }
+    return b.state === f
+  })
+})
 
 // 1. Total PnL
 const totalPnl = computed(() => positionStats.value?.total_net_pnl ?? 0)
@@ -148,12 +165,6 @@ function formatUsd(n: number): string {
   return `${sign}$${abs.toFixed(2)}`
 }
 
-function formatVolume(n: number): string {
-  if (n >= 1_000_000) return '$' + (n / 1_000_000).toFixed(2) + 'M'
-  if (n >= 1_000) return '$' + (n / 1_000).toFixed(1) + 'K'
-  return '$' + n.toFixed(0)
-}
-
 function formatDuration(ms: number): string {
   if (ms <= 0) return '—'
   const totalMin = Math.round(ms / 60_000)
@@ -252,77 +263,53 @@ async function handleCreate(req: BotCreateRequest) {
 function handleNavigate(botId: string) {
   router.push({ name: 'bot-detail', params: { botId } })
 }
+
+// ── Filter helpers ────────────────────────────────────
+
+function handleFilterChange(filter: BotStateFilter) {
+  stateFilter.value = filter
+}
+
+const filterEmptyMessage = computed(() => {
+  if (botsStore.bots.length === 0) return 'No bots configured yet.'
+  if (filteredBots.value.length === 0) {
+    const f = stateFilter.value
+    if (f === 'ALL') return 'No bots configured yet.'
+    return `No bots in ${f} state.`
+  }
+  return null
+})
 </script>
 
 <template>
   <div :class="$style.dashboard">
-    <!-- ── Row 1: 4 Stat Cards ── -->
-    <div :class="$style.statsGrid">
-      <DashboardStatCard
-        title="Total PnL"
-        :value="formatUsd(totalPnl)"
-        :subtitle="`${closedCount} closed positions`"
-        :color="totalPnl >= 0 ? 'success' : 'error'"
-      />
-      <DashboardStatCard
-        title="Point Factor"
-        :value="pointFactor > 0 ? pointFactor.toFixed(1) : '—'"
-        subtitle="points per $100K volume"
-      />
-      <DashboardStatCard
-        title="Active Bots"
-        :value="`${activeBots} / ${botsStore.bots.length}`"
-        subtitle="running / total"
-        :color="activeBots > 0 ? 'success' : 'secondary'"
-      />
-      <div :class="$style.mostTradedCard">
-        <Typography size="text-xs" color="tertiary" :class="$style.cardTitle">MOST TRADED</Typography>
-        <div v-if="mostTraded.length" :class="$style.tokenList">
-          <div v-for="(t, i) in mostTraded" :key="t.token" :class="$style.tokenRow">
-            <Typography size="text-sm" weight="semibold">{{ i + 1 }}. {{ t.token }}</Typography>
-            <Typography size="text-xs" color="tertiary">{{ formatVolume(t.volume) }}</Typography>
-          </div>
-        </div>
-        <Typography v-else size="text-sm" color="tertiary" :class="$style.noData">No trades yet</Typography>
-      </div>
-    </div>
+    <!-- ── Hero: Bot State Tiles ── -->
+    <BotStateTiles
+      :bots="botsStore.bots"
+      :active-filter="stateFilter"
+      @filter-change="handleFilterChange"
+      @add-bot="showCreateModal = true"
+    />
 
-    <!-- ── Row 2: 4 Stat Cards ── -->
-    <div :class="$style.statsGrid">
-      <DashboardStatCard
-        title="Paid Fees"
-        :value="formatUsd(Math.abs(totalFees))"
-        :subtitle="`${closedCount} positions`"
-        color="error"
-      />
-      <DashboardStatCard
-        title="Paid Funding"
-        :value="formatUsd(totalFunding)"
-        :color="totalFunding >= 0 ? 'success' : 'error'"
-      />
-      <DashboardStatCard
-        title="Avg Hold Time"
-        :value="formatDuration(avgHoldMs)"
-        :subtitle="`${closedCount} closed positions`"
-      />
-      <DashboardStatCard
-        title="Delta Neutral Factor"
-        :value="deltaNeutralFactor != null ? deltaNeutralFactor.toFixed(1) + '%' : '—'"
-        :gauge="deltaNeutralFactor"
-      />
-    </div>
-
-    <!-- ── Row 3: Points & Efficiency + Bots ── -->
+    <!-- ── Main: Bot list (left) + KPI stack (right) ── -->
     <div :class="$style.mainGrid">
-      <PointsEfficiencyWidget />
-
+      <!-- Bot list panel -->
       <div :class="$style.botsPanel">
         <div :class="$style.botsPanelHeader">
-          <Typography size="text-lg" weight="semibold">Bots</Typography>
-          <Button variant="outline" size="sm" @click="showCreateModal = true">
-            <template #prefix>+</template>
-            Add Bot
-          </Button>
+          <div :class="$style.headerLeft">
+            <Typography size="text-lg" weight="semibold">Bots</Typography>
+            <Typography
+              v-if="stateFilter !== 'ALL'"
+              size="text-xs"
+              color="tertiary"
+              :class="$style.filterBadge"
+            >
+              filtered: {{ stateFilter }}
+            </Typography>
+          </div>
+          <Typography size="text-xs" color="tertiary">
+            {{ filteredBots.length }} of {{ botsStore.bots.length }}
+          </Typography>
         </div>
 
         <div v-if="botsStore.error" :class="$style.error">
@@ -332,12 +319,20 @@ function handleNavigate(botId: string) {
         <div v-if="botsStore.loading && !botsStore.bots.length" :class="$style.empty">
           <Typography size="text-sm" color="secondary">Loading bots...</Typography>
         </div>
-        <div v-else-if="!botsStore.bots.length" :class="$style.empty">
-          <Typography size="text-sm" color="tertiary">No bots configured yet.</Typography>
+        <div v-else-if="filterEmptyMessage" :class="$style.empty">
+          <Typography size="text-sm" color="tertiary">{{ filterEmptyMessage }}</Typography>
+          <button
+            v-if="stateFilter !== 'ALL' && botsStore.bots.length > 0"
+            type="button"
+            :class="$style.clearFilterBtn"
+            @click="stateFilter = 'ALL'"
+          >
+            Show all bots
+          </button>
         </div>
         <div v-else :class="$style.botList">
           <BotMiniCard
-            v-for="bot in botsStore.bots"
+            v-for="bot in filteredBots"
             :key="bot.bot_id"
             :bot="bot"
             :action-loading="actionLoading[bot.bot_id]"
@@ -349,10 +344,42 @@ function handleNavigate(botId: string) {
           />
         </div>
       </div>
+
+      <!-- KPI stack -->
+      <div :class="$style.kpiStack">
+        <DashboardStatCard
+          title="Total PnL"
+          :value="formatUsd(totalPnl)"
+          :subtitle="`${closedCount} closed positions`"
+          :color="totalPnl >= 0 ? 'success' : 'error'"
+        />
+        <DashboardStatCard
+          title="Active Bots"
+          :value="`${activeBots} / ${botsStore.bots.length}`"
+          subtitle="running / total"
+          :color="activeBots > 0 ? 'success' : 'secondary'"
+        />
+        <DashboardStatCard
+          title="Avg Hold Time"
+          :value="formatDuration(avgHoldMs)"
+          :subtitle="`${closedCount} closed positions`"
+        />
+        <DashboardStatCard
+          title="Paid Funding"
+          :value="formatUsd(totalFunding)"
+          :color="totalFunding >= 0 ? 'success' : 'error'"
+        />
+      </div>
     </div>
 
-    <!-- ── Row 4: Funding Widget ── -->
-    <FundingWidget />
+    <!-- ── Advanced Analytics (collapsible, default closed) ── -->
+    <AdvancedAnalyticsSection
+      :point-factor="pointFactor"
+      :most-traded="mostTraded"
+      :delta-neutral-factor="deltaNeutralFactor"
+      :total-fees="totalFees"
+      :closed-count="closedCount"
+    />
 
     <!-- Create Modal -->
     <BotCreateModal
@@ -373,51 +400,11 @@ function handleNavigate(botId: string) {
   margin: 0 auto;
 }
 
-.statsGrid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: var(--space-4);
-}
-
 .mainGrid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--space-6);
-  align-items: start;
-}
-
-/* Most Traded — custom card (not DashboardStatCard) */
-.mostTradedCard {
-  border-radius: var(--radius-xl);
-  border: 1px solid var(--color-stroke-divider);
-  background: var(--color-white-2);
-  padding: var(--space-4) var(--space-5);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  min-height: 120px;
-}
-
-.cardTitle {
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.tokenList {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  margin-top: auto;
-}
-
-.tokenRow {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.noData {
-  margin-top: auto;
+  grid-template-columns: minmax(0, 65fr) minmax(0, 35fr);
+  gap: var(--space-5);
+  align-items: stretch;
 }
 
 /* Bots panel */
@@ -428,6 +415,7 @@ function handleNavigate(botId: string) {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  min-height: 480px;
 }
 
 .botsPanelHeader {
@@ -439,34 +427,84 @@ function handleNavigate(botId: string) {
   background: var(--color-white-4);
 }
 
+.headerLeft {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.filterBadge {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--color-stroke-divider);
+  border-radius: var(--radius-md);
+  background: var(--color-white-2);
+}
+
 .botList {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   padding: var(--space-3);
-  max-height: 600px;
+  max-height: 640px;
   overflow-y: auto;
 }
 
 .error {
   padding: var(--space-3) var(--space-4);
   margin: var(--space-3);
-  background: var(--color-error-bg);
-  border: 1px solid var(--color-error-stroke);
+  background: var(--color-error-bg, rgba(220, 53, 69, 0.1));
+  border: 1px solid var(--color-error-stroke, var(--color-error));
   border-radius: var(--radius-md);
 }
 
 .empty {
   padding: var(--space-10) var(--space-5);
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.clearFilterBtn {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--color-stroke-divider);
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.clearFilterBtn:hover {
+  background: var(--color-white-4);
+  border-color: var(--color-stroke-primary);
+}
+
+/* KPI stack — 4 cards vertical */
+.kpiStack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.kpiStack > * {
+  /* Stretch each card to fill column */
+  flex: 1 1 0;
 }
 
 @media (max-width: 900px) {
-  .statsGrid {
-    grid-template-columns: repeat(2, 1fr);
-  }
   .mainGrid {
     grid-template-columns: 1fr;
+  }
+  .kpiStack {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
   }
   .dashboard {
     padding: 24px 16px;
@@ -474,7 +512,7 @@ function handleNavigate(botId: string) {
 }
 
 @media (max-width: 480px) {
-  .statsGrid {
+  .kpiStack {
     grid-template-columns: 1fr;
   }
 }
