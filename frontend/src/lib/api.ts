@@ -34,6 +34,37 @@ export async function createBot(req: BotCreateRequest): Promise<{ success: boole
   return request('/fn/bots', { method: 'POST', body: JSON.stringify(req) })
 }
 
+/**
+ * Adopt an existing delta-neutral hedge position into a new bot. The bot
+ * is created in HOLDING state — no entry is performed; the user already
+ * opened the position manually. The bot can then be exited via the normal
+ * Stop button (graceful_stop → manual_exit TWAP).
+ */
+export interface AdoptBotRequest {
+  bot_id: string
+  long_exchange: string
+  long_symbol: string
+  short_exchange: string
+  short_symbol: string
+  quantity: number
+  // Optional config overrides — same keys as BotCreateRequest
+  twap_num_chunks?: number
+  twap_interval_s?: number
+  leverage_long?: number
+  leverage_short?: number
+  duration_h?: number
+  duration_m?: number
+  max_chunk_spread_usd?: number
+  max_spread_pct?: number
+  min_spread_pct?: number
+}
+
+export async function adoptBot(
+  req: AdoptBotRequest,
+): Promise<{ success: boolean; bot_id: string; state: string }> {
+  return request('/fn/bots/adopt', { method: 'POST', body: JSON.stringify(req) })
+}
+
 export async function deleteBot(botId: string): Promise<{ success: boolean }> {
   return request(`/fn/bots/${botId}`, { method: 'DELETE' })
 }

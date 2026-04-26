@@ -52,7 +52,7 @@ RUN chmod +x /app/entrypoint.sh
 ENV V2_HEADLESS=1
 
 # Build cache-bust marker for Phase F.4 roll-out
-ENV V2_BUILD_TAG=variational-portfolio-skip-removed-v24
+ENV V2_BUILD_TAG=adopt-existing-positions-v25
 
 EXPOSE 8000
 

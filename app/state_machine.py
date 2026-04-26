@@ -127,6 +127,63 @@ class MakerTakerConfig:
     short_exchange: str = ""
 
 
+def seed_holding_state(
+    *,
+    job_id: str,
+    long_exchange: str,
+    long_symbol: str,
+    long_qty: float,
+    long_entry_price: float,
+    short_exchange: str,
+    short_symbol: str,
+    short_qty: float,
+    short_entry_price: float,
+) -> None:
+    """Seed a HOLDING state.json on disk for a bot adopting an existing
+    delta-neutral hedge position.
+
+    Called from BotRegistry.adopt_bot() BEFORE engine.start() runs, so that
+    the engine's load_state() picks up the HOLDING state and the bot is
+    already in HOLDING from the very first tick — no ENTERING phase, the
+    bot can be exited via the normal Stop button (graceful_stop → manual_exit).
+
+    Convention (matching StateMachine internals):
+      - long_qty:  positive (e.g. 12500 for a long position)
+      - short_qty: negative (e.g. -12500 for a short position)
+      - entry prices: average entry from the exchange position object
+
+    Triggers an event-driven R2 flush so the seeded state survives an
+    immediate container recycle.
+    """
+    state_path = Path(f"data/bots/{job_id}/position.json")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "state": JobState.HOLDING.value,
+        "long_qty": float(long_qty),
+        "short_qty": float(short_qty),
+        "long_exchange": long_exchange,
+        "short_exchange": short_exchange,
+        "long_symbol": long_symbol,
+        "short_symbol": short_symbol,
+        "long_entry_price": float(long_entry_price),
+        "short_entry_price": float(short_entry_price),
+    }
+    with open(state_path, "w") as fh:
+        json.dump(data, fh, indent=2)
+    logger.info(
+        "seed_holding_state: bot=%s long=%s:%s qty=%.6f short=%s:%s qty=%.6f",
+        job_id, long_exchange, long_symbol, long_qty,
+        short_exchange, short_symbol, short_qty,
+    )
+    # Phase F.4 M3.C.1: push to R2 immediately so adoption survives a
+    # container recycle that happens before the next 30s flush window.
+    try:
+        from app.cloud_persistence import request_flush_soon
+        request_flush_soon(reason=f"event:adopt_seed:{job_id}")
+    except Exception:
+        pass
+
+
 class StateMachine:
     """Maker-Taker TWAP execution state machine.
 

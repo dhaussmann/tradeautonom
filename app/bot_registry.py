@@ -22,6 +22,7 @@ from typing import Any, Optional
 from app.engine import EngineConfig, FundingArbEngine
 from app.shared_data_cache import SharedDataCache
 from app.shared_auth_ws_manager import SharedWebSocketManagerRegistry
+from app.state_machine import seed_holding_state
 from app.symbol_resolver import resolve_variational_symbol
 
 logger = logging.getLogger("tradeautonom.bot_registry")
@@ -254,6 +255,286 @@ class BotRegistry:
         logger.info("Bot created: %s (long=%s:%s short=%s:%s)",
                      bot_id, config.long_exchange, config.instrument_a,
                      config.short_exchange, config.instrument_b)
+        return engine
+
+    # ── Adoption of existing hedge positions ──────────────────────────
+
+    @staticmethod
+    def _match_position(
+        positions: list[dict], exchange: str, symbol: str,
+    ) -> dict | None:
+        """Find a position object matching the given exchange-side symbol.
+
+        Primary: exact instrument/symbol match.
+        Fallback (variational only): match by underlying token to handle
+        the funding-interval drift documented in M9 (Variational position
+        objects can carry stale funding_interval_s while bot configs track
+        the live value).
+        """
+        if not positions:
+            return None
+        for p in positions:
+            inst = p.get("instrument") or p.get("symbol") or ""
+            if inst == symbol:
+                return p
+        if exchange == "variational" and symbol.startswith("P-"):
+            parts = symbol.split("-")
+            if len(parts) >= 2:
+                token = parts[1].upper()
+                for p in positions:
+                    if str(p.get("underlying", "")).upper() == token:
+                        return p
+                    inst = p.get("instrument") or p.get("symbol") or ""
+                    if inst.startswith("P-"):
+                        ip = inst.split("-")
+                        if len(ip) >= 2 and ip[1].upper() == token:
+                            return p
+        return None
+
+    async def _validate_hedge_position(
+        self,
+        config: EngineConfig,
+        expected_long_qty: float,
+        expected_short_qty: float,
+    ) -> tuple[float, float, float, float]:
+        """Re-fetch positions from both exchanges and validate that they form
+        a delta-neutral hedge that matches the user-claimed quantities.
+
+        Returns (long_size, long_entry_price, short_size, short_entry_price)
+        suitable for seed_holding_state(). Raises ValueError on any mismatch.
+        """
+        long_client = self._clients.get(config.long_exchange)
+        short_client = self._clients.get(config.short_exchange)
+        if not long_client:
+            raise ValueError(
+                f"Exchange client not loaded: {config.long_exchange} "
+                f"(vault may be locked)"
+            )
+        if not short_client:
+            raise ValueError(
+                f"Exchange client not loaded: {config.short_exchange} "
+                f"(vault may be locked)"
+            )
+
+        try:
+            long_positions = await asyncio.to_thread(
+                long_client.fetch_positions, [config.instrument_a],
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to fetch {config.long_exchange} positions: {exc}",
+            ) from exc
+        try:
+            short_positions = await asyncio.to_thread(
+                short_client.fetch_positions, [config.instrument_b],
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to fetch {config.short_exchange} positions: {exc}",
+            ) from exc
+
+        long_pos = self._match_position(
+            long_positions, config.long_exchange, config.instrument_a,
+        )
+        short_pos = self._match_position(
+            short_positions, config.short_exchange, config.instrument_b,
+        )
+
+        if not long_pos:
+            raise ValueError(
+                f"No open position on {config.long_exchange} for "
+                f"{config.instrument_a}",
+            )
+        if not short_pos:
+            raise ValueError(
+                f"No open position on {config.short_exchange} for "
+                f"{config.instrument_b}",
+            )
+
+        long_side = str(long_pos.get("side", "")).upper()
+        short_side = str(short_pos.get("side", "")).upper()
+        if long_side and long_side != "LONG":
+            raise ValueError(
+                f"{config.long_exchange}/{config.instrument_a} is {long_side}, "
+                f"expected LONG",
+            )
+        if short_side and short_side != "SHORT":
+            raise ValueError(
+                f"{config.short_exchange}/{config.instrument_b} is {short_side}, "
+                f"expected SHORT",
+            )
+
+        long_size = abs(float(long_pos.get("size", 0)))
+        short_size = abs(float(short_pos.get("size", 0)))
+
+        if long_size <= 0 or short_size <= 0:
+            raise ValueError(
+                f"Position size must be > 0 (long={long_size}, short={short_size})",
+            )
+
+        # Quantity match: both legs must agree within 1e-6 relative tolerance.
+        if (
+            abs(long_size - short_size) / max(long_size, short_size) > 1e-6
+        ):
+            raise ValueError(
+                f"Hedge size mismatch: long={long_size}, short={short_size}. "
+                f"Both legs must have identical size to be adopted.",
+            )
+
+        # User-claimed quantity must also match (defends against UI race
+        # where the user confirmed a value that has since changed on the
+        # exchange — e.g. someone partially closed a leg).
+        for label, claimed, actual in (
+            ("long", expected_long_qty, long_size),
+            ("short", expected_short_qty, short_size),
+        ):
+            if claimed and actual:
+                if abs(actual - abs(claimed)) / max(actual, abs(claimed)) > 1e-6:
+                    raise ValueError(
+                        f"{label} size changed since you confirmed: "
+                        f"exchange={actual}, claimed={claimed}. Refresh "
+                        f"and retry.",
+                    )
+
+        long_entry = float(long_pos.get("entry_price", 0))
+        short_entry = float(short_pos.get("entry_price", 0))
+        return long_size, long_entry, short_size, short_entry
+
+    def _check_no_existing_bot_owns_position(
+        self,
+        long_exchange: str,
+        long_symbol: str,
+        short_exchange: str,
+        short_symbol: str,
+    ) -> None:
+        """Refuse to adopt a position that another bot already manages.
+
+        Looks at every (exchange, symbol) pair across both legs of every
+        bot config — if either leg of the new adoption matches either leg
+        of an existing bot, abort.
+        """
+        for bot_id, engine in self._bots.items():
+            c = engine.config
+            existing = {
+                (c.long_exchange, c.instrument_a),
+                (c.short_exchange, c.instrument_b),
+            }
+            attempted = {
+                (long_exchange, long_symbol),
+                (short_exchange, short_symbol),
+            }
+            if existing & attempted:
+                raise ValueError(
+                    f"Position already managed by bot '{bot_id}'",
+                )
+
+    async def adopt_bot(
+        self,
+        bot_id: str,
+        config: EngineConfig,
+        long_qty: float,
+        short_qty: float,
+    ) -> FundingArbEngine:
+        """Create a bot that takes over an existing delta-neutral hedge.
+
+        Mirrors create_bot() but seeds a HOLDING state.json before starting
+        the engine, so the bot starts in HOLDING (not IDLE) and can be
+        exited via the normal Stop button. The position itself was opened
+        by the user — the bot just inherits its lifecycle from this point.
+
+        Args:
+            bot_id: alphanumeric bot identifier (no existing bot may share it).
+            config: standard EngineConfig (long_exchange, short_exchange,
+                instrument_a, instrument_b, quantity, twap settings, etc.).
+            long_qty:  user-claimed long size (re-validated against exchange).
+            short_qty: user-claimed short size (re-validated against exchange).
+
+        Raises:
+            ValueError: bot_id taken, position not found, sizes mismatched,
+                position already managed by another bot, etc.
+        """
+        if bot_id in self._bots:
+            raise ValueError(f"Bot '{bot_id}' already exists")
+        if not bot_id or not bot_id.replace("-", "").replace("_", "").isalnum():
+            raise ValueError(
+                f"Invalid bot_id: '{bot_id}' (use alphanumeric, -, _)",
+            )
+
+        # Ensure shared resources are initialized
+        if self._shared_data_cache is None:
+            await self._init_shared_resources()
+
+        # Same Variational symbol auto-correction as create_bot — important
+        # because the user-supplied instrument_b may carry a stale funding
+        # interval that no longer matches the live tradable symbol.
+        await self._pre_correct_variational_symbol(bot_id, config)
+
+        # No other bot may already be managing either leg.
+        self._check_no_existing_bot_owns_position(
+            config.long_exchange, config.instrument_a,
+            config.short_exchange, config.instrument_b,
+        )
+
+        # Re-fetch positions from the exchanges and confirm the hedge is
+        # still delta-neutral and matches user expectation.
+        (
+            long_size, long_entry, short_size, short_entry,
+        ) = await self._validate_hedge_position(config, long_qty, short_qty)
+
+        # Persist the bot config so a recycle survives the adoption.
+        config.job_id = bot_id
+        self._save_config(bot_id, config)
+
+        # Seed the HOLDING state BEFORE engine.start() so load_state() picks
+        # it up. State machine convention: long is positive, short negative.
+        seed_holding_state(
+            job_id=bot_id,
+            long_exchange=config.long_exchange,
+            long_symbol=config.instrument_a,
+            long_qty=long_size,
+            long_entry_price=long_entry,
+            short_exchange=config.short_exchange,
+            short_symbol=config.instrument_b,
+            short_qty=-short_size,
+            short_entry_price=short_entry,
+        )
+
+        # Standard subscribe + OMS-add flow (same as create_bot).
+        await self._subscribe_bot_symbols(bot_id, config)
+        if self._oms_data_layer and hasattr(self._oms_data_layer, "add_symbols"):
+            oms_symbols = {
+                config.long_exchange: config.instrument_a,
+                config.short_exchange: config.instrument_b,
+            }
+            results = await self._oms_data_layer.add_symbols(oms_symbols)
+            failed = [sym for sym, ok in results.items() if not ok]
+            if failed:
+                logger.warning(
+                    "BotRegistry.adopt_bot: OMS subscription problems for %s: %s",
+                    bot_id, failed,
+                )
+
+        engine = FundingArbEngine(
+            config=config,
+            clients=self._clients,
+            activity_forwarder=self._activity_forwarder,
+            shared_data_cache=self._shared_data_cache,
+            shared_ws_registry=self._shared_ws_registry,
+            oms_data_layer=getattr(self, "_oms_data_layer", None),
+            persist_config_callback=self._save_config,
+        )
+
+        # engine.start() → state_machine.load_state() → bot is HOLDING.
+        # sync_position_from_exchange runs and confirms qty against exchange.
+        await engine.start()
+        self._bots[bot_id] = engine
+
+        logger.info(
+            "Bot adopted: %s (long=%s:%s qty=%.6f @ %.6f, short=%s:%s qty=%.6f @ %.6f)",
+            bot_id,
+            config.long_exchange, config.instrument_a, long_size, long_entry,
+            config.short_exchange, config.instrument_b, short_size, short_entry,
+        )
         return engine
 
     async def delete_bot(self, bot_id: str) -> None:

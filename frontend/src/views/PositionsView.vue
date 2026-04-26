@@ -4,7 +4,9 @@ import { usePortfolioStream } from '@/composables/usePortfolioStream'
 import { fetchPortfolioPairs } from '@/lib/api'
 import Typography from '@/components/ui/Typography.vue'
 import Chip from '@/components/ui/Chip.vue'
-import type { PortfolioExchange, DeltaNeutralPair } from '@/types/portfolio'
+import Button from '@/components/ui/Button.vue'
+import BotAdoptModal from '@/components/dashboard/BotAdoptModal.vue'
+import type { PortfolioExchange, DeltaNeutralPair, PairPosition } from '@/types/portfolio'
 
 const { data, connected } = usePortfolioStream(3000)
 const activeTab = ref<'positions' | 'pairs'>('positions')
@@ -12,6 +14,43 @@ const pairs = ref<DeltaNeutralPair[]>([])
 const pairsLoading = ref(false)
 const pairsError = ref<string | null>(null)
 let pairsPollInterval: ReturnType<typeof setInterval> | null = null
+
+// ── Adopt-as-Bot modal state ──
+const adoptModalOpen = ref(false)
+const adoptToken = ref('')
+const adoptLong = ref<PairPosition | null>(null)
+const adoptShort = ref<PairPosition | null>(null)
+
+/**
+ * A pair is adoptable if:
+ *   - both legs exist (matched, not unmatched),
+ *   - it isn't already managed by a bot (source !== "bot:..."),
+ *   - both leg sizes match within 1e-6 relative tolerance (backend
+ *     enforces strict match — UI hides the button to spare the user
+ *     a server-side error).
+ */
+function isAdoptable(pair: DeltaNeutralPair): boolean {
+  if (!pair.long || !pair.short) return false
+  if (pair.source.startsWith('bot:')) return false
+  const l = Math.abs(Number(pair.long.size))
+  const s = Math.abs(Number(pair.short.size))
+  if (l <= 0 || s <= 0) return false
+  return Math.abs(l - s) / Math.max(l, s) <= 1e-6
+}
+
+function openAdoptModal(pair: DeltaNeutralPair) {
+  if (!pair.long || !pair.short) return
+  adoptToken.value = pair.token
+  adoptLong.value = pair.long
+  adoptShort.value = pair.short
+  adoptModalOpen.value = true
+}
+
+function onAdopted() {
+  // Refresh the pair list so this position now shows source=bot:<id>
+  // and the adopt button disappears.
+  loadPairs()
+}
 
 const exchangeList = computed<PortfolioExchange[]>(() => {
   if (!data.value?.exchanges) return []
@@ -366,6 +405,13 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
           <div :class="$style.pairHeader">
             <Typography size="text-lg" weight="bold">{{ pair.token }}</Typography>
             <Chip :variant="sourceVariant(pair.source)" size="sm">{{ sourceLabel(pair.source) }}</Chip>
+            <Button
+              v-if="isAdoptable(pair)"
+              variant="solid"
+              size="sm"
+              :class="$style.adoptBtn"
+              @click="openAdoptModal(pair)"
+            >Adopt as Bot</Button>
           </div>
 
           <!-- Desktop Pair Table -->
@@ -640,6 +686,16 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
     <div v-if="!data && activeTab === 'positions'" :class="$style.empty">
       <Typography color="secondary">Connecting to portfolio stream...</Typography>
     </div>
+
+    <!-- Adopt-as-Bot modal -->
+    <BotAdoptModal
+      :open="adoptModalOpen"
+      :token="adoptToken"
+      :long="adoptLong"
+      :short="adoptShort"
+      @close="adoptModalOpen = false"
+      @adopted="onAdopted"
+    />
   </div>
 </template>
 
@@ -837,10 +893,14 @@ function sourceVariant(source: string): 'success' | 'neutral' | 'error' {
 .pairHeader {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: var(--space-3);
   padding: var(--space-4) var(--space-5);
   border-bottom: 1px solid var(--color-stroke-divider);
   background: var(--color-white-4);
+}
+
+.adoptBtn {
+  margin-left: auto;
 }
 
 .pairFooter {

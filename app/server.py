@@ -1930,6 +1930,82 @@ async def fn_bots_create(req: dict):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.post("/fn/bots/adopt")
+async def fn_bots_adopt(req: dict):
+    """Adopt an existing delta-neutral hedge position into a new bot.
+
+    The position is NOT opened by the bot — the user already opened it
+    manually. The bot inherits it in HOLDING state and can be exited
+    later via the normal Stop button (graceful_stop → manual_exit TWAP).
+
+    Body (required):
+      bot_id:           str
+      long_exchange:    str    (e.g. "extended", "grvt", "nado")
+      long_symbol:      str    (e.g. "XRP-USD")
+      short_exchange:   str    (e.g. "variational")
+      short_symbol:     str    (e.g. "P-XRP-USDC-3600")
+      quantity:         number (must equal exchange size on BOTH legs)
+
+    Body (optional config overrides — same keys as POST /fn/bots):
+      twap_num_chunks, twap_interval_s, leverage_long, leverage_short,
+      duration_h, duration_m, max_chunk_spread_usd, max_spread_pct, ...
+    """
+    registry = _require_registry()
+    bot_id = req.pop("bot_id", None)
+    if not bot_id:
+        raise HTTPException(status_code=400, detail="bot_id is required")
+
+    long_exchange = req.pop("long_exchange", None)
+    short_exchange = req.pop("short_exchange", None)
+    long_symbol = req.pop("long_symbol", None)
+    short_symbol = req.pop("short_symbol", None)
+    quantity = req.pop("quantity", None)
+    if not all([long_exchange, short_exchange, long_symbol, short_symbol]):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "long_exchange, long_symbol, short_exchange and short_symbol "
+                "are all required"
+            ),
+        )
+    if quantity is None:
+        raise HTTPException(status_code=400, detail="quantity is required")
+    try:
+        qty_dec = Decimal(str(quantity))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid quantity: {quantity}")
+    if qty_dec <= 0:
+        raise HTTPException(status_code=400, detail="quantity must be > 0")
+
+    try:
+        config = (
+            EngineConfig.from_settings(_settings, job_id=bot_id)
+            if _settings
+            else EngineConfig(job_id=bot_id)
+        )
+        config.long_exchange = long_exchange
+        config.short_exchange = short_exchange
+        config.instrument_a = long_symbol
+        config.instrument_b = short_symbol
+        config.quantity = qty_dec
+
+        # Optional overrides (same keys as POST /fn/bots)
+        for key, val in req.items():
+            if hasattr(config, key):
+                if key == "quantity":
+                    continue  # already handled above
+                setattr(config, key, val)
+
+        await registry.adopt_bot(
+            bot_id, config,
+            long_qty=float(qty_dec),
+            short_qty=float(qty_dec),
+        )
+        return {"success": True, "bot_id": bot_id, "state": "HOLDING"}
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.delete("/fn/bots/{bot_id}")
 async def fn_bots_delete(bot_id: str):
     """Delete a bot (must be IDLE)."""
