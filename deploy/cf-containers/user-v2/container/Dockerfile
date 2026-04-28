@@ -38,6 +38,14 @@ RUN apt-get update && \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Build cache-bust marker. MUST come BEFORE `COPY app/` so that bumping
+# this tag invalidates the cache for the COPY layer too. Without this,
+# BuildKit can mark the COPY as CACHED even when app/*.py changed,
+# producing stale images that look "deployed" but contain old code.
+# Bump the version suffix on every code change you want forced into the
+# next build; keeps the tag short while still acting as a cache-buster.
+ENV V2_BUILD_TAG=repair-ioc-diagnostics-v40
+
 # App code. V2 is HEADLESS — no static/ directory, no /ui route. The
 # user-facing Vue SPA lives on bot.defitool.de (see deploy/cloudflare/).
 # app/server.py skips the /ui registration when V2_HEADLESS=1.
@@ -50,9 +58,6 @@ RUN chmod +x /app/entrypoint.sh
 
 # Signal to app/server.py to skip the /ui static-file endpoint.
 ENV V2_HEADLESS=1
-
-# Build cache-bust marker for Phase F.4 roll-out
-ENV V2_BUILD_TAG=builders-enabled-v37
 
 EXPOSE 8000
 

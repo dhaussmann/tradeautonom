@@ -57,9 +57,12 @@ class JobState(str, enum.Enum):
 
 
 class ChunkState(str, enum.Enum):
+    SPREAD_WAIT = "SPREAD_WAIT"   # In Spread-Gate-Loop (BBO/Depth) — Pause greift hier sofort
     MAKER_PLACE = "MAKER_PLACE"
     MAKER_WAIT = "MAKER_WAIT"
     TAKER_HEDGE = "TAKER_HEDGE"
+    REPAIR = "REPAIR"             # In Imbalance-Repair-Loop
+    VERIFY = "VERIFY"             # In Mandatory-Position-Verify-Loop
     CHUNK_DONE = "CHUNK_DONE"
 
 
@@ -501,15 +504,24 @@ class StateMachine:
         return self._state in (JobState.PAUSED_ENTERING, JobState.PAUSED_EXITING)
 
     def pause(self) -> None:
-        """Pause the running TWAP execution. The chunk loop will block at the next safe point."""
+        """Pause the running TWAP execution.
+
+        The chunk loop blocks at the next safe checkpoint:
+          • SPREAD_WAIT loop:  immediate (≤2s)
+          • MAKER_WAIT (waiting for fill): ≤100ms (short-circuited)
+          • Top of chase-loop (between reprice rounds): immediate; cancels
+            any open maker order before blocking
+          • Top of chunk-loop (between chunks): immediate
+          • REPAIR / VERIFY: between attempts (≤5s typical)
+        """
         if self._state == JobState.ENTERING:
             self._pre_pause_state = JobState.ENTERING
             self._paused.clear()
             self._transition(JobState.PAUSED_ENTERING)
             self._log(
                 "ENGINE",
-                "Entry PAUSED — current chunk will finish, then wait for resume. "
-                "No new chunks will start until you click Resume.",
+                "Entry PAUSED — open maker order (if any) will be cancelled "
+                "at the next chase-loop checkpoint. No new orders until Resume.",
             )
         elif self._state == JobState.EXITING:
             self._pre_pause_state = JobState.EXITING
@@ -517,8 +529,8 @@ class StateMachine:
             self._transition(JobState.PAUSED_EXITING)
             self._log(
                 "ENGINE",
-                "Exit PAUSED — current chunk will finish, then wait for resume. "
-                "No new chunks will start until you click Resume.",
+                "Exit PAUSED — open maker order (if any) will be cancelled "
+                "at the next chase-loop checkpoint. No new orders until Resume.",
             )
         else:
             logger.info("pause: state is %s — nothing to pause", self._state.value)
@@ -554,6 +566,44 @@ class StateMachine:
             await asyncio.sleep(0.5)
             if not self._is_executing():
                 return False
+        return True
+
+    async def _pause_aware_sleep(
+        self,
+        seconds: float,
+        *,
+        chunk_index: int,
+        chase_round: int,
+        loop_name: str,
+        config,
+    ) -> bool:
+        """Sleep `seconds`, but if pause was requested, block until resumed instead.
+
+        Returns True if execution should continue normally (loop iteration may
+        continue), False if execution was aborted (caller should bail out).
+
+        On resume, returns True immediately — the caller should `continue`
+        without sleeping further so newly-edited spread bounds take effect on
+        the very next check.
+        """
+        if not self._paused.is_set():
+            self._log(
+                "ENGINE",
+                f"[PAUSE-WAIT] Chunk {chunk_index} round {chase_round}: "
+                f"{loop_name} loop paused — bounds at pause time were "
+                f"[{config.min_spread_pct:+.4f}%, {config.max_spread_pct:+.4f}%]. "
+                f"Blocking until resume; no orders placed.",
+            )
+            if not await self._wait_if_paused():
+                return False  # aborted during pause
+            self._log(
+                "ENGINE",
+                f"[RESUME-EFFECT] Chunk {chunk_index} round {chase_round}: "
+                f"resumed — re-checking {loop_name} with current bounds "
+                f"[{config.min_spread_pct:+.4f}%, {config.max_spread_pct:+.4f}%]",
+            )
+            return True  # caller should `continue` without further sleep
+        await asyncio.sleep(seconds)
         return True
 
     # ── State persistence ──────────────────────────────────────────────
@@ -856,7 +906,12 @@ class StateMachine:
                                     f"before the new chunk starts, so chunk 1 begins from "
                                     f"a clean baseline",
                                 )
-                            repair_ok = await self._repair_imbalance(config, i, ChunkResult(chunk_index=i, maker_exchange=config.maker_exchange, taker_exchange=config.taker_exchange, start_ts=time.time()), pre_gap)
+                            repair_ok = await self._repair_imbalance(
+                                config, i,
+                                ChunkResult(chunk_index=i, maker_exchange=config.maker_exchange, taker_exchange=config.taker_exchange, start_ts=time.time()),
+                                pre_gap,
+                                repair_context="pre-chunk",
+                            )
                             if repair_ok:
                                 result.total_taker_qty += pre_gap
                                 self._log(
@@ -1015,6 +1070,7 @@ class StateMachine:
                 remaining_gap = effective_gap
                 total_repaired = 0.0
                 attempt = 0
+                self._current_chunk_state = ChunkState.REPAIR
                 while remaining_gap >= min_repair_qty:
                     attempt += 1
                     # Check if bot was stopped or paused during repair
@@ -1024,7 +1080,10 @@ class StateMachine:
                     if not await self._wait_if_paused():
                         self._log("RISK", f"Chunk {i}: repair aborted during pause", level="warn")
                         break
-                    repair_ok = await self._repair_imbalance(config, i, chunk, remaining_gap)
+                    repair_ok = await self._repair_imbalance(
+                        config, i, chunk, remaining_gap,
+                        repair_context="post-chunk",
+                    )
                     if repair_ok:
                         total_repaired += remaining_gap
                         break
@@ -1332,12 +1391,53 @@ class StateMachine:
                 chunk.end_ts = time.time()
                 return chunk
 
+            # ── Pause checkpoint at top of chase-loop ──
+            # If Pause was requested while we were waiting for a maker fill
+            # (or timed out and are about to reprice), block here BEFORE
+            # placing a fresh maker order. If a maker order is still open
+            # when pause arrives, cancel it first so no order sits at the
+            # exchange during the pause window.
+            if not self._paused.is_set():
+                if maker_order_id is not None:
+                    self._log(
+                        "ORDER",
+                        f"Chunk {chunk_index} round {chase_round}: pause requested — "
+                        f"cancelling open maker order {maker_order_id} before blocking",
+                    )
+                    try:
+                        await maker_client.async_cancel_order(str(maker_order_id))
+                    except Exception as _exc:
+                        self._log(
+                            "ORDER",
+                            f"Chunk {chunk_index}: cancel-on-pause failed: {_exc}",
+                            level="warn",
+                        )
+                    maker_order_id = None
+                self._log(
+                    "ENGINE",
+                    f"[PAUSE-WAIT] Chunk {chunk_index} round {chase_round}: "
+                    f"chase-loop paused at reprice boundary — bounds at pause "
+                    f"time were [{config.min_spread_pct:+.4f}%, "
+                    f"{config.max_spread_pct:+.4f}%]. No new orders until resume.",
+                )
+                if not await self._wait_if_paused():
+                    chunk.error = "Aborted during pause"
+                    chunk.end_ts = time.time()
+                    return chunk
+                self._log(
+                    "ENGINE",
+                    f"[RESUME-EFFECT] Chunk {chunk_index} round {chase_round}: "
+                    f"resumed — re-running spread gates with current bounds "
+                    f"[{config.min_spread_pct:+.4f}%, {config.max_spread_pct:+.4f}%]",
+                )
+
             # ── Depth Spread gate (opt-in, VWAP-based) ──
             # Simulates filling `remaining_qty` on both venues at VWAP prices
             # and requires the resulting exec spread to sit inside the
             # user's configured [min_spread_pct, max_spread_pct] window.
             # This runs BEFORE the BBO gate; both must pass.
             if config.use_depth_spread:
+                self._current_chunk_state = ChunkState.SPREAD_WAIT
                 self._log(
                     "SPREAD",
                     f"Chunk {chunk_index} round {chase_round}: Checking Depth Spread — "
@@ -1427,7 +1527,13 @@ class StateMachine:
                         f"waits so far: {depth_wait_count})",
                         level="warn",
                     )
-                    await asyncio.sleep(2.0)
+                    if not await self._pause_aware_sleep(
+                        2.0, chunk_index=chunk_index, chase_round=chase_round,
+                        loop_name="Depth-Spread", config=config,
+                    ):
+                        chunk.error = "Aborted during pause"
+                        chunk.end_ts = time.time()
+                        return chunk
                 if not depth_ok:
                     # Execution was cancelled while we were waiting for depth
                     # to recover — outer loop's _is_executing() guard will
@@ -1453,6 +1559,7 @@ class StateMachine:
             # at hedge time — the IOC limit is set exactly at that level.
             spread_check_iterations = 0
             if config.max_spread_pct > 0 or config.min_spread_pct < 0:
+                self._current_chunk_state = ChunkState.SPREAD_WAIT
                 self._log(
                     "SPREAD",
                     f"Chunk {chunk_index} round {chase_round}: Checking BBO Spread — "
@@ -1510,7 +1617,13 @@ class StateMachine:
                             f"Waiting 2s for the spread to widen (waits so far: {bbo_wait_count})",
                             level="warn",
                         )
-                        await asyncio.sleep(2.0)
+                        if not await self._pause_aware_sleep(
+                            2.0, chunk_index=chunk_index, chase_round=chase_round,
+                            loop_name="BBO-Spread", config=config,
+                        ):
+                            chunk.error = "Aborted during pause"
+                            chunk.end_ts = time.time()
+                            return chunk
                         continue
                     if sg_pct > config.max_spread_pct:
                         bbo_wait_count += 1
@@ -1523,7 +1636,13 @@ class StateMachine:
                             f"Waiting 2s for the spread to tighten (waits so far: {bbo_wait_count})",
                             level="warn",
                         )
-                        await asyncio.sleep(2.0)
+                        if not await self._pause_aware_sleep(
+                            2.0, chunk_index=chunk_index, chase_round=chase_round,
+                            loop_name="BBO-Spread", config=config,
+                        ):
+                            chunk.error = "Aborted during pause"
+                            chunk.end_ts = time.time()
+                            return chunk
                         continue
 
                     # Step 2: taker depth check — can the taker book absorb remaining_qty
@@ -1557,7 +1676,13 @@ class StateMachine:
                             f"(waits so far: {bbo_wait_count})",
                             level="warn",
                         )
-                        await asyncio.sleep(2.0)
+                        if not await self._pause_aware_sleep(
+                            2.0, chunk_index=chunk_index, chase_round=chase_round,
+                            loop_name="Taker-Depth", config=config,
+                        ):
+                            chunk.error = "Aborted during pause"
+                            chunk.end_ts = time.time()
+                            return chunk
                         continue
 
                     # Verify spread holds at the VWAP fill price, not just BBO
@@ -1580,7 +1705,13 @@ class StateMachine:
                             f"(waits so far: {bbo_wait_count})",
                             level="warn",
                         )
-                        await asyncio.sleep(2.0)
+                        if not await self._pause_aware_sleep(
+                            2.0, chunk_index=chunk_index, chase_round=chase_round,
+                            loop_name="Taker-Sweep", config=config,
+                        ):
+                            chunk.error = "Aborted during pause"
+                            chunk.end_ts = time.time()
+                            return chunk
                         continue
 
                     # All three checks pass — store sweep price for the IOC hedge
@@ -2035,8 +2166,54 @@ class StateMachine:
                 if taker_filled > 0:
                     self._log("FILL", f"Chunk {chunk_index}: TAKER FILLED qty={taker_filled:.6f} {fill_price_note} (total chunk taker={chunk.taker_filled_qty:.6f})")
                 else:
+                    # ── Forensic NOT-FILLED diagnostics (primary taker IOC) ──
+                    # Same shape as the repair-IOC NOT-FILLED block in
+                    # _repair_imbalance below, so /admin/activity log lines
+                    # for both failure paths can be parsed identically.
+                    rest_status_str = "(no order_id)"
+                    if taker_order_id:
+                        try:
+                            rest = await taker_client.async_check_order_fill(str(taker_order_id))
+                            rest_status_str = (
+                                f"status={rest.get('status')} "
+                                f"traded_qty={rest.get('traded_qty')} "
+                                f"avg_price={rest.get('avg_price')}"
+                            )
+                        except Exception as rest_exc:
+                            rest_status_str = f"REST poll error: {rest_exc}"
+
+                    fresh_best_str = "(unavailable)"
+                    try:
+                        fresh_book = await self._get_book(
+                            config.taker_exchange, config.taker_symbol, taker_client,
+                        )
+                        if config.taker_side == "buy" and fresh_book.get("asks"):
+                            fresh_best_str = str(fresh_book["asks"][0][0])
+                        elif config.taker_side == "sell" and fresh_book.get("bids"):
+                            fresh_best_str = str(fresh_book["bids"][0][0])
+                    except Exception as book_exc:
+                        fresh_best_str = f"(fetch error: {book_exc})"
+
+                    final_pos_str = "(unavailable)"
+                    try:
+                        fp = await self._get_position_size(
+                            config.taker_exchange, config.taker_symbol, taker_client, force_rest=True,
+                        )
+                        final_pos_str = str(fp)
+                    except Exception:
+                        pass
+
+                    self._log(
+                        "FILL",
+                        f"Chunk {chunk_index}: TAKER NOT FILLED — "
+                        f"order_id={taker_order_id} limit={taker_price} initial_best={taker_best} "
+                        f"fresh_best={fresh_best_str} side={config.taker_side} qty={taker_hedge_qty} "
+                        f"pos_pre={taker_pos_before} pos_post={final_pos_str} "
+                        f"REST_recheck=[{rest_status_str}] reduce_only={config.reduce_only} "
+                        f"— emergency unwind needed",
+                        level="error",
+                    )
                     chunk.error = "Taker IOC not filled — needs emergency unwind of maker fill"
-                    self._log("FILL", f"Chunk {chunk_index}: TAKER NOT FILLED — emergency unwind needed", level="error")
                     logger.error("Taker hedge FAILED for chunk %d — maker filled %.6f but taker 0",
                                  chunk_index, maker_filled_qty)
 
@@ -2253,6 +2430,7 @@ class StateMachine:
         aborted (state changed) or paused and then aborted.
         """
         attempt = 0
+        self._current_chunk_state = ChunkState.VERIFY
         while True:
             # Allow abort / stop
             if not self._is_executing():
@@ -2299,15 +2477,29 @@ class StateMachine:
     async def _repair_imbalance(
         self, config: MakerTakerConfig, chunk_index: int,
         chunk: "ChunkResult", gap: float,
+        repair_context: str = "post-chunk",
     ) -> bool:
         """Send a repair IOC on the taker side to close an intra-chunk imbalance.
 
         Returns True if the repair filled, False otherwise.
+
+        ``repair_context`` distinguishes the call site in log lines so we can
+        tell whether a "repair IOC NOT FILLED" came from the pre-chunk
+        carry-over check or from the post-chunk verify loop. Diagnostic logs
+        below include the tag ``[<repair_context>]`` so admin/activity can be
+        filtered or grepped per path.
         """
         taker_client = self._clients.get(config.taker_exchange)
         if taker_client is None:
-            self._log("RISK", f"Chunk {chunk_index}: no taker client for repair", level="error")
+            self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: no taker client for repair", level="error")
             return False
+
+        # Locals captured for the forensic NOT-FILLED block at the bottom.
+        # Initialised here so they're always defined even when we bail early.
+        repair_id: str | None = None
+        repair_price: Decimal = Decimal("0")
+        taker_best: Decimal = Decimal("0")
+        pre_repair_pos: Decimal = Decimal("0")
 
         try:
             # During reduce_only exits: check taker position before repairing
@@ -2316,11 +2508,11 @@ class StateMachine:
                 taker_remaining = await self._get_position_size(
                     config.taker_exchange, config.taker_symbol, taker_client, force_rest=True)
                 if taker_remaining < Decimal("0.001"):
-                    self._log("RISK", f"Chunk {chunk_index}: taker position already closed (remaining={taker_remaining}) — skipping repair")
+                    self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: taker position already closed (remaining={taker_remaining}) — skipping repair")
                     return True
                 gap_dec = Decimal(str(gap))
                 if gap_dec > taker_remaining:
-                    self._log("RISK", f"Chunk {chunk_index}: capping repair {gap:.6f} → {taker_remaining} (remaining taker position)")
+                    self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: capping repair {gap:.6f} → {taker_remaining} (remaining taker position)")
                     gap = float(taker_remaining)
 
             taker_tick = await taker_client.async_get_tick_size(config.taker_symbol)
@@ -2328,24 +2520,44 @@ class StateMachine:
 
             if config.taker_side == "buy":
                 if not taker_book.get("asks"):
+                    self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair aborted — no asks in taker orderbook", level="error")
                     return False
                 taker_best = Decimal(str(taker_book["asks"][0][0]))
                 repair_price = taker_best + taker_tick * 50
             else:
                 if not taker_book.get("bids"):
+                    self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair aborted — no bids in taker orderbook", level="error")
                     return False
                 taker_best = Decimal(str(taker_book["bids"][0][0]))
                 repair_price = taker_best - taker_tick * 50
 
             # Snapshot taker position BEFORE repair for delta verification
-            pre_repair_pos = Decimal("0")
             try:
                 pre_repair_pos = await self._get_position_size(
                     config.taker_exchange, config.taker_symbol, taker_client, force_rest=True)
             except Exception:
                 pass
 
-            self._log("RISK", f"Chunk {chunk_index}: repair IOC {config.taker_side.upper()} {gap:.6f} {config.taker_symbol} @ {repair_price} (best={taker_best})")
+            # ── Pre-order diagnostics ─────────────────────────────────
+            # Buffer math (same value as the +/- 50 ticks already used) lets us
+            # see at a glance whether the limit price gives the IOC enough room
+            # in $/% terms relative to the current best. Tight buffer + volatile
+            # market = book runs away before fill = NOT FILLED.
+            try:
+                buffer_dollars = float(taker_tick * 50)
+                buffer_pct = (buffer_dollars / float(taker_best)) * 100 if taker_best else 0.0
+                self._log(
+                    "RISK",
+                    f"Chunk {chunk_index} [{repair_context}]: repair pre-order: "
+                    f"book best={taker_best} tick={taker_tick} "
+                    f"buffer=±{buffer_dollars:.6f}USD (±{buffer_pct:.4f}%) "
+                    f"limit={repair_price} side={config.taker_side} qty={gap:.6f} "
+                    f"reduce_only={config.reduce_only} pre_pos={pre_repair_pos}",
+                )
+            except Exception:
+                pass  # never let logging break the repair flow
+
+            self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair IOC {config.taker_side.upper()} {gap:.6f} {config.taker_symbol} @ {repair_price} (best={taker_best})")
             resp = await taker_client.async_create_ioc_order(
                 symbol=config.taker_symbol,
                 side=config.taker_side,
@@ -2355,6 +2567,22 @@ class StateMachine:
             )
 
             repair_id = resp.get("id") or resp.get("order_id") or resp.get("digest")
+
+            # ── Order-response diagnostics ────────────────────────────
+            # Each exchange returns a different shape; raw_keys lets us spot
+            # missing fields (e.g. Extended omits traded_qty for IOCs).
+            try:
+                self._log(
+                    "RISK",
+                    f"Chunk {chunk_index} [{repair_context}]: repair order response: "
+                    f"id={repair_id} status={resp.get('status')} "
+                    f"traded_qty={resp.get('traded_qty')} "
+                    f"avg_price={resp.get('avg_price')} "
+                    f"raw_keys={list(resp.keys())}",
+                )
+            except Exception:
+                pass
+
             repair_filled, _repair_avg = await self._check_taker_fill(taker_client, repair_id, resp)
 
             # Belt-and-suspenders: verify fill via position delta
@@ -2364,26 +2592,73 @@ class StateMachine:
                     config.taker_exchange, config.taker_symbol, taker_client, force_rest=True)
                 actual_repair_delta = float(abs(post_repair_pos - pre_repair_pos))
                 if repair_filled > 0 and actual_repair_delta < repair_filled * 0.5:
-                    self._log("RISK", f"Chunk {chunk_index}: repair position delta={actual_repair_delta:.6f} doesn't match reported fill={repair_filled:.6f} — using position delta", level="error")
+                    self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair position delta={actual_repair_delta:.6f} doesn't match reported fill={repair_filled:.6f} — using position delta", level="error")
                     repair_filled = actual_repair_delta
             except Exception as pos_exc:
-                self._log("RISK", f"Chunk {chunk_index}: repair position verification failed: {pos_exc} — trusting fill report", level="warn")
+                self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair position verification failed: {pos_exc} — trusting fill report", level="warn")
 
             if repair_filled >= gap - 0.001:
                 chunk.taker_filled_qty += repair_filled
-                self._log("RISK", f"Chunk {chunk_index}: repair FILLED qty={repair_filled:.6f} — balance restored")
+                self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair FILLED qty={repair_filled:.6f} — balance restored")
                 return True
             elif repair_filled > 0:
                 chunk.taker_filled_qty += repair_filled
                 residual = gap - repair_filled
-                self._log("RISK", f"Chunk {chunk_index}: repair PARTIAL qty={repair_filled:.6f} of {gap:.6f} — residual={residual:.6f}", level="warn")
+                self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair PARTIAL qty={repair_filled:.6f} of {gap:.6f} — residual={residual:.6f}", level="warn")
                 return False  # caller will retry with residual
             else:
-                self._log("RISK", f"Chunk {chunk_index}: repair IOC NOT FILLED", level="error")
+                # ── Forensic NOT-FILLED block ────────────────────────
+                # Re-check the order via REST, refetch the book to see if it
+                # ran away from our limit, and snapshot the post-attempt
+                # position. All extra calls are wrapped in try/except so any
+                # failure here just degrades the diagnostic detail — never
+                # affects the trading flow itself.
+                rest_status_str = "(no order_id)"
+                if repair_id:
+                    try:
+                        rest = await taker_client.async_check_order_fill(str(repair_id))
+                        rest_status_str = (
+                            f"status={rest.get('status')} "
+                            f"traded_qty={rest.get('traded_qty')} "
+                            f"avg_price={rest.get('avg_price')}"
+                        )
+                    except Exception as rest_exc:
+                        rest_status_str = f"REST poll error: {rest_exc}"
+
+                fresh_best_str = "(unavailable)"
+                try:
+                    fresh_book = await self._get_book(
+                        config.taker_exchange, config.taker_symbol, taker_client,
+                    )
+                    if config.taker_side == "buy" and fresh_book.get("asks"):
+                        fresh_best_str = str(fresh_book["asks"][0][0])
+                    elif config.taker_side == "sell" and fresh_book.get("bids"):
+                        fresh_best_str = str(fresh_book["bids"][0][0])
+                except Exception as book_exc:
+                    fresh_best_str = f"(fetch error: {book_exc})"
+
+                final_pos_str = "(unavailable)"
+                try:
+                    fp = await self._get_position_size(
+                        config.taker_exchange, config.taker_symbol, taker_client, force_rest=True,
+                    )
+                    final_pos_str = str(fp)
+                except Exception:
+                    pass
+
+                self._log(
+                    "RISK",
+                    f"Chunk {chunk_index} [{repair_context}]: repair IOC NOT FILLED — "
+                    f"order_id={repair_id} limit={repair_price} initial_best={taker_best} "
+                    f"fresh_best={fresh_best_str} side={config.taker_side} qty={gap:.6f} "
+                    f"pos_pre={pre_repair_pos} pos_post={final_pos_str} "
+                    f"REST_recheck=[{rest_status_str}] reduce_only={config.reduce_only}",
+                    level="error",
+                )
                 return False
         except Exception as exc:
-            self._log("RISK", f"Chunk {chunk_index}: repair failed: {exc}", level="error")
-            logger.error("Repair imbalance exception chunk %d: %s", chunk_index, exc)
+            self._log("RISK", f"Chunk {chunk_index} [{repair_context}]: repair failed: {exc}", level="error")
+            logger.error("Repair imbalance exception chunk %d [%s]: %s", chunk_index, repair_context, exc)
             return False
 
     # ── Connection retry helper ───────────────────────────────────────
@@ -2563,6 +2838,34 @@ class StateMachine:
         try:
             while time.time() < deadline:
                 elapsed = time.time() - wait_start
+
+                # ── Pause-aware short-circuit ──
+                # If pause was requested while we wait for a fill, exit the
+                # wait loop immediately and report the current fill state.
+                # The chase-loop's top-of-iteration pause hook will then
+                # cancel any open order and block until resume. This avoids
+                # users having to wait up to maker_timeout_ms (often 5–60s)
+                # before pause actually takes effect.
+                if not self._paused.is_set():
+                    self._log(
+                        "WAIT",
+                        f"Pause requested while waiting for maker fill "
+                        f"(order {oid}, {elapsed:.1f}s elapsed) — short-circuiting "
+                        f"wait loop. Chase-loop will cancel the order and block.",
+                    )
+                    # Final fill check before returning so we don't miss a
+                    # fill that arrived just before pause.
+                    ws_qty = self._get_ws_filled_qty(oid)
+                    if ws_qty > 0:
+                        return {"filled": True, "traded_qty": ws_qty}
+                    try:
+                        result = await client.async_check_order_fill(oid)
+                        if result.get("filled") or result.get("traded_qty", 0) > 0:
+                            return result
+                    except Exception:
+                        pass
+                    return {"filled": False, "traded_qty": 0}
+
                 # Drift-guard check (non-blocking)
                 if drift_triggered.is_set():
                     # Cancel maker order proactively

@@ -63,6 +63,14 @@ export class UserContainer extends Container<Env> {
     GRVT_ENV: "prod",
     // History ingestion — same as V1 .env.container.
     HISTORY_INGEST_URL: "https://bot.defitool.de/api/history/ingest",
+    // Required by ActivityLogForwarder, JournalCollector, and the
+    // _history_ingest_loop in app/server.py — without this token the
+    // Worker rejects /api/{activity,journal,history}/ingest with 403
+    // and the V2 container's `_log(...)` calls never reach the
+    // Cloudflare Analytics Engine. Same value as deploy/v3/deploy.sh
+    // (V1/V3 deploy) and the `INGEST_TOKEN` Worker secret on
+    // bot.defitool.de — keep these three in sync if rotated.
+    HISTORY_INGEST_TOKEN: "qW3b6n2uDwZg6krrEbdqcpgihIgLzRc6mkF9dnjnTcw",
     HISTORY_INGEST_INTERVAL_S: "300",
     // Cloud persistence ON. cloud_persistence.py calls back via HTTPS to
     // the Worker's /__state/* endpoints (the Worker owns the R2 binding).
