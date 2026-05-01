@@ -24,6 +24,8 @@ export interface BotConfig {
   max_chunk_spread_usd: number
   min_spread_pct: number
   max_spread_pct: number
+  exit_min_spread_pct: number
+  exit_max_spread_pct: number
   fn_opt_depth_spread?: boolean
   fn_opt_max_slippage_bps?: number
   fn_opt_ohi_monitoring?: boolean
@@ -113,6 +115,36 @@ export interface ActivityEntry {
   extra?: { level?: string }
 }
 
+/**
+ * One TWAP-chunk fill, flattened from engine._trade_log.
+ *
+ * Pre-mapped long/short legs come straight from the backend (computed
+ * in engine.py:_log_trade at execution time using the maker_exchange ↔
+ * config.long_exchange identity match — robust across ENTRY/EXIT
+ * regardless of which side is buying or selling).
+ *
+ * `spread_usd` is the per-unit price difference (long_price −
+ * short_price). Negative = long leg cheaper than short at fill =
+ * favourable carry on entry.
+ *
+ * `ts` is end_ts of the chunk (or trade timestamp as fallback).
+ * `error` is non-null only for failed/aborted chunks the user should
+ * notice; successful chunks have `error: null`.
+ */
+export interface FillEntry {
+  action: 'ENTRY' | 'EXIT' | string
+  chunk_index: number
+  long_exchange: string
+  long_qty: number
+  long_price: number
+  short_exchange: string
+  short_qty: number
+  short_price: number
+  spread_usd: number | null
+  ts: number
+  error: string | null
+}
+
 export interface OhiEntry {
   exchange?: string
   ohi: number
@@ -173,6 +205,11 @@ export interface BotStatus {
   data: Record<string, unknown> & { oms_active?: boolean; oms_url?: string | null }
   config: BotConfig
   trade_count: number
+  // Latest 50 fills (newest first) — live tail from SSE. Initial mount
+  // also calls fetchBotFills() to load the full history; subsequent SSE
+  // frames keep the tail in sync. May be undefined on V2 containers
+  // that pre-date the field; callers must handle that gracefully.
+  fills?: FillEntry[]
   activity_log: ActivityEntry[]
 }
 
@@ -191,6 +228,8 @@ export interface BotCreateRequest {
   leverage_short?: number
   min_spread_pct?: number
   max_spread_pct?: number
+  exit_min_spread_pct?: number
+  exit_max_spread_pct?: number
 }
 
 export interface BotStartRequest {
@@ -203,4 +242,24 @@ export interface BotStartRequest {
   short_exchange?: string
   instrument_a?: string
   instrument_b?: string
+}
+
+/**
+ * OMS V2 /meta/{exchange}/{symbol} response.
+ * Matches deploy/cf-containers/oms-v2/src/types.ts::SymbolMeta
+ */
+export interface SymbolMeta {
+  exchange: string
+  symbol: string
+  base_token: string
+  tick_size: number
+  /** Base-qty floor. For Nado this equals size_increment. */
+  min_order_size: number
+  /** USD-notional floor, or null if the exchange does not publish one. */
+  min_notional_usd: number | null
+  qty_step: number
+  max_leverage: number
+  taker_fee_pct: number
+  maker_fee_pct: number | null
+  funding_interval_s: number | null
 }

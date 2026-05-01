@@ -69,5 +69,12 @@ export const useBotsStore = defineStore('bots', () => {
     return result
   }
 
-  return { bots, loading, error, load, create, remove, start, stop, kill, pause, resume, reset }
+  /** Reset all session-scoped bot state (called by /logout). */
+  function resetSession() {
+    bots.value = []
+    loading.value = false
+    error.value = null
+  }
+
+  return { bots, loading, error, load, create, remove, start, stop, kill, pause, resume, reset, resetSession }
 })

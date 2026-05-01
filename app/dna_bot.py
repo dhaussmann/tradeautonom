@@ -27,6 +27,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 
 logger = logging.getLogger("tradeautonom.dna_bot")
@@ -60,10 +61,16 @@ class DNAPosition:
     exit_threshold_bps: float = 0.01  # spread threshold for close
     closed_at: float | None = None
     close_spread_bps: float | None = None
-    close_reason: str = ""        # "arb_closed" | "manual" | ""
+    close_reason: str = ""        # "arb_closed" | "arb_closed_poll" | "manual" | ""
     close_buy_fill_price: float = 0.0   # exit fill price on buy side (reverse sell)
     close_sell_fill_price: float = 0.0  # exit fill price on sell side (reverse buy)
     simulation: bool = False         # snapshot of config.simulation at open time
+    # Pre-trade baseline snapshot — absolute |size| on each exchange BEFORE
+    # the open executed. Used by _verify_position_balance to compare
+    # delta-vs-expected (catches "both legs partial-filled equally" case).
+    # Defaults to 0.0 for backward-compat with old persisted positions.
+    buy_baseline_size: float = 0.0
+    sell_baseline_size: float = 0.0
 
 
 @dataclass
@@ -78,6 +85,10 @@ class DNAConfig:
     custom_min_spread_bps: float = 5.0    # only used when spread_mode == "custom"
     exchanges: list[str] = field(default_factory=lambda: ["extended", "grvt", "nado"])
     slippage_tolerance_pct: float = 0.5   # max slippage for IOC orders
+    max_signal_age_ms: int = 1500         # skip stale OMS opportunity signals
+    max_quote_age_ms: int = 2000          # skip stale /quote/cross snapshots
+    max_signal_erosion_pct: float = 40.0  # max allowed signal->live spread erosion
+    require_cross_quote: bool = False     # fail-closed when /quote/cross is unavailable
     size_tolerance_pct: float = 5.0       # accept position if within X% of target
     simulation: bool = False              # paper-trade mode
     tick_interval_s: float = 0.5          # how often to process signals
@@ -88,6 +99,9 @@ class DNAConfig:
     exit_threshold_bps: float = 0.01      # spread considered "closed"
     excluded_tokens: list[str] = field(default_factory=list)  # tokens to skip
     auto_exclude_open_positions: bool = True  # auto-add tokens with open exchange positions
+    # Per-token cooldown (seconds) after a successful auto-close.
+    # 0 disables the feature. Manual closes do NOT trigger the cooldown.
+    cooldown_after_close_s: float = 300.0
 
 
 @dataclass
@@ -127,6 +141,14 @@ class DNABot:
         self._activity_forwarder = activity_forwarder
         self._oms_fee_config: dict | None = None  # cached /arb/config response
         self._leverage_applied: set[tuple[str, str]] = set()  # (exchange, symbol) where max leverage was set
+        # Per-token cooldown after auto-close: token (uppercase) → unix-ts when cooldown expires.
+        # Set in _close_position on automatic exits, checked in _handle_signal.
+        # In-memory only (matches _activity_log/_leverage_applied pattern); resets on restart.
+        self._token_cooldown_until: dict[str, float] = {}
+        # Throttle for cooldown-skip activity-log entries — token → last log ts.
+        # OMS streams ~5 signals/s per token; without throttling the activity
+        # log would be flooded with "cooldown active" lines for the same token.
+        self._cooldown_log_throttle: dict[str, float] = {}
 
         # Restore positions and config from disk
         self._load_state()
@@ -398,6 +420,47 @@ class DNABot:
                 logger.info("DNA: cached OMS fee config: %s", fees)
         except Exception as exc:
             logger.warning("DNA: failed to fetch OMS config: %s", exc)
+
+    async def _fetch_cross_quote(
+        self,
+        token: str,
+        buy_exchange: str,
+        sell_exchange: str,
+        qty: Decimal,
+    ) -> dict | None:
+        """Fetch a live pre-trade cross quote from OMS.
+
+        Endpoint:
+          /quote/cross?token=...&buy_exchange=...&sell_exchange=...&qty=...
+
+        Returns parsed JSON on success, or None if the request failed.
+        """
+        params = urllib.parse.urlencode(
+            {
+                "token": token,
+                "buy_exchange": buy_exchange,
+                "sell_exchange": sell_exchange,
+                "qty": str(qty),
+            }
+        )
+        url = f"{self.config.oms_url.rstrip('/')}/quote/cross?{params}"
+        try:
+            data = await asyncio.get_event_loop().run_in_executor(
+                None, self._fetch_json, url,
+            )
+            if isinstance(data, dict):
+                return data
+            return None
+        except Exception as exc:
+            logger.warning(
+                "DNA: failed to fetch cross quote %s %s->%s qty=%s: %s",
+                token,
+                buy_exchange,
+                sell_exchange,
+                qty,
+                exc,
+            )
+            return None
 
     async def _nado_signer_watchdog(self) -> None:
         """Periodically verify that the Nado linked signer matches the local trading key.
@@ -685,6 +748,43 @@ class DNABot:
         # delta_neutral: full fee threshold
         return fee_threshold_bps
 
+    # ── Cooldown helpers ──────────────────────────────────────────
+
+    def _is_token_in_cooldown(self, token: str) -> tuple[bool, float]:
+        """Check whether a token is still in post-close cooldown.
+
+        Returns (in_cooldown, remaining_seconds). Lazily evicts expired
+        entries so the dict cannot grow unbounded.
+        """
+        if self.config.cooldown_after_close_s <= 0:
+            return (False, 0.0)
+        key = token.upper()
+        until = self._token_cooldown_until.get(key)
+        if until is None:
+            return (False, 0.0)
+        now = time.time()
+        if now >= until:
+            # Expired — evict so /dna/status doesn't show stale entries
+            self._token_cooldown_until.pop(key, None)
+            self._cooldown_log_throttle.pop(key, None)
+            return (False, 0.0)
+        return (True, until - now)
+
+    def _set_token_cooldown(self, token: str) -> None:
+        """Arm the post-close cooldown for a token.
+
+        Idempotent: re-arming refreshes the expiry. No-op when the feature
+        is disabled (cooldown_after_close_s <= 0).
+        """
+        if self.config.cooldown_after_close_s <= 0:
+            return
+        key = token.upper()
+        self._token_cooldown_until[key] = time.time() + self.config.cooldown_after_close_s
+        # Reset the log throttle so the very first skip after a fresh
+        # cooldown emits an activity-log entry instead of being silently
+        # suppressed by the previous cooldown's throttle window.
+        self._cooldown_log_throttle.pop(key, None)
+
     async def _handle_signal(self, signal: dict) -> None:
         """Evaluate an arb signal and potentially open a position."""
         token = signal.get("token", "")
@@ -701,6 +801,32 @@ class DNABot:
         sell_min_order_size = signal.get("sell_min_order_size", 0.0)
         buy_qty_step = signal.get("buy_qty_step", 0.0)
         sell_qty_step = signal.get("sell_qty_step", 0.0)
+
+        signal_ts_ms: int | None = None
+        signal_age_ms: float | None = None
+        ts_raw = signal.get("timestamp_ms")
+        if ts_raw is not None:
+            try:
+                signal_ts_ms = int(float(ts_raw))
+            except (TypeError, ValueError):
+                signal_ts_ms = None
+        if signal_ts_ms and signal_ts_ms > 0:
+            signal_age_ms = time.time() * 1000 - signal_ts_ms
+            if self.config.max_signal_age_ms > 0 and signal_age_ms > self.config.max_signal_age_ms:
+                logger.info(
+                    "DNA: skip stale signal %s %s->%s age=%.0fms (max=%dms)",
+                    token,
+                    buy_exchange,
+                    sell_exchange,
+                    signal_age_ms,
+                    self.config.max_signal_age_ms,
+                )
+                self._log_activity(
+                    "dna_skipped_signal_stale",
+                    f"{token}: signal age={signal_age_ms:.0f}ms exceeds "
+                    f"max_signal_age_ms={self.config.max_signal_age_ms}ms",
+                )
+                return
 
         # Skip if max positions reached
         open_positions = [p for p in self._positions if p.status == "open"]
@@ -727,6 +853,26 @@ class DNABot:
 
         # Skip excluded tokens
         if token.upper() in (t.upper() for t in self.config.excluded_tokens):
+            return
+
+        # Skip if token is still in post-close cooldown.
+        # This is the whipsaw guard: after we auto-close a position the
+        # closing trade itself moves the orderbook, often producing a
+        # phantom arb signal in the same direction within a few seconds.
+        # Throttle the activity-log entry so we emit at most one line per
+        # token every 10s — OMS streams ~5 signals/s per token.
+        in_cd, remaining = self._is_token_in_cooldown(token)
+        if in_cd:
+            now = time.time()
+            last_log = self._cooldown_log_throttle.get(token.upper(), 0.0)
+            if now - last_log >= 10.0:
+                self._cooldown_log_throttle[token.upper()] = now
+                self._log_activity(
+                    "dna_skipped_cooldown",
+                    f"{token}: post-close cooldown active "
+                    f"({remaining:.0f}s remaining, "
+                    f"signal {buy_exchange}→{sell_exchange} {net_profit_bps:.1f}bps)",
+                )
             return
 
         # Skip if exchanges not in our config
@@ -787,6 +933,7 @@ class DNABot:
             sell_min_order_size=sell_min_order_size,
             buy_qty_step=buy_qty_step,
             sell_qty_step=sell_qty_step,
+            signal_timestamp_ms=signal_ts_ms,
         )
 
     # ── Position execution ────────────────────────────────────────
@@ -831,6 +978,194 @@ class DNABot:
                         qty, harmonized, step_buy, step_sell, step)
         return harmonized
 
+    async def _snapshot_baseline_positions(
+        self,
+        buy_client: Any, buy_symbol: str,
+        sell_client: Any, sell_symbol: str,
+    ) -> tuple[float, float]:
+        """Read absolute position |size| on both exchanges BEFORE a trade.
+
+        Used as anchor for post-trade verification — compare actual position
+        delta against expected qty, not just buy_size vs sell_size (which
+        misses the case where both legs partial-filled by the same amount,
+        or where the user has a pre-existing manual position on one side).
+
+        Errors on one side are tolerated: returns 0 for the failing side and
+        logs a warning. The verify step still runs, just with a less-precise
+        baseline.
+        """
+        try:
+            buy_pos, sell_pos = await asyncio.gather(
+                asyncio.to_thread(buy_client.fetch_positions, [buy_symbol]),
+                asyncio.to_thread(sell_client.fetch_positions, [sell_symbol]),
+                return_exceptions=True,
+            )
+            if isinstance(buy_pos, Exception):
+                self._log_activity(
+                    "dna_baseline_warn",
+                    f"[DNA-VERIFY] baseline snapshot {buy_client.name}/{buy_symbol} "
+                    f"failed: {buy_pos} — assuming 0",
+                )
+                buy_size = 0.0
+            else:
+                p = next((x for x in buy_pos if x.get("instrument") == buy_symbol), None)
+                buy_size = abs(float(p["size"])) if p else 0.0
+
+            if isinstance(sell_pos, Exception):
+                self._log_activity(
+                    "dna_baseline_warn",
+                    f"[DNA-VERIFY] baseline snapshot {sell_client.name}/{sell_symbol} "
+                    f"failed: {sell_pos} — assuming 0",
+                )
+                sell_size = 0.0
+            else:
+                p = next((x for x in sell_pos if x.get("instrument") == sell_symbol), None)
+                sell_size = abs(float(p["size"])) if p else 0.0
+
+            return buy_size, sell_size
+        except Exception as exc:
+            self._log_activity(
+                "dna_baseline_error",
+                f"[DNA-VERIFY] baseline snapshot error: {exc} — falling back to 0/0",
+            )
+            return 0.0, 0.0
+
+    async def _nado_walk_and_validate(
+        self,
+        nado_client: Any,
+        nado_side: str,
+        nado_symbol: str,
+        qty: Decimal,
+        opposite_leg_price: float,
+        original_net_profit_bps: float,
+    ) -> tuple[bool, str, float]:
+        """Walk Nado book to validate depth + arb-profitability before trading.
+
+        Returns (ok, reason, realized_vwap).
+
+        Procedure:
+        1. Fetch Nado book (limit=20) for the side we'll consume.
+        2. Walk levels until cumulative size >= qty. If insufficient
+           depth, return (False, "depth: ...", 0.0) — Extended leg is
+           never sent.
+        3. Compute VWAP across consumed levels (honest expected fill
+           price).
+        4. Apply a static slippage haircut to the *opposite* leg's
+           signal price (per dna_other_leg_slippage_bps; default 5 bps)
+           to model worse-than-quote fills there.
+        5. Compute realized arb in bps from VWAP + haircut'd opposite
+           price. Subtract the slippage erosion (signal_bps -
+           realized_bps) from the OMS-provided net_profit_bps. If the
+           result <= 0, the trade is unprofitable post-walk.
+        6. Return ok=True only if realized_net_bps > 0.
+
+        Note: original_net_profit_bps already has OMS fees deducted.
+        We're asking "does the slippage we'd incur on Nado + the haircut
+        we assume on the other leg eat the whole arb edge?".
+        """
+        try:
+            book = await nado_client.async_fetch_order_book(nado_symbol, limit=20)
+        except Exception as exc:
+            return False, f"book fetch failed: {exc}", 0.0
+
+        levels_key = "asks" if nado_side == "buy" else "bids"
+        levels = book.get(levels_key, [])
+        if not levels:
+            return False, f"empty {levels_key}", 0.0
+
+        try:
+            best = Decimal(str(levels[0][0]))
+        except Exception:
+            return False, "invalid book data", 0.0
+
+        # Walk levels until cumulative size >= qty; track VWAP numerator
+        cum_size = Decimal("0")
+        vwap_num = Decimal("0")  # sum(price * size_consumed_at_level)
+        worst = best
+        consumed_levels = 0
+        for price_str, size_str in levels:
+            try:
+                price = Decimal(str(price_str))
+                size = Decimal(str(size_str))
+            except Exception:
+                continue
+            remaining = qty - cum_size
+            if remaining <= 0:
+                break
+            consume = size if size <= remaining else remaining
+            vwap_num += price * consume
+            cum_size += consume
+            worst = price
+            consumed_levels += 1
+            if cum_size >= qty:
+                break
+
+        if cum_size < qty:
+            return (
+                False,
+                f"depth: need {qty} have {cum_size} across {consumed_levels} levels",
+                0.0,
+            )
+
+        vwap = vwap_num / cum_size if cum_size > 0 else best
+        vwap_f = float(vwap)
+        best_f = float(best)
+
+        # Slippage we'd incur on Nado (vs signal's top-of-book quote) in bps,
+        # measured as price-erosion against the trade direction:
+        #   buy: VWAP higher than best  → costs us (vwap-best)/best
+        #   sell: VWAP lower than best  → costs us (best-vwap)/best
+        if nado_side == "buy":
+            nado_slip_bps = max(0.0, (vwap_f - best_f) / best_f * 10000.0)
+        else:
+            nado_slip_bps = max(0.0, (best_f - vwap_f) / best_f * 10000.0)
+
+        # Static haircut on the *other* leg (no extra REST call).
+        try:
+            from app.config import Settings  # local import; avoid module cycles
+            other_leg_haircut_bps = float(Settings().dna_other_leg_slippage_bps)
+        except Exception:
+            other_leg_haircut_bps = 5.0
+
+        # Diagnostic: cross-check with absolute spread recomputed from
+        # walked Nado VWAP and signal's opposite-leg price. Not used as
+        # a gate (see comment below) — purely for log clarity.
+        if opposite_leg_price > 0:
+            if nado_side == "buy":
+                # Nado buys, opposite sells → spread = sell - vwap_buy
+                recomputed_spread_bps = (opposite_leg_price - vwap_f) / vwap_f * 10000.0
+            else:
+                # Nado sells, opposite buys → spread = vwap_sell - buy
+                recomputed_spread_bps = (vwap_f - opposite_leg_price) / opposite_leg_price * 10000.0
+        else:
+            recomputed_spread_bps = 0.0
+
+        # OMS-reported net_profit_bps already accounts for fees and
+        # top-of-book pricing on both legs. Total erosion vs that
+        # baseline:
+        total_erosion_bps = nado_slip_bps + other_leg_haircut_bps
+        realized_net_bps = original_net_profit_bps - total_erosion_bps
+
+        if realized_net_bps <= 0:
+            reason = (
+                f"unprofitable after walk: signal={original_net_profit_bps:.2f}bps, "
+                f"nado_slip={nado_slip_bps:.2f}bps, other_leg_haircut="
+                f"{other_leg_haircut_bps:.2f}bps → realized={realized_net_bps:.2f}bps "
+                f"(best={best_f:.6f}, vwap={vwap_f:.6f}, levels={consumed_levels}, "
+                f"raw_spread={recomputed_spread_bps:.2f}bps)"
+            )
+            return False, reason, vwap_f
+
+        logger.info(
+            "DNA pre-flight nado %s %s qty=%s OK: signal=%.2fbps, "
+            "nado_slip=%.2fbps, other_leg_haircut=%.2fbps → realized=%.2fbps "
+            "(best=%s, vwap=%s, raw_spread=%.2fbps, levels=%d)",
+            nado_side.upper(), nado_symbol, qty,
+            original_net_profit_bps, nado_slip_bps, other_leg_haircut_bps,
+            realized_net_bps, best, vwap, recomputed_spread_bps, consumed_levels,
+        )
+        return True, "ok", vwap_f
+
     async def _open_position(
         self,
         token: str,
@@ -848,6 +1183,7 @@ class DNABot:
         sell_min_order_size: float = 0.0,
         buy_qty_step: float = 0.0,
         sell_qty_step: float = 0.0,
+        signal_timestamp_ms: int | None = None,
     ) -> None:
         """Execute both legs quasi-simultaneously and record the position."""
         position_id = str(uuid.uuid4())[:8]
@@ -860,6 +1196,16 @@ class DNABot:
         if qty_decimal <= 0:
             logger.warning("DNA %s: harmonized qty is 0 — skipping", token)
             return
+
+        signal_age_ms: float | None = None
+        if signal_timestamp_ms and signal_timestamp_ms > 0:
+            signal_age_ms = time.time() * 1000 - float(signal_timestamp_ms)
+
+        quote_buy_vwap: float | None = None
+        quote_sell_vwap: float | None = None
+        quote_exec_spread_bps: float | None = None
+        quote_book_age_ms: float | None = None
+        quote_net_profit_after_fees_bps: float | None = None
 
         # Pre-flight: ensure qty meets minimum order size on BOTH exchanges
         buy_min = Decimal(str(buy_min_order_size)) if buy_min_order_size > 0 else self._get_min_order_size(buy_client, buy_symbol)
@@ -875,11 +1221,231 @@ class DNABot:
                                f"(buy {buy_exchange}={buy_min}, sell {sell_exchange}={sell_min}) — skipped")
             return
 
-        # Ensure max leverage is set (only fires once per symbol, ~0ms after first call)
-        await asyncio.gather(
-            self._ensure_leverage(buy_client, buy_exchange, buy_symbol, buy_max_leverage),
-            self._ensure_leverage(sell_client, sell_exchange, sell_symbol, sell_max_leverage),
+        # Pre-flight live re-validation for BOTH legs using OMS /quote/cross.
+        # This filters stale/moved opportunities right before order placement.
+        cross_quote = await self._fetch_cross_quote(
+            token=token,
+            buy_exchange=buy_exchange,
+            sell_exchange=sell_exchange,
+            qty=qty_decimal,
         )
+        if cross_quote is None:
+            if self.config.require_cross_quote:
+                logger.warning(
+                    "DNA %s: /quote/cross unavailable and require_cross_quote=true — skipping",
+                    token,
+                )
+                self._log_activity(
+                    "dna_skipped_quote_unavailable",
+                    f"{token}: /quote/cross unavailable and require_cross_quote=true — skipped",
+                )
+                return
+            logger.info(
+                "DNA %s: /quote/cross unavailable — continuing with legacy fail-open path",
+                token,
+            )
+            self._log_activity(
+                "dna_quote_unavailable_fallback",
+                f"{token}: /quote/cross unavailable — using legacy execution path",
+            )
+        else:
+            feasible = bool(cross_quote.get("feasible", False))
+            if not feasible:
+                reason = cross_quote.get("feasibility_reason") or "infeasible"
+                logger.info("DNA %s: live cross quote infeasible (%s) — skipping", token, reason)
+                self._log_activity(
+                    "dna_skipped_quote_infeasible",
+                    f"{token}: live cross quote infeasible ({reason}) — skipped",
+                )
+                return
+
+            buy_quote = cross_quote.get("buy") if isinstance(cross_quote.get("buy"), dict) else {}
+            sell_quote = cross_quote.get("sell") if isinstance(cross_quote.get("sell"), dict) else {}
+
+            buy_age_raw = buy_quote.get("book_age_ms") if isinstance(buy_quote, dict) else None
+            sell_age_raw = sell_quote.get("book_age_ms") if isinstance(sell_quote, dict) else None
+            ages: list[float] = []
+            for age_raw in (buy_age_raw, sell_age_raw):
+                try:
+                    if age_raw is not None:
+                        ages.append(float(age_raw))
+                except (TypeError, ValueError):
+                    continue
+            quote_book_age_ms = max(ages) if ages else None
+
+            if (
+                self.config.max_quote_age_ms > 0
+                and quote_book_age_ms is not None
+                and quote_book_age_ms > self.config.max_quote_age_ms
+            ):
+                logger.info(
+                    "DNA %s: live cross quote stale (age=%.0fms max=%dms) — skipping",
+                    token,
+                    quote_book_age_ms,
+                    self.config.max_quote_age_ms,
+                )
+                self._log_activity(
+                    "dna_skipped_quote_stale",
+                    f"{token}: live cross quote age={quote_book_age_ms:.0f}ms exceeds "
+                    f"max_quote_age_ms={self.config.max_quote_age_ms}ms — skipped",
+                )
+                return
+
+            try:
+                quote_exec_spread_bps = float(cross_quote.get("exec_spread_bps", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                quote_exec_spread_bps = 0.0
+            try:
+                quote_net_profit_after_fees_bps = float(
+                    cross_quote.get("net_profit_bps_after_fees", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                quote_net_profit_after_fees_bps = 0.0
+
+            if quote_net_profit_after_fees_bps <= 0:
+                logger.info(
+                    "DNA %s: live cross quote unprofitable after fees (%.2fbps) — skipping",
+                    token,
+                    quote_net_profit_after_fees_bps,
+                )
+                self._log_activity(
+                    "dna_skipped_quote_unprofitable",
+                    f"{token}: live cross quote net_profit_bps_after_fees="
+                    f"{quote_net_profit_after_fees_bps:.2f} <= 0 — skipped",
+                )
+                return
+
+            if self.config.max_signal_erosion_pct > 0 and net_profit_bps > 0:
+                erosion_pct = max(
+                    0.0,
+                    (net_profit_bps - quote_exec_spread_bps) / net_profit_bps * 100.0,
+                )
+                if erosion_pct > self.config.max_signal_erosion_pct:
+                    logger.info(
+                        "DNA %s: signal erosion too high %.1f%% (signal=%.2fbps live=%.2fbps max=%.1f%%) — skipping",
+                        token,
+                        erosion_pct,
+                        net_profit_bps,
+                        quote_exec_spread_bps,
+                        self.config.max_signal_erosion_pct,
+                    )
+                    self._log_activity(
+                        "dna_skipped_quote_eroded",
+                        f"{token}: signal erosion {erosion_pct:.1f}% exceeds "
+                        f"max_signal_erosion_pct={self.config.max_signal_erosion_pct:.1f}% "
+                        f"(signal={net_profit_bps:.2f}bps live={quote_exec_spread_bps:.2f}bps)",
+                    )
+                    return
+
+            try:
+                quote_buy_vwap = float(buy_quote.get("vwap")) if buy_quote.get("vwap") is not None else None
+            except (TypeError, ValueError):
+                quote_buy_vwap = None
+            try:
+                quote_sell_vwap = float(sell_quote.get("vwap")) if sell_quote.get("vwap") is not None else None
+            except (TypeError, ValueError):
+                quote_sell_vwap = None
+
+            # Harmonize to live quote quantity if tighter than the signal-derived qty.
+            try:
+                live_harmonized_qty = Decimal(str(cross_quote.get("harmonized_qty", "0")))
+            except Exception:
+                live_harmonized_qty = Decimal("0")
+            if live_harmonized_qty > 0 and live_harmonized_qty < qty_decimal:
+                logger.info(
+                    "DNA %s: live quote resized qty %.6f -> %.6f",
+                    token,
+                    qty_decimal,
+                    live_harmonized_qty,
+                )
+                qty_decimal = live_harmonized_qty
+
+            if effective_min > 0 and qty_decimal < effective_min:
+                logger.info(
+                    "DNA %s: live quote qty %.6f below min_order_size %.6f — skipping",
+                    token,
+                    qty_decimal,
+                    float(effective_min),
+                )
+                self._log_activity(
+                    "dna_skipped_quote_qty_too_small",
+                    f"{token}: live quote qty={qty_decimal:.6f} below min={effective_min} — skipped",
+                )
+                return
+
+        # Pre-flight Nado depth + arb-validity walk.
+        #
+        # The Nado leg is FOK — partial fills aren't possible. If the book
+        # can't absorb our qty within the slippage band, the order would
+        # return code=2031 *after* the Extended/GRVT leg has already filled,
+        # forcing an unwind. Walk the book here to:
+        #   (a) Skip the trade entirely when Nado depth is insufficient.
+        #   (b) Skip the trade when VWAP slippage + other-leg haircut would
+        #       erode the OMS-reported net_profit_bps to <= 0 (loser).
+        # Only runs for live trades when Nado is one of the two legs.
+        if not self.config.simulation:
+            nado_leg = None  # tuple: (side, symbol, opposite_signal_price)
+            if buy_exchange == "nado":
+                nado_leg = ("buy", buy_symbol, sell_price)
+            elif sell_exchange == "nado":
+                nado_leg = ("sell", sell_symbol, buy_price)
+
+            if nado_leg is not None:
+                nado_side, nado_symbol, opposite_price = nado_leg
+                nado_client = self._clients["nado"]
+                ok, reason, vwap = await self._nado_walk_and_validate(
+                    nado_client=nado_client,
+                    nado_side=nado_side,
+                    nado_symbol=nado_symbol,
+                    qty=qty_decimal,
+                    opposite_leg_price=opposite_price,
+                    original_net_profit_bps=net_profit_bps,
+                )
+                if not ok:
+                    activity_code = (
+                        "dna_skipped_thin_nado_depth"
+                        if reason.startswith("depth")
+                        else "dna_skipped_thin_nado_unprofitable"
+                        if reason.startswith("unprofitable")
+                        else "dna_skipped_thin_nado_book_error"
+                    )
+                    logger.warning(
+                        "DNA %s: pre-flight Nado %s %s qty=%s SKIPPED — %s",
+                        token, nado_side, nado_symbol, qty_decimal, reason,
+                    )
+                    self._log_activity(
+                        activity_code,
+                        f"{token}: nado {nado_side} {nado_symbol} qty={qty_decimal} "
+                        f"skipped — {reason}",
+                    )
+                    return
+
+        # Ensure max leverage is set (only fires once per symbol, ~0ms after first call)
+        # Run leverage setup AND baseline snapshot in parallel to minimise the
+        # latency window between signal arrival and order placement. The
+        # baseline is the absolute |size| on each exchange BEFORE we trade,
+        # used by _verify_position_balance to compare delta-vs-expected.
+        baseline_buy_size, baseline_sell_size = 0.0, 0.0
+        if self.config.simulation:
+            # SIM-MODE: do not touch the live account at all. Skipping
+            # _ensure_leverage avoids mutating real account leverage while
+            # the bot is supposed to be paper-trading. Skipping the
+            # baseline snapshot is fine since _verify_position_balance is
+            # also skipped in sim mode (see guard there).
+            pass
+        else:
+            _, _, baselines = await asyncio.gather(
+                self._ensure_leverage(buy_client, buy_exchange, buy_symbol, buy_max_leverage),
+                self._ensure_leverage(sell_client, sell_exchange, sell_symbol, sell_max_leverage),
+                self._snapshot_baseline_positions(buy_client, buy_symbol, sell_client, sell_symbol),
+            )
+            baseline_buy_size, baseline_sell_size = baselines
+            self._log_activity(
+                "dna_baseline",
+                f"[DNA-VERIFY] [{position_id}] {token}: baseline snapshot — "
+                f"{buy_exchange}={baseline_buy_size:.6f}, "
+                f"{sell_exchange}={baseline_sell_size:.6f}",
+            )
 
         t_start = time.time()
 
@@ -945,6 +1511,8 @@ class DNABot:
                 exit_min_hold_s=self._compute_exit_hold_s(),
                 exit_threshold_bps=self.config.exit_threshold_bps,
                 simulation=self.config.simulation,
+                buy_baseline_size=baseline_buy_size,
+                sell_baseline_size=baseline_sell_size,
             )
             self._positions.append(position)
             self._save_state()
@@ -960,12 +1528,54 @@ class DNABot:
                                f"SELL {sell_exchange}@{position.sell_fill_price:.4f}, "
                                f"qty={effective_qty:.6f}, notional=${position.notional_usd:.2f}")
 
-            # Post-fill: verify actual exchange positions match
+            buy_slippage_bps = None
+            sell_slippage_bps = None
+            if buy_price > 0:
+                buy_slippage_bps = (actual_buy - buy_price) / buy_price * 10000.0
+            if sell_price > 0:
+                sell_slippage_bps = (sell_price - actual_sell) / sell_price * 10000.0
+
+            telemetry = {
+                "position_id": position_id,
+                "token": token,
+                "buy_exchange": buy_exchange,
+                "sell_exchange": sell_exchange,
+                "qty": effective_qty,
+                "notional_usd": position.notional_usd,
+                "signal_timestamp_ms": signal_timestamp_ms,
+                "signal_age_ms": signal_age_ms,
+                "signal_buy_price_bbo": buy_price,
+                "signal_sell_price_bbo": sell_price,
+                "signal_net_profit_bps": net_profit_bps,
+                "quote_buy_vwap": quote_buy_vwap,
+                "quote_sell_vwap": quote_sell_vwap,
+                "quote_exec_spread_bps": quote_exec_spread_bps,
+                "quote_book_age_ms": quote_book_age_ms,
+                "quote_net_profit_after_fees_bps": quote_net_profit_after_fees_bps,
+                "realized_buy_fill": actual_buy,
+                "realized_sell_fill": actual_sell,
+                "realized_spread_bps": actual_spread_bps,
+                "buy_slippage_bps": buy_slippage_bps,
+                "sell_slippage_bps": sell_slippage_bps,
+                "long_exchange": buy_exchange,
+                "short_exchange": sell_exchange,
+                "long_price": actual_buy,
+                "short_price": actual_sell,
+                "long_cheaper_than_short": actual_buy < actual_sell,
+                "execution_time_ms": elapsed_ms,
+            }
+            self._log_activity("dna_entry_telemetry", json.dumps(telemetry))
+
+            # Post-fill: verify actual exchange positions match expected delta.
+            # Baselines anchor the comparison so partial-fills and pre-existing
+            # manual positions are detected correctly.
             await self._verify_position_balance(
                 position_id, token,
                 buy_exchange, buy_symbol,
                 sell_exchange, sell_symbol,
-                effective_qty,
+                expected_qty=effective_qty,
+                baseline_buy=baseline_buy_size,
+                baseline_sell=baseline_sell_size,
             )
 
         elif not buy_result.success and not sell_result.success:
@@ -1029,11 +1639,36 @@ class DNABot:
         self, client: Any, symbol: str, side: str, quantity: Decimal,
     ) -> DNALegResult:
         """Execute a market order on an exchange and poll for fill."""
+        # SIM-MODE GUARD (defense-in-depth): if we ever reach _execute_leg
+        # while config.simulation is True, that is a bug — the open/close
+        # paths should have routed through the simulated branch. Log
+        # loudly and return a fake fill instead of placing a real order.
+        if self.config.simulation:
+            logger.error(
+                "DNA: _execute_leg called in simulation mode (%s %s %s qty=%s) — "
+                "bug guard, returning fake fill",
+                getattr(client, "name", "?"), side, symbol, quantity,
+            )
+            return DNALegResult(
+                success=True,
+                exchange=getattr(client, "name", "?"),
+                symbol=symbol,
+                side=side,
+                quantity=float(quantity),
+                fill_price=0.0,
+                order_id="sim-guard",
+            )
         try:
-            # Use synchronous create_market_order wrapped in thread
+            # Use synchronous create_market_order wrapped in thread.
+            # Pass DNA's configured slippage tolerance — Nado uses it as
+            # the FOK band cap (replaces the old 10-tick fudge); Extended
+            # and GRVT accept it natively (Extended uses it as max
+            # slippage on the market order; GRVT ignores — handled
+            # exchange-side).
             resp = await asyncio.to_thread(
                 client.create_market_order,
                 symbol=symbol, side=side, amount=quantity,
+                slippage_pct=self.config.slippage_tolerance_pct,
             )
 
             # Extract order id — different clients use different keys
@@ -1118,19 +1753,50 @@ class DNABot:
         buy_exchange: str, buy_symbol: str,
         sell_exchange: str, sell_symbol: str,
         expected_qty: float,
+        baseline_buy: float = 0.0,
+        baseline_sell: float = 0.0,
     ) -> None:
-        """Verify actual exchange positions match after a trade and repair any delta imbalance.
+        """Verify actual exchange positions after a trade and repair any imbalance.
 
-        Strategy:
-        - diff <= size_tolerance_pct → OK, nothing to do
-        - diff <= 20% of larger side → fill_up: add qty to the smaller side
-        - diff >  20% of larger side → trim_down: reduce the larger side (less risky)
+        Two paths:
 
-        Uses 2.5s settlement delay to allow Extended's async fill confirmation to complete.
+        OPEN-Verify (expected_qty > 0):
+          Uses pre-trade baselines + expected delta. For each exchange we check
+          (current_size - baseline) ≈ expected_qty within size_tolerance_pct.
+          Repairs the side that is most off-target, bringing it back to
+          baseline + expected_qty (buy more if short; sell to trim if over).
+          This catches the case where BOTH legs partial-filled by the same
+          amount (legacy "side-by-side" logic missed this).
+
+        CLOSE-Verify (expected_qty == 0):
+          Both sides should end up flat. Falls back to "smaller side vs larger
+          side" comparison with fill_up / trim_down repair (as before).
+
+        Uses 2.5s settlement delay to allow Extended's async fill confirmation
+        to complete.
+
+        All decisions and outcomes are surfaced via [DNA-VERIFY]-tagged
+        activity log entries so the user can audit what happened.
         """
+        # SIM-MODE GUARD: never touch real exchanges in simulation. Without
+        # this guard the verifier would fetch live positions, compute a huge
+        # imbalance vs the simulated expectation, and fire a real market
+        # repair order in the full position size. (See AGENTS.md §11.)
+        if self.config.simulation:
+            self._log_activity(
+                "dna_verify_skipped",
+                f"[DNA-VERIFY] [{position_id}] {token}: SKIPPED — simulation mode",
+            )
+            return
+
         buy_client = self._clients.get(buy_exchange)
         sell_client = self._clients.get(sell_exchange)
         if not buy_client or not sell_client:
+            self._log_activity(
+                "dna_verify_skipped",
+                f"[DNA-VERIFY] [{position_id}] {token}: SKIPPED — missing client "
+                f"for {buy_exchange} or {sell_exchange}",
+            )
             return
 
         try:
@@ -1146,89 +1812,179 @@ class DNABot:
             buy_size = abs(float(buy_pos["size"])) if buy_pos else 0.0
             sell_size = abs(float(sell_pos["size"])) if sell_pos else 0.0
 
-            if buy_size == 0.0 and sell_size == 0.0:
-                return  # both flat — position was closed or never opened
+            tolerance = self.config.size_tolerance_pct
 
-            diff = abs(buy_size - sell_size)
-            max_size = max(buy_size, sell_size, 1e-9)
-            diff_pct = diff / max_size * 100
+            # ── OPEN-Verify: compare delta vs expected_qty per side ──
+            if expected_qty > 0:
+                delta_buy = buy_size - baseline_buy
+                delta_sell = sell_size - baseline_sell
 
-            if diff_pct <= self.config.size_tolerance_pct:
-                logger.info(
-                    "DNA %s %s: position balance OK — %s %.6f, %s %.6f (diff=%.2f%%)",
-                    position_id, token, buy_exchange, buy_size, sell_exchange, sell_size, diff_pct,
+                buy_diff = abs(delta_buy - expected_qty)
+                sell_diff = abs(delta_sell - expected_qty)
+                buy_diff_pct = buy_diff / max(expected_qty, 1e-9) * 100
+                sell_diff_pct = sell_diff / max(expected_qty, 1e-9) * 100
+
+                self._log_activity(
+                    "dna_verify_open",
+                    f"[DNA-VERIFY] [{position_id}] {token}: OPEN check — "
+                    f"{buy_exchange} {baseline_buy:.6f}→{buy_size:.6f} "
+                    f"(Δ={delta_buy:+.6f}, off {buy_diff_pct:.2f}%); "
+                    f"{sell_exchange} {baseline_sell:.6f}→{sell_size:.6f} "
+                    f"(Δ={delta_sell:+.6f}, off {sell_diff_pct:.2f}%); "
+                    f"expected={expected_qty:.6f}, tol={tolerance:.1f}%",
                 )
-                return
 
-            logger.warning(
-                "DNA %s %s: POSITION IMBALANCE — %s=%.6f, %s=%.6f (diff=%.6f, %.2f%%)",
-                position_id, token, buy_exchange, buy_size, sell_exchange, sell_size, diff, diff_pct,
-            )
-            self._log_activity("position_imbalance",
-                               f"[{position_id}] {token}: {buy_exchange}={buy_size:.6f}, "
-                               f"{sell_exchange}={sell_size:.6f} (diff={diff:.6f}, {diff_pct:.2f}%)")
+                buy_ok = buy_diff_pct <= tolerance
+                sell_ok = sell_diff_pct <= tolerance
 
-            # Choose repair strategy:
-            # fill_up  (≤20% diff): add to the smaller side — preserves target notional
-            # trim_down (>20% diff): reduce the larger side — safer, avoids extra market exposure
-            _FILL_UP_THRESHOLD_PCT = 20.0
-            correction_qty = Decimal(str(diff))
+                if buy_ok and sell_ok:
+                    self._log_activity(
+                        "dna_verify_ok",
+                        f"[DNA-VERIFY] [{position_id}] {token}: OK — both legs within "
+                        f"{tolerance:.1f}% of expected {expected_qty:.6f}",
+                    )
+                    return
 
-            if buy_size < sell_size:
-                larger_client, larger_symbol, larger_exchange = sell_client, sell_symbol, sell_exchange
-                smaller_client, smaller_symbol, smaller_exchange = buy_client, buy_symbol, buy_exchange
-                fill_up_side, trim_down_side = "buy", "sell"
+                # Pick the side most off-target to repair. Repair brings
+                # delta back to expected_qty by buying more (if short) or
+                # selling to trim (if over-filled).
+                if buy_ok:
+                    # Only sell side is off
+                    repair_side_label = "sell"
+                elif sell_ok:
+                    # Only buy side is off
+                    repair_side_label = "buy"
+                elif buy_diff >= sell_diff:
+                    # Both off — repair the worse one
+                    repair_side_label = "buy"
+                else:
+                    repair_side_label = "sell"
+
+                if repair_side_label == "buy":
+                    shortfall = expected_qty - delta_buy
+                    repair_client, repair_symbol = buy_client, buy_symbol
+                    repair_exchange = buy_exchange
+                    # If we're short on the buy leg → buy more; if over → sell to trim.
+                    repair_side = "buy" if shortfall > 0 else "sell"
+                else:
+                    shortfall = expected_qty - delta_sell
+                    repair_client, repair_symbol = sell_client, sell_symbol
+                    repair_exchange = sell_exchange
+                    # Sell-leg short on |size| (delta < expected) → place SELL to add short.
+                    repair_side = "sell" if shortfall > 0 else "buy"
+
+                correction_qty = Decimal(str(abs(shortfall)))
+                strategy = f"delta_repair_{repair_side_label}_leg"
+
+            # ── CLOSE-Verify: legacy fill_up / trim_down logic ──
             else:
-                larger_client, larger_symbol, larger_exchange = buy_client, buy_symbol, buy_exchange
-                smaller_client, smaller_symbol, smaller_exchange = sell_client, sell_symbol, sell_exchange
-                fill_up_side, trim_down_side = "sell", "buy"
+                if buy_size == 0.0 and sell_size == 0.0:
+                    self._log_activity(
+                        "dna_verify_skipped",
+                        f"[DNA-VERIFY] [{position_id}] {token}: SKIPPED — both sides "
+                        f"flat (closed/never-opened)",
+                    )
+                    return
 
-            if diff_pct <= _FILL_UP_THRESHOLD_PCT:
-                # Small imbalance → fill up the smaller side
-                step = self._get_qty_step(smaller_client, smaller_symbol)
-                correction_qty = (correction_qty / step).to_integral_value(rounding="ROUND_DOWN") * step
-                repair_client, repair_symbol, repair_side, repair_exchange = (
-                    smaller_client, smaller_symbol, fill_up_side, smaller_exchange
+                diff = abs(buy_size - sell_size)
+                max_size = max(buy_size, sell_size, 1e-9)
+                diff_pct = diff / max_size * 100
+
+                self._log_activity(
+                    "dna_verify_close",
+                    f"[DNA-VERIFY] [{position_id}] {token}: CLOSE check — "
+                    f"{buy_exchange}={buy_size:.6f}, {sell_exchange}={sell_size:.6f}, "
+                    f"diff={diff:.6f} ({diff_pct:.2f}%, tol={tolerance:.1f}%)",
                 )
-                strategy = "fill_up"
-            else:
-                # Large imbalance → trim down the larger side
-                step = self._get_qty_step(larger_client, larger_symbol)
-                correction_qty = (correction_qty / step).to_integral_value(rounding="ROUND_DOWN") * step
-                repair_client, repair_symbol, repair_side, repair_exchange = (
-                    larger_client, larger_symbol, trim_down_side, larger_exchange
-                )
-                strategy = "trim_down"
+
+                if diff_pct <= tolerance:
+                    self._log_activity(
+                        "dna_verify_ok",
+                        f"[DNA-VERIFY] [{position_id}] {token}: OK — close-side "
+                        f"within tolerance",
+                    )
+                    return
+
+                _FILL_UP_THRESHOLD_PCT = 20.0
+                correction_qty = Decimal(str(diff))
+
+                if buy_size < sell_size:
+                    larger_client, larger_symbol, larger_exchange = sell_client, sell_symbol, sell_exchange
+                    smaller_client, smaller_symbol, smaller_exchange = buy_client, buy_symbol, buy_exchange
+                    fill_up_side, trim_down_side = "buy", "sell"
+                else:
+                    larger_client, larger_symbol, larger_exchange = buy_client, buy_symbol, buy_exchange
+                    smaller_client, smaller_symbol, smaller_exchange = sell_client, sell_symbol, sell_exchange
+                    fill_up_side, trim_down_side = "sell", "buy"
+
+                if diff_pct <= _FILL_UP_THRESHOLD_PCT:
+                    repair_client, repair_symbol, repair_side, repair_exchange = (
+                        smaller_client, smaller_symbol, fill_up_side, smaller_exchange
+                    )
+                    strategy = "fill_up"
+                else:
+                    repair_client, repair_symbol, repair_side, repair_exchange = (
+                        larger_client, larger_symbol, trim_down_side, larger_exchange
+                    )
+                    strategy = "trim_down"
+
+            # ── Round correction qty to repair-exchange step size ──
+            step = self._get_qty_step(repair_client, repair_symbol)
+            correction_qty = (correction_qty / step).to_integral_value(rounding="ROUND_DOWN") * step
 
             if correction_qty <= 0:
-                logger.warning("DNA %s %s: repair qty rounded to 0 (step too large) — skipping", position_id, token)
+                self._log_activity(
+                    "dna_verify_skipped",
+                    f"[DNA-VERIFY] [{position_id}] {token}: REPAIR_SKIPPED — "
+                    f"correction qty rounded to 0 (step={step} too large for shortfall)",
+                )
                 return
 
-            logger.info(
-                "DNA %s %s: repairing delta [%s] — %s %s %.6f on %s",
-                position_id, token, strategy, repair_side, repair_symbol, correction_qty, repair_exchange,
+            self._log_activity(
+                "dna_verify_imbalance",
+                f"[DNA-VERIFY] [{position_id}] {token}: IMBALANCE — repairing "
+                f"[{strategy}] {repair_side} {correction_qty} {repair_symbol} on {repair_exchange}",
             )
+            logger.warning(
+                "DNA %s %s: IMBALANCE — repair [%s] %s %s on %s qty=%s",
+                position_id, token, strategy, repair_side, repair_symbol,
+                repair_exchange, correction_qty,
+            )
+
             corrective = await self._execute_leg(repair_client, repair_symbol, repair_side, correction_qty)
+
             if corrective.success:
+                self._log_activity(
+                    "dna_verify_repaired",
+                    f"[DNA-VERIFY] [{position_id}] {token}: REPAIR_OK — "
+                    f"[{strategy}] {repair_side} {corrective.quantity:.6f} on "
+                    f"{repair_exchange} filled @ {corrective.fill_price or 0:.4f}",
+                )
                 logger.info(
-                    "DNA %s %s: delta repair OK [%s] — %s %.6f on %s",
+                    "DNA %s %s: REPAIR_OK [%s] — %s %.6f on %s",
                     position_id, token, strategy, repair_side, corrective.quantity, repair_exchange,
                 )
-                self._log_activity("position_corrected",
-                                   f"[{position_id}] {token}: delta repair [{strategy}] "
-                                   f"{repair_side} {corrective.quantity:.6f} on {repair_exchange}")
             else:
+                self._log_activity(
+                    "dna_verify_failed",
+                    f"[DNA-VERIFY] [{position_id}] {token}: REPAIR_FAILED — "
+                    f"[{strategy}] {repair_side} on {repair_exchange}: {corrective.error}",
+                )
                 logger.error(
-                    "DNA %s %s: DELTA REPAIR FAILED [%s] — %s %s on %s: %s",
+                    "DNA %s %s: REPAIR_FAILED [%s] — %s %s on %s: %s",
                     position_id, token, strategy, repair_side, repair_symbol,
                     repair_exchange, corrective.error,
                 )
-                self._log_activity("corrective_failed",
-                                   f"[{position_id}] {token}: delta repair [{strategy}] "
-                                   f"{repair_side} on {repair_exchange} FAILED: {corrective.error}")
 
         except Exception as exc:
-            logger.warning("DNA %s %s: position balance check error: %s", position_id, token, exc)
+            self._log_activity(
+                "dna_verify_error",
+                f"[DNA-VERIFY] [{position_id}] {token}: ERROR — {exc}",
+            )
+            logger.warning(
+                "DNA %s %s: position balance check error: %s",
+                position_id, token, exc, exc_info=True,
+            )
 
     async def _close_position(self, pos: DNAPosition, spread_bps: float, reason: str) -> bool:
         """Close a position by executing reverse market orders on both sides.
@@ -1310,13 +2066,36 @@ class DNABot:
                                f"[{pos.position_id}] {pos.token}: closed ({reason}), "
                                f"spread={spread_bps:.2f}bps, held {(pos.closed_at - pos.opened_at):.0f}s")
 
-            # Post-close: verify both sides are flat / balanced
-            await self._verify_position_balance(
-                pos.position_id, pos.token,
-                pos.buy_exchange, pos.buy_symbol,
-                pos.sell_exchange, pos.sell_symbol,
-                0.0,
-            )
+            # Arm per-token cooldown ONLY for automatic exits. Manual
+            # closes (UI button) bypass the cooldown so the user can
+            # rotate positions immediately. The two reason strings below
+            # are produced by:
+            #   "arb_closed"      → _ws_loop on arb_close WS message
+            #   "arb_closed_poll" → _spread_poll_loop fallback safety net
+            if reason in ("arb_closed", "arb_closed_poll"):
+                self._set_token_cooldown(pos.token)
+                if self.config.cooldown_after_close_s > 0:
+                    self._log_activity(
+                        "dna_cooldown_armed",
+                        f"{pos.token}: cooldown armed for "
+                        f"{self.config.cooldown_after_close_s:.0f}s after auto-close",
+                    )
+
+            # Post-close: verify both sides are flat / balanced.
+            # expected_qty=0 puts the verifier into CLOSE-mode (legacy
+            # fill_up/trim_down logic); baselines are unused in that path.
+            # Skip for simulated positions even if config.simulation has
+            # since been toggled live — verify must never touch the
+            # exchange for a position that was opened in sim.
+            if not pos.simulation:
+                await self._verify_position_balance(
+                    pos.position_id, pos.token,
+                    pos.buy_exchange, pos.buy_symbol,
+                    pos.sell_exchange, pos.sell_symbol,
+                    expected_qty=0.0,
+                    baseline_buy=0.0,
+                    baseline_sell=0.0,
+                )
             return True
         else:
             # One or both legs failed — revert to open for retry
@@ -1447,6 +2226,10 @@ class DNABot:
                 "custom_min_spread_bps": self.config.custom_min_spread_bps,
                 "exchanges": self.config.exchanges,
                 "simulation": self.config.simulation,
+                "max_signal_age_ms": self.config.max_signal_age_ms,
+                "max_quote_age_ms": self.config.max_quote_age_ms,
+                "max_signal_erosion_pct": self.config.max_signal_erosion_pct,
+                "require_cross_quote": self.config.require_cross_quote,
                 "exit_mode": self.config.exit_mode,
                 "exit_min_hold_minutes": self.config.exit_min_hold_minutes,
                 "exit_min_hold_hours": self.config.exit_min_hold_hours,
@@ -1454,6 +2237,15 @@ class DNABot:
                 "exit_threshold_bps": self.config.exit_threshold_bps,
                 "excluded_tokens": self.config.excluded_tokens,
                 "auto_exclude_open_positions": self.config.auto_exclude_open_positions,
+                "cooldown_after_close_s": self.config.cooldown_after_close_s,
+            },
+            # Active per-token cooldowns: token → seconds remaining.
+            # Only includes tokens whose cooldown has not yet expired;
+            # expired entries are evicted lazily by _is_token_in_cooldown.
+            "cooldowns": {
+                token: round(until - time.time(), 1)
+                for token, until in self._token_cooldown_until.items()
+                if until > time.time()
             },
             "positions": {
                 "open": len(open_pos),

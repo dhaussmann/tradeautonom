@@ -13,10 +13,13 @@ const authStore = useAuthStore()
 
 const mobileMenuOpen = ref(false)
 
-async function handleLogout() {
-  await authStore.logout()
+// Route through /logout instead of calling authStore.logout() directly so
+// every logout path (header desktop button, mobile menu, vault-screen
+// link, address-bar nav) shares the same Pinia-store reset and cookie
+// cleanup logic in LogoutView.vue.
+function handleLogout() {
   mobileMenuOpen.value = false
-  router.push('/login')
+  router.push({ name: 'logout' })
 }
 
 const baseLinks = [
@@ -25,6 +28,7 @@ const baseLinks = [
   { to: '/strategies', label: 'Strategies', name: 'strategies' },
   { to: '/arbitrage', label: 'Arbitrage', name: 'arbitrage' },
   { to: '/dna', label: 'DNA Bot', name: 'dna' },
+  { to: '/gold-spread', label: 'Gold Spread', name: 'gold-spread' },
   { to: '/positions', label: 'Positions', name: 'positions' },
   { to: '/history', label: 'History', name: 'history' },
   { to: '/account', label: 'Account', name: 'account' },

@@ -202,6 +202,14 @@ const keyFields = [
           </Typography>
         </button>
       </form>
+      <!-- Logout escape hatch — present in every vault state so the user
+           can always sign out, even when the vault password is forgotten
+           or the unlock keeps failing. -->
+      <div :class="$style.logoutEscape">
+        <RouterLink :to="{ name: 'logout' }" :class="$style.logoutLink">
+          <Typography size="text-xs" color="tertiary">Sign out</Typography>
+        </RouterLink>
+      </div>
     </div>
     <!-- Help panel (slides in from the right) -->
     <Transition name="slide">
@@ -444,6 +452,26 @@ const keyFields = [
 }
 
 .helpLink:hover {
+  text-decoration: underline;
+}
+
+/* Sign-out escape hatch at the bottom of the vault card. Deliberately
+   muted so it does not compete with the primary unlock/setup action,
+   but present so the user can always get out. */
+.logoutEscape {
+  text-align: center;
+  margin-top: var(--space-2);
+  padding: var(--space-2) 0;
+}
+
+.logoutLink {
+  text-decoration: none;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+
+.logoutLink:hover {
+  opacity: 1;
   text-decoration: underline;
 }
 </style>

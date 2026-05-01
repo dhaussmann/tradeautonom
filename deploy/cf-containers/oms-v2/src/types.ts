@@ -6,15 +6,33 @@ import type { ExtendedOms } from "./exchanges/extended";
 import type { GrvtOms } from "./exchanges/grvt";
 import type { NadoOms } from "./exchanges/nado";
 import type { VariationalOms } from "./exchanges/variational";
+import type { RisexOms } from "./exchanges/risex";
 import type { AggregatorDO } from "./aggregator";
 import type { NadoRelayContainer } from "./nado-relay-container";
 import type { ArbScannerDO } from "./arb-scanner";
+
+/**
+ * Cloudflare Analytics Engine binding interface.
+ * See https://developers.cloudflare.com/analytics/analytics-engine/.
+ */
+export interface AnalyticsEngineDataset {
+  writeDataPoint(event: {
+    blobs?: string[];
+    doubles?: number[];
+    indexes?: string[];
+  }): void;
+}
 
 export interface Env {
   EXTENDED_OMS: DurableObjectNamespace<ExtendedOms>;
   GRVT_OMS: DurableObjectNamespace<GrvtOms>;
   NADO_OMS: DurableObjectNamespace<NadoOms>;
   VARIATIONAL_OMS: DurableObjectNamespace<VariationalOms>;
+  /**
+   * RisexOms — singleton DO holding the WebSocket to wss://ws.rise.trade/ws.
+   * See src/exchanges/risex.ts.
+   */
+  RISEX_OMS: DurableObjectNamespace<RisexOms>;
   AGGREGATOR_DO: DurableObjectNamespace<AggregatorDO>;
   /**
    * Node.js container holding the permessage-deflate WebSocket to Nado.
@@ -26,6 +44,12 @@ export interface Env {
    * Serves /ws/arb and /arb/*. See src/arb-scanner.ts.
    */
   ARB_SCANNER: DurableObjectNamespace<ArbScannerDO>;
+  /**
+   * Analytics Engine dataset for historical PAXG/XAUT spread tracking.
+   * Written by AggregatorDO via lib/gold-spread.ts whenever a Variational
+   * book update affects either gold token.
+   */
+  GOLD_SPREAD: AnalyticsEngineDataset;
 }
 
 export interface BookSnapshot {

@@ -1,4 +1,4 @@
-import type { BotSummary, BotStatus, BotCreateRequest, BotStartRequest, BotPosition, FundingInfo, ActivityEntry } from '@/types/bot'
+import type { BotSummary, BotStatus, BotCreateRequest, BotStartRequest, BotPosition, FundingInfo, ActivityEntry, FillEntry } from '@/types/bot'
 import type { Position, AccountSummary } from '@/types/account'
 import type { PairsResponse } from '@/types/portfolio'
 import type { EquitySnapshot, Trade, HistoryResponse } from '@/types/history'
@@ -57,6 +57,8 @@ export interface AdoptBotRequest {
   max_chunk_spread_usd?: number
   max_spread_pct?: number
   min_spread_pct?: number
+  exit_min_spread_pct?: number
+  exit_max_spread_pct?: number
 }
 
 export async function adoptBot(
@@ -117,6 +119,17 @@ export async function fetchBotTrades(botId: string, limit = 50) {
   return request<Record<string, unknown>>(`/fn/bots/${botId}/trades?limit=${limit}`)
 }
 
+/**
+ * Fetch the flat fill log for a bot (every TWAP chunk that filled,
+ * newest first). limit=0 returns the entire history; the SSE stream's
+ * `status.fills` is capped at 50 for bandwidth so the BotDetailView
+ * uses this REST endpoint on initial mount and then merges new SSE
+ * fills into the store.
+ */
+export async function fetchBotFills(botId: string, limit = 0): Promise<{ fills: FillEntry[] }> {
+  return request(`/fn/bots/${botId}/fills?limit=${limit}`)
+}
+
 export async function fetchBotLog(botId: string, sinceSeq = 0, limit = 100): Promise<{ entries: ActivityEntry[] }> {
   return request(`/fn/bots/${botId}/log?since_seq=${sinceSeq}&limit=${limit}`)
 }
@@ -132,6 +145,23 @@ export async function fetchAccountAll(): Promise<AccountSummary[]> {
 
 export async function fetchPositions(): Promise<Position[]> {
   return request<Position[]>('/account/positions')
+}
+
+// Per-exchange auth/connectivity health, used to surface a clear banner when
+// e.g. the Variational JWT was revoked server-side. tracked=false means the
+// exchange client doesn't publish a fine-grained auth state (Extended/GRVT/
+// Nado) and is assumed ok unless a separate fetch fails.
+export interface ExchangeHealth {
+  ok: boolean
+  last_status_code: number | null
+  last_error: string | null
+  last_check_ts: number
+  consecutive_failures: number
+  tracked: boolean
+}
+
+export async function fetchAccountHealth(): Promise<Record<string, ExchangeHealth>> {
+  return request<Record<string, ExchangeHealth>>('/account/health')
 }
 
 // ── Exchanges ─────────────────────────────────────────

@@ -2,6 +2,85 @@
 
 ---
 
+## [Unreleased] — 2026-04-29
+
+### Bug Fixes
+
+#### SSE bot-stream silently dropped exit_min/max_spread_pct
+**Symptom:** Editing `exit_min_spread_pct` / `exit_max_spread_pct` in `BotDetailView` had no visible effect. Apply-button persisted the value to the engine + disk, but the UI pill snapped back to the default after the next SSE message (~2s later). User concluded "Apply doesn't work".
+
+**Root cause:** `app/server.py::fn_bot_stream` rebuilt the status payload manually from `engine.config.*` and **omitted both `exit_*_spread_pct` fields entirely**. Other fields like `fn_opt_max_per_pair_ratio` were also missing. The initial REST snapshot via `GET /fn/bots/{id}/status` (which calls `engine.get_status()`) had all fields correctly — so the UI showed the right value at first, then the SSE overwrite cleared them and Vue's `?? -0.5` fallback in `BotDetailView.vue:190-191` kicked in.
+
+**Fix (`app/server.py`):** SSE now uses `engine.get_status()` as the single source of truth, identical to the REST snapshot. Eliminates the entire drift-risk class:
+```python
+status = engine.get_status()
+data = {**status, "bot_id": bot_id, "ts": now}
+```
+
+**Affected only V2 (Cloudflare Container `user-v2`).** NAS containers are deprecated and out of scope.
+
+### Features
+
+#### DNA bot: live pre-trade cross-quote guard + entry telemetry
+The DNA entry path now validates opportunities against a fresh OMS `/quote/cross`
+snapshot before placing orders.
+
+- Added pre-trade guards in `app/dna_bot.py`:
+  - stale signal reject (`max_signal_age_ms`),
+  - infeasible/stale cross-quote reject (`max_quote_age_ms`),
+  - signal-to-live erosion reject (`max_signal_erosion_pct`),
+  - unprofitable-after-fees reject (`net_profit_bps_after_fees <= 0`).
+- Added optional fail-closed mode when cross-quote is unavailable:
+  - `dna_require_cross_quote=true` skips entries,
+  - default `false` keeps fail-open legacy behavior.
+- Added live quantity re-harmonization from cross-quote (`harmonized_qty`) before execution.
+- Added structured activity telemetry event `dna_entry_telemetry` with signal/quote/realized spread fields and slippage diagnostics.
+
+**New DNA settings (`app/config.py`, wired in `app/server.py`):**
+- `dna_max_signal_age_ms` (default `1500`)
+- `dna_max_quote_age_ms` (default `2000`)
+- `dna_max_signal_erosion_pct` (default `40.0`)
+- `dna_require_cross_quote` (default `false`)
+
+#### Bot creation: maker-asymmetry hint + smart spread defaults
+Step 4 of `BotCreateModal` now adapts to the maker-leg choice.
+
+- **Asymmetry hint:** dezenter Hinweistext direkt unter dem Spread-Window.
+  - Maker = Long → "max_spread_pct ist der wichtigere Hebel — empfohlen ≥ +0.30%."
+  - Maker = Short → "min_spread_pct ist der wichtigere Hebel — empfohlen ≤ −0.30%."
+- **Smart defaults (aggressive ±0.10% / ±0.40%):** beim Wechsel der Maker-Wahl werden Entry- und Exit-Spread-Felder automatisch asymmetrisch vorbelegt — solange der User noch keinen der vier Spread-Inputs editiert hat. Sobald der User selbst einen Wert ändert, wird die Auto-Belegung deaktiviert (`userTouchedSpread`-Flag).
+- Reine Frontend-Änderung in `BotCreateModal.vue`. Rationale: Spread-Definition ist `(long − short) / short`. Bei Maker = Short profitiert die Maker-Order von steigendem Short-Bid → Spread driftet während Wartezeit Richtung negativ → `min_spread_pct` braucht mehr Headroom unten.
+
+---
+
+## [Unreleased] — 2026-04-27
+
+### Features
+
+#### Bot creation: minimum order size validation (FN bot)
+The `BotCreateModal` now validates position size and chunk count against per-exchange minimums before allowing submission.
+
+**Rules enforced (Step 4 of the wizard):**
+- **Nado as maker:** total notional ≥ 1000 USD AND chunk notional ≥ 100 USD (Nado's published `min_notional_usd`).
+- **Any maker exchange with a base-qty floor (Extended, GRVT):** `chunk_qty ≥ min_order_size`.
+- **Variational as maker:** no validation (no min-size data published).
+- **Taker-side mismatch:** soft warning only (engine auto-reduce stays in place).
+
+**Implementation:**
+- New `frontend/src/lib/oms-meta.ts` — fetches OMSv2 `/meta/{exchange}/{symbol}` from the browser with 5min in-memory cache.
+- New `frontend/src/lib/bot-validation.ts` — pure validation function `validateBotCreate()` with constants `NADO_MAKER_MIN_TOTAL_USD = 1000`, `NADO_MAKER_MIN_CHUNK_NOTIONAL_USD = 100`.
+- `BotCreateModal.vue` Step 4 now shows live validation feedback and blocks "Next" if a hard rule fails.
+- New env var: `VITE_OMS_META_URL` (defaults to `https://oms-v2.defitool.de` in `.env.production`).
+
+**OMS V2 Worker — CORS on `/meta`, `/quote`, `/book`:**
+- `aggregator.ts` now emits `Access-Control-Allow-Origin` headers and handles `OPTIONS` preflight for these public read-only endpoints. Required for browser-direct access from the Vue SPA.
+
+**Backend untouched:** `app/server.py POST /fn/bots` remains permissive; engine `engine.py:902-915` auto-reduce-chunks stays as defense-in-depth. DNA bot and adopt-bot are out of scope.
+
+**Deploy order:** OMS V2 worker first (CORS fix) → frontend (`./deploy/cloudflare/deploy.sh`).
+
+---
+
 ## [Unreleased] — 2026-04-20
 
 ### Bug Fixes

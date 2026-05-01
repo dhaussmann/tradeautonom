@@ -29,6 +29,7 @@ import {
 import { handleExecutionLogIngest, handleExecutionLogQuery } from "./execution_log";
 import { handleActivityIngest, handleActivityQuery } from "./activity_log";
 import { handlePersistenceStatus } from "./persistence_status";
+import { handleGoldSpreadHistory } from "./gold_spread";
 import { createAuth } from "./auth";
 import { loadSecrets, saveSecrets, hasSecrets, maskKeys, filterUpdates } from "./lib/secrets";
 // @ts-expect-error — generated at build time by wrangler sites
@@ -161,6 +162,55 @@ export default {
       }
     }
 
+    // ── Admin bulk-recycle: stop *all* CF user containers so they cold-
+    //    start with the latest user-v2 image on the next request. Run
+    //    this after every `wrangler deploy` of the user-v2 worker /
+    //    container image to roll out new code to running users.
+    //    Photon-backend users are skipped (their containers live on the
+    //    NAS and are managed by deploy/v3/manage.sh).
+    //    Usage: POST /api/admin/recycle-all?token=INGEST_TOKEN
+    if (url.pathname === "/api/admin/recycle-all" && request.method === "POST") {
+      const token = url.searchParams.get("token");
+      if (token !== env.INGEST_TOKEN) return jsonResponse({ error: "Forbidden" }, 403);
+      const rows = await env.DB.prepare(
+        "SELECT id FROM user WHERE backend = 'cf'",
+      ).all<{ id: string }>();
+      const userIds = (rows.results ?? []).map((r) => r.id);
+      const sharedTok = env.V2_SHARED_TOKEN || "";
+
+      const settled = await Promise.allSettled(
+        userIds.map(async (uid) => {
+          const req = new Request(
+            `http://user-v2.internal/admin/recycle/${encodeURIComponent(uid)}`,
+            {
+              method: "POST",
+              headers: { "X-Internal-Token": sharedTok },
+            },
+          );
+          const resp = await env.USER_V2.fetch(req);
+          return { user_id: uid, http_status: resp.status, ok: resp.ok };
+        }),
+      );
+
+      const details = settled.map((r, i) => {
+        if (r.status === "fulfilled") return r.value;
+        return {
+          user_id: userIds[i],
+          http_status: 0,
+          ok: false,
+          error: r.reason instanceof Error ? r.reason.message : String(r.reason),
+        };
+      });
+      const recycled = details.filter((d) => d.ok).length;
+      const failed = details.length - recycled;
+      return jsonResponse({
+        total_cf_users: userIds.length,
+        recycled,
+        failed,
+        details,
+      });
+    }
+
     // ── TEMP: Admin probe — proxy a GET or POST to the user's current backend.
     //    Used for debugging V2 routing without needing a session cookie.
     //    Usage: GET  /api/admin/probe/<user_id>/<backend_path>?token=...
@@ -264,6 +314,16 @@ export default {
       if (!isAdmin(session, env)) return jsonResponse({ error: "Forbidden" }, 403);
       return handleActivityQuery(request, env.CF_ACCOUNT_ID, env.CF_API_TOKEN);
     }
+    // ── Gold spread history: served directly from Analytics Engine ──
+    //   GET /api/gold-spread/history?range=24h&resolution=1m
+    // Authenticated users only (no admin requirement). The dataset is
+    // written by the OMS-v2 worker; we read it via the CF SQL API.
+    if (url.pathname === "/api/gold-spread/history" && request.method === "GET") {
+      const session = await getSession(request, env);
+      if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
+      return handleGoldSpreadHistory(request, env.CF_ACCOUNT_ID, env.CF_API_TOKEN);
+    }
+
     // Phase F.4 M6: V2 persistence status dashboard
     //   GET /api/admin/persistence-status
     if (url.pathname === "/api/admin/persistence-status" && request.method === "GET") {

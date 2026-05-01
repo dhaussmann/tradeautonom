@@ -51,6 +51,10 @@
         "class_name": "VariationalOms"
       },
       {
+        "name": "RISEX_OMS",
+        "class_name": "RisexOms"
+      },
+      {
         "name": "AGGREGATOR_DO",
         "class_name": "AggregatorDO"
       },
@@ -80,6 +84,19 @@
     {
       "tag": "v4",
       "new_sqlite_classes": ["ArbScannerDO"]
+    },
+    {
+      "tag": "v5",
+      "new_sqlite_classes": ["RisexOms"]
+    }
+  ],
+  // Analytics Engine dataset for historical PAXG/XAUT spread tracking.
+  // Written by AggregatorDO whenever both gold-token books update; queried by
+  // the main worker via the CF Analytics Engine SQL API for the gold-spread UI.
+  "analytics_engine_datasets": [
+    {
+      "binding": "GOLD_SPREAD",
+      "dataset": "tradeautonom-gold-spread"
     }
   ]
 }

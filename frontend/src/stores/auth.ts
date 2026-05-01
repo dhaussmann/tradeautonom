@@ -60,8 +60,16 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function logout() {
-    await authClient.signOut()
-    user.value = null
+    // Always clear local state, even if the server-side signOut fails
+    // (network down, server 5xx, etc.). The /logout escape route relies
+    // on this so the user is never stranded with stale session state.
+    try {
+      await authClient.signOut()
+    } finally {
+      user.value = null
+      isAdmin.value = false
+      error.value = null
+    }
   }
 
   return { user, loading, error, isAuthenticated, isAdmin, checkSession, login, register, logout }

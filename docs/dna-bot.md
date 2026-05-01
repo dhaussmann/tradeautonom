@@ -1,5 +1,9 @@
 # DNA Bot — Delta-Neutral Arbitrage
 
+> Endanwender-Dokumentation zur Order-Ausführung (Wann/Wie/Was passiert
+> bei einem Trade, ohne Code) findest du in
+> [`docs/dna-bot-execution.md`](dna-bot-execution.md).
+
 ## Überblick
 
 Der DNA Bot erkennt Preisunterschiede desselben Tokens zwischen zwei Börsen und eröffnet gegenläufige Positionen (Long + Short), um die Preisdifferenz als Gewinn zu sichern. Die Position ist **delta-neutral**: Preisbewegungen des Tokens haben keinen Einfluss auf den Gewinn, da beide Seiten sich gegenseitig absichern. Der Gewinn entsteht ausschließlich aus dem Spread bei Eröffnung minus dem Spread bei Schließung.
@@ -83,6 +87,7 @@ Ein Signal wird **verworfen**, wenn:
 4. Die beteiligten Börsen nicht in der Bot-Konfiguration enthalten sind
 5. Der Spread unter dem konfigurierten Schwellenwert liegt (abhängig vom Spread-Modus)
 6. Kein Exchange-Client für eine der beiden Börsen registriert ist (fehlende API-Keys)
+7. Der Token befindet sich im Post-Close-Cooldown nach einem kürzlichen automatischen Close (siehe Abschnitt 5.5)
 
 ---
 
@@ -169,6 +174,20 @@ Beide Reverse-Legs werden **gleichzeitig** abgesendet (identisch zum Eröffnen).
 
 Über das Frontend kann jede offene Position manuell geschlossen werden — unabhängig von Haltezeit und Spread. Dabei wird derselbe Close-Mechanismus verwendet.
 
+### 5.5 Token-Cooldown nach Close
+
+Nach jedem **automatischen** Close (`arb_closed` via WebSocket oder `arb_closed_poll` via REST-Fallback) wird der entsprechende Token für eine konfigurierbare Zeit (Standard: **300 Sekunden**) gesperrt. In dieser Zeit werden alle eingehenden Signale für denselben Token verworfen.
+
+**Begründung:** Der Close-Trade selbst bewegt das Orderbuch der beiden Börsen. Innerhalb weniger Sekunden nach dem Schließen erscheint dadurch oft ein "Phantom-Arb" in derselben Richtung — die Spread-Differenz ist aber nur eine kurzfristige Marktreaktion auf die Close-Order, kein echter Arbitrage. Der Cooldown verhindert dieses Whipsaw-Muster.
+
+| Eigenschaft | Verhalten |
+|------|-----------|
+| **Granularität** | Pro Token (z.B. "HYPE" sperrt jede HYPE-Kombination) |
+| **Trigger** | Nur automatische Closes — manuelle Closes lösen *keinen* Cooldown aus |
+| **Persistenz** | Nur im Speicher — geht bei Container-Restart verloren |
+| **Konfiguration** | `cooldown_after_close_s` (Standard 300, 0 = deaktiviert) |
+| **Sichtbarkeit** | Activity-Log Event `dna_skipped_cooldown` (auf 1× pro 10s je Token gethrottelt); aktive Cooldowns im `cooldowns`-Feld von `/dna/status` |
+
 ---
 
 ## 6. WebSocket-Verbindungsmanagement
@@ -227,6 +246,8 @@ Erfasste Ereignisse:
 - `entry_partial_unwind` — Ein Leg fehlgeschlagen, erfolgreiches Leg rückgängig gemacht
 - `qty_too_small` — Signal übersprungen wegen zu kleiner Menge
 - `auto_exclude` — Token automatisch ausgeschlossen
+- `dna_cooldown_armed` — Cooldown nach automatischem Close aktiviert
+- `dna_skipped_cooldown` — Signal verworfen, weil Token noch im Post-Close-Cooldown ist (gethrottelt: max 1× pro 10s je Token)
 
 ---
 
@@ -249,6 +270,7 @@ Erfasste Ereignisse:
 | `exit_threshold_bps` | 0,01 | Spread-Schwelle für automatisches Schließen |
 | `excluded_tokens` | [] | Manuell ausgeschlossene Tokens |
 | `auto_exclude_open_positions` | true | Automatisch Tokens mit bestehenden Exchange-Positionen ausschließen |
+| `cooldown_after_close_s` | 300 | Sperrzeit pro Token nach automatischem Close (Whipsaw-Schutz). 0 deaktiviert |
 | `tick_interval_s` | 0,5 | (Legacy) OMS Scan-Intervall — Opportunities werden jetzt per WebSocket gestreamt |
 
 ---

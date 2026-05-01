@@ -41,6 +41,10 @@ import {
   findArbForToken,
   minProfitBps,
 } from "./lib/arb";
+import {
+  tradeabilityKey,
+  type TradeabilityMap,
+} from "./lib/tradeability";
 
 /** Max /ws/arb connections per client — defensive cap. */
 const MAX_WATCH_PER_WS = 200;
@@ -59,6 +63,18 @@ export class ArbScannerDO extends DurableObject<Env> {
   private discovery: DiscoveryPayload = { pairs: {}, meta: {} };
   private discoveryBootstrapped = false;
 
+  /**
+   * Per-leg tradeability map: keyed `"exchange:symbol"`. Pushed by
+   * AggregatorDO after each tradeability cron tick (every 15 min) via
+   * updateTradeability(). Used to filter "listed but unfillable" legs
+   * (one-sided book, crossed book, stale, etc.) out of arb opportunities.
+   *
+   * Empty on cold start → `isLegTradeable` fails open so we don't silently
+   * block all opportunities while waiting for the first cron pass.
+   * See lib/tradeability.ts for the evaluation rules.
+   */
+  private tradeability: TradeabilityMap = {};
+
   /** Reverse index: "exchange:symbol" → base token. */
   private symbolToToken: Map<string, string> = new Map();
 
@@ -75,13 +91,24 @@ export class ArbScannerDO extends DurableObject<Env> {
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    // Bootstrap discovery from AggregatorDO once per cold start. This
-    // populates books-to-token mapping before the first fan-out arrives.
+    // Bootstrap discovery + tradeability from AggregatorDO once per cold
+    // start. This populates books-to-token mapping and the leg-liveness
+    // map before the first fan-out arrives, so post-hibernation cold starts
+    // see consistent filtering instead of waiting up to 15 min for the next
+    // cron tick.
     state.blockConcurrencyWhile(async () => {
       await this.bootstrapDiscovery().catch((e) => {
         console.warn(
           JSON.stringify({
             evt: "arb_bootstrap_failed",
+            err: e instanceof Error ? e.message : String(e),
+          }),
+        );
+      });
+      await this.bootstrapTradeability().catch((e) => {
+        console.warn(
+          JSON.stringify({
+            evt: "arb_tradeability_bootstrap_failed",
             err: e instanceof Error ? e.message : String(e),
           }),
         );
@@ -98,6 +125,10 @@ export class ArbScannerDO extends DurableObject<Env> {
     if (path === "/ws/arb") return this.handleWsUpgrade(req);
 
     if (path === "/arb/health") {
+      let untradeableCount = 0;
+      for (const v of Object.values(this.tradeability)) {
+        if (!v.tradeable) untradeableCount += 1;
+      }
       return this.json({
         status: "ok",
         tokens_tracked: Object.keys(this.discovery.pairs).length,
@@ -108,6 +139,8 @@ export class ArbScannerDO extends DurableObject<Env> {
         last_scan_ms: this.lastScanMs,
         connected_clients: this.ctx.getWebSockets().length,
         discovery_bootstrapped: this.discoveryBootstrapped,
+        tradeability_entries: Object.keys(this.tradeability).length,
+        tradeability_untradeable: untradeableCount,
         uptime_pushes: {
           opportunities: this.totalPushedOpps,
           status: this.totalPushedStatus,
@@ -192,6 +225,36 @@ export class ArbScannerDO extends DurableObject<Env> {
     return { ok: true, tokens: Object.keys(pairs).length };
   }
 
+  /**
+   * Called by AggregatorDO after each tradeability cron tick. Replaces the
+   * leg-liveness map and re-scans every token so any opportunity that
+   * relies on a leg now flagged untradeable is removed in the same cycle.
+   *
+   * Fail-open semantics live in `isLegTradeable`: legs missing from the
+   * map are treated as tradeable, so transient cron failures or cold-start
+   * windows cannot block all opportunities.
+   */
+  async updateTradeability(
+    map: TradeabilityMap,
+  ): Promise<{ ok: true; entries: number; untradeable: number }> {
+    this.tradeability = map ?? {};
+    let untradeable = 0;
+    for (const v of Object.values(this.tradeability)) {
+      if (!v.tradeable) untradeable += 1;
+    }
+    // Force a re-scan only if discovery is already bootstrapped — otherwise
+    // the books-to-token map is incomplete.
+    if (this.discoveryBootstrapped) {
+      this.opportunities.clear();
+      this.rescanAll();
+    }
+    return {
+      ok: true,
+      entries: Object.keys(this.tradeability).length,
+      untradeable,
+    };
+  }
+
   // ── Internals ────────────────────────────────────────────────────
 
   private async bootstrapDiscovery(): Promise<void> {
@@ -218,6 +281,45 @@ export class ArbScannerDO extends DurableObject<Env> {
     }
   }
 
+  private async bootstrapTradeability(): Promise<void> {
+    const agg = this.env.AGGREGATOR_DO.get(
+      this.env.AGGREGATOR_DO.idFromName("aggregator"),
+    );
+    const map = (await (agg as any).getTradeabilityForScanner?.()) as
+      | TradeabilityMap
+      | null
+      | undefined;
+    if (map && typeof map === "object") {
+      this.tradeability = map;
+    }
+  }
+
+  /**
+   * Fail-open per-leg tradeability check. Missing entries → assume
+   * tradeable so a cold start or transient cron failure does not
+   * silently filter out every opportunity. The `tradeable: false` decision
+   * comes from lib/tradeability.ts (one-sided book, crossed book, stale,
+   * disconnected, wide spread, or invalid price).
+   */
+  private isLegTradeable(exchange: string, symbol: string): boolean {
+    const t = this.tradeability[tradeabilityKey(exchange, symbol)];
+    if (!t) return true;
+    return t.tradeable;
+  }
+
+  /** Reduce an exchange→symbol map to legs that are currently tradeable. */
+  private filterTradeableLegs(
+    exchangeMap: Record<string, string>,
+  ): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [exch, sym] of Object.entries(exchangeMap)) {
+      if (this.isLegTradeable(exch, sym)) {
+        out[exch] = sym;
+      }
+    }
+    return out;
+  }
+
   private rescanAll(): void {
     for (const token of Object.keys(this.discovery.pairs)) {
       if (ARB_EXCLUDED_TOKENS.has(token)) continue;
@@ -239,7 +341,15 @@ export class ArbScannerDO extends DurableObject<Env> {
     const exchangeMap = this.discovery.pairs[token];
     if (!exchangeMap) return;
 
-    const newOpps = findArbForToken(token, exchangeMap, this.books, {
+    // Drop any leg that the most recent tradeability check flagged as
+    // untradeable (one-sided book, crossed book, stale, etc.). lib/arb.ts
+    // already filters legs whose live snapshot is empty/disconnected, but
+    // it cannot detect crossed_book or wide-spread anomalies — that's
+    // what this layer adds. Fail-open: legs without a tradeability entry
+    // are kept (cold-start tolerance).
+    const tradeableMap = this.filterTradeableLegs(exchangeMap);
+
+    const newOpps = findArbForToken(token, tradeableMap, this.books, {
       meta: this.discovery.meta,
     });
 
@@ -520,12 +630,17 @@ export class ArbScannerDO extends DurableObject<Env> {
       if (!Number.isFinite(override)) {
         return this.json({ error: "min_profit_bps must be numeric" }, 400);
       }
-      // Live re-scan with custom threshold.
+      // Live re-scan with custom threshold. Apply the same tradeability
+      // filter as rescanToken() so REST and WS callers see consistent
+      // results — otherwise an explorer hitting /arb/opportunities?token=X
+      // would still see opportunities on legs that the cached scanner
+      // already filtered out.
       const result: ArbOpportunity[] = [];
       for (const [token, exchMap] of Object.entries(this.discovery.pairs)) {
         if (ARB_EXCLUDED_TOKENS.has(token)) continue;
         if (tokenFilter && token !== tokenFilter.toUpperCase()) continue;
-        const opps = findArbForToken(token, exchMap, this.books, {
+        const tradeableMap = this.filterTradeableLegs(exchMap);
+        const opps = findArbForToken(token, tradeableMap, this.books, {
           meta: this.discovery.meta,
           overrideMinBps: override,
         });

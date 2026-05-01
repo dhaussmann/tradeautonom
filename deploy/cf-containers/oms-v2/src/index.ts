@@ -23,6 +23,7 @@ import { ExtendedOms } from "./exchanges/extended";
 import { GrvtOms } from "./exchanges/grvt";
 import { NadoOms } from "./exchanges/nado";
 import { VariationalOms } from "./exchanges/variational";
+import { RisexOms } from "./exchanges/risex";
 import { AggregatorDO } from "./aggregator";
 import { NadoRelayContainer } from "./nado-relay-container";
 import { ArbScannerDO } from "./arb-scanner";
@@ -33,17 +34,19 @@ export {
   GrvtOms,
   NadoOms,
   VariationalOms,
+  RisexOms,
   AggregatorDO,
   NadoRelayContainer,
   ArbScannerDO,
 };
 
-type ExchangeBindingKey = "extended" | "grvt" | "nado" | "variational";
+type ExchangeBindingKey = "extended" | "grvt" | "nado" | "variational" | "risex";
 function exchangeStub(env: Env, key: ExchangeBindingKey): DurableObjectStub {
   const ns =
     key === "extended" ? env.EXTENDED_OMS
     : key === "grvt" ? env.GRVT_OMS
     : key === "nado" ? env.NADO_OMS
+    : key === "risex" ? env.RISEX_OMS
     : env.VARIATIONAL_OMS;
   return ns.get(ns.idFromName("singleton"));
 }
@@ -64,20 +67,24 @@ export default {
       path === "/ws" ||
       path === "/health" ||
       path === "/tracked" ||
+      path === "/tracked/legs" ||
       path === "/status" ||
       path === "/discovery" ||
       path === "/discovery/run" ||
       path === "/meta" ||
       path.startsWith("/meta/") ||
       path.startsWith("/quote/") ||
-      path.startsWith("/book/")
+      path.startsWith("/book/") ||
+      path.startsWith("/gold-spread/") ||
+      path === "/tradeability" ||
+      path.startsWith("/tradeability/")
     ) {
       const stub = env.AGGREGATOR_DO.get(env.AGGREGATOR_DO.idFromName("aggregator"));
       return stub.fetch(request);
     }
 
     // Per-exchange DO passthroughs for debugging
-    const exMatch = path.match(/^\/(ext|grvt|nado|variational)(\/.*)?$/);
+    const exMatch = path.match(/^\/(ext|grvt|nado|variational|risex)(\/.*)?$/);
     if (exMatch) {
       const prefix = exMatch[1]!;
       const remain = exMatch[2] || "/health";
@@ -106,12 +113,18 @@ export default {
           "  GET /ws                        WebSocket: {action:'subscribe',exchange,symbol}",
           "  GET /book/{exch}/{sym}         current orderbook snapshot",
           "  GET /tracked                   cross-exchange token mapping",
+          "  GET /tracked/legs              same, annotated with per-leg tradeability",
           "  GET /status                    per-feed health and freshness",
           "  GET /health                    aggregate health",
           "",
           "Auto-discovery:",
           "  GET /discovery                 last-run stats",
           "  GET /discovery/run             force a fresh run",
+          "",
+          "Tradeability (book-liveness guard):",
+          "  GET /tradeability              full map (exchange:symbol → result)",
+          "  GET /tradeability/{exch}/{sym} single (exchange,symbol) result",
+          "  GET /tradeability/run          force a fresh check (also runs on cron)",
           "",
           "Arb scanner (DNA-bot):",
           "  WS  /ws/arb                    {action:'watch'|'unwatch'|'subscribe_opportunities'|'unsubscribe_opportunities'}",
@@ -134,8 +147,9 @@ export default {
           "  GET /grvt/health               GrvtOms health",
           "  GET /nado/health               NadoOms health",
           "  GET /variational/health        VariationalOms health",
+          "  GET /risex/health              RisexOms health",
           "",
-          "Supported exchanges: extended, grvt, nado, variational",
+          "Supported exchanges: extended, grvt, nado, variational, risex",
           "",
           "Docs: docs/v2-oms-cloudflare-native.md",
         ].join("\n"),
@@ -150,5 +164,16 @@ export default {
     const stub = env.AGGREGATOR_DO.get(env.AGGREGATOR_DO.idFromName("aggregator"));
     // Trigger discovery; AggregatorDO will push symbol lists to each ExchangeOms.
     await (stub as any).runDiscoveryAndPropagate();
+    // Tradeability check: walks every tracked (exchange,symbol) and marks
+    // legs whose order book is one-sided / stale / disconnected. Result is
+    // exposed via /tradeability and annotated onto /tracked. Cron is every
+    // 15 min (see wrangler.jsonc); the user's once-per-hour requirement is
+    // therefore comfortably met. Running after discovery means newly-added
+    // symbols are evaluated within the same tick.
+    try {
+      await (stub as any).runTradeabilityCheck();
+    } catch (e) {
+      console.warn("tradeability check failed:", e);
+    }
   },
 } satisfies ExportedHandler<Env>;

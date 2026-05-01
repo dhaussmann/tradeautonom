@@ -17,6 +17,8 @@ const MANAGED_KEYS = [
   "nado_linked_signer_key",
   "nado_wallet_address",
   "nado_subaccount_name",
+  "risex_account_address",
+  "risex_signer_key",
 ] as const;
 
 export type SecretKeys = Record<string, string>;

@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     nado_env: str = "mainnet"
     nado_linked_signer_key: str = ""    # bot's trading key (linked signer — auto-generated)
     nado_wallet_address: str = ""       # main wallet address (from MetaMask connect)
+    # FOK (market) order limit-band as % of mid. Replaces the previous
+    # hard-coded "best ± 10 ticks" offset which was unit-inappropriate
+    # across price scales and triggered code=2031 on thin books.
+    # See app/nado_client.py:create_market_order.
+    nado_fok_slippage_pct: float = 0.5
+    # RISEx credentials (rise.trade — fully onchain orderbook DEX on RISE Chain)
+    risex_account_address: str = ""       # wallet address (0x...)
+    risex_signer_key: str = ""            # pre-registered signer private key
+    risex_env: str = "mainnet"            # "mainnet" or "testnet"
     # Variational credentials (wallet address extracted from JWT automatically)
     variational_jwt_token: str = ""
     variational_proxy_url: str = "https://proxy.defitool.de/api"  # CF Worker proxy
@@ -95,8 +104,10 @@ class Settings(BaseSettings):
     # Risk management
     fn_delta_max_usd: float = 50.0            # max absolute delta imbalance (USD) before rebalance
     fn_circuit_breaker_loss_usd: float = 500.0  # cumulative loss threshold to halt all trading
-    fn_min_spread_pct: float = -0.5            # min spread % (safety floor — blocks extreme negative outliers)
-    fn_max_spread_pct: float = 0.05           # max spread % of mid-price to allow entry
+    fn_min_spread_pct: float = -0.5            # entry min spread % (safety floor — blocks extreme negative outliers)
+    fn_max_spread_pct: float = 0.05           # entry max spread % of mid-price to allow entry
+    fn_exit_min_spread_pct: float = -0.5       # exit min spread % (separate from entry — applied during graceful_stop / manual_exit)
+    fn_exit_max_spread_pct: float = 0.05       # exit max spread % (separate from entry)
     fn_max_chunk_spread_usd: float = 1.0      # max absolute cross-exchange spread (USD) per chunk
 
     # Funding rate monitoring
@@ -136,10 +147,58 @@ class Settings(BaseSettings):
     dna_min_profit_bps: float = 0.0        # 0 = use OMS fee thresholds
     dna_exchanges: str = "extended,grvt,nado"
     dna_slippage_tolerance_pct: float = 0.5
+    # Drop stale arb signals before entry (ms). 0 disables the check.
+    dna_max_signal_age_ms: int = 1500
+    # Drop stale pre-trade cross quotes (book age, ms). 0 disables the check.
+    dna_max_quote_age_ms: int = 2000
+    # Max allowed spread erosion from signal -> live cross quote (% of signal bps).
+    # Example: signal=10 bps, live=5 bps => 50% erosion.
+    dna_max_signal_erosion_pct: float = 40.0
+    # If True, skip entries when /quote/cross is unavailable (fail-closed).
+    # If False, continue with legacy path (fail-open).
+    dna_require_cross_quote: bool = False
+    # Pre-flight haircut applied to the *non-Nado* leg's signal price when
+    # validating arb-profitability after walking the Nado book. Static
+    # estimate (no extra API call) of how much the Extended/GRVT leg
+    # might fill worse than the OMS top-of-book quote.
+    dna_other_leg_slippage_bps: float = 5.0
     dna_size_tolerance_pct: float = 5.0
     dna_simulation: bool = False           # default to live trading
     dna_excluded_tokens: str = "SUI"       # comma-separated tokens to skip
     dna_auto_exclude_open_positions: bool = True  # auto-exclude tokens with open exchange positions
+    # Per-token cooldown (seconds) after an automatic close. Prevents the bot
+    # from immediately re-opening a position in the same token while the
+    # orderbook is still settling from the close trade — a classic whipsaw
+    # source where a phantom arb appears seconds after exit.
+    # Triggered only by automatic exits (arb_closed / arb_closed_poll);
+    # manual closes via the UI bypass the cooldown so the user can rotate
+    # positions without waiting. 0 disables the feature.
+    dna_cooldown_after_close_s: float = 300.0
+
+    # ── Gold-Spread Bot (PAXG vs XAUT on Variational) ─────────
+    # Singleton bot tracking the convergence spread between two gold-token
+    # perps on Variational. See app/gold_spread_bot.py.
+    gold_spread_enabled: bool = True             # Initialise the singleton at startup
+    gold_spread_oms_url: str = "https://oms-v2.defitool.de"  # OMS-v2 base URL
+    gold_spread_entry: float = 15.0              # Entry threshold (USD spread by default)
+    gold_spread_exit: float = 5.0                # Exit threshold
+    gold_spread_threshold_in_pct: bool = False   # If True, thresholds are spread_pct
+    gold_spread_quantity: float = 1.0            # Per-leg base-asset quantity
+    gold_spread_max_slippage_pct: float = 0.7    # IOC slippage cap
+    gold_spread_signal_confirmations: int = 3    # Consecutive ticks before action
+    gold_spread_tick_interval_s: float = 5.0     # OMS poll cadence
+    gold_spread_simulation: bool = True          # Default to paper trade (Phase 1)
+    # Phase 2 execution-safety knobs
+    gold_spread_max_position_value_usd: float = 10000.0
+    gold_spread_execution_timeout_s: float = 30.0
+    gold_spread_unwind_slippage_pct: float = 2.0
+    gold_spread_fill_verify_delay_s: float = 0.5
+    # Auto-unwind if the realised entry spread is smaller than this
+    # fraction of the entry threshold (catches RFQ price drift / requote).
+    gold_spread_min_actual_spread_ratio: float = 0.5
+    # Std-dev / mean cap on exec_spread across the confirmation window
+    # to filter single-tick spread spikes. 0 disables.
+    gold_spread_max_spread_volatility_ratio: float = 0.5
 
     # ── History ingest (push snapshots to Cloudflare D1) ───────
     history_ingest_url: str = ""              # e.g. https://tradeautonom.workers.dev/api/history/ingest

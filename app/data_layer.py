@@ -39,6 +39,12 @@ _GRVT_WS_ENDPOINTS = {
 
 _X18_FLOAT = 1e18
 
+# ── RISEx WS endpoints ───────────────────────────────────────────────
+_RISEX_WS_ENDPOINTS = {
+    "mainnet": "wss://ws.rise.trade/ws",
+    "testnet": "wss://ws.testnet.rise.trade/ws",
+}
+
 
 @dataclass
 class OrderbookSnapshot:
@@ -491,6 +497,14 @@ class DataLayer:
                 await self._run_ob_rest_fallback(client, exch_name, symbol)
                 return
             await self._run_ob_ws_nado(symbol, product_id, nado_env)
+        elif exch_name == "risex":
+            risex_env = getattr(client, "_env", "mainnet")
+            market_id = client._get_market_id(symbol) if hasattr(client, "_get_market_id") else None
+            if market_id is None:
+                logger.error("DataLayer: cannot resolve RISEx market_id for %s — falling back to REST", symbol)
+                await self._run_ob_rest_fallback(client, exch_name, symbol)
+                return
+            await self._run_ob_ws_risex(symbol, market_id, risex_env)
         else:
             logger.warning("DataLayer: unknown exchange '%s' — using REST fallback", exch_name)
             await self._run_ob_rest_fallback(client, exch_name, symbol)
@@ -1069,6 +1083,117 @@ class DataLayer:
         snap.is_synced = True
         self._ob_changed.set()
 
+    # ── RISEx WS orderbook ────────────────────────────────────────────
+
+    async def _run_ob_ws_risex(self, symbol: str, market_id: int, risex_env: str) -> None:
+        """Async WS orderbook for RISEx exchange.
+
+        Endpoint: wss://ws.rise.trade/ws
+        Subscribes to 'orderbook' channel. First message is a full snapshot;
+        subsequent messages with type='update' are incremental deltas.
+        Prices and quantities are plain decimal strings.
+        """
+        key = ("risex", symbol)
+        ws_url = _RISEX_WS_ENDPOINTS.get(risex_env, _RISEX_WS_ENDPOINTS["mainnet"])
+        reconnect_delay = 1.0
+
+        while self._running:
+            try:
+                logger.info("DataLayer: RISEx OB WS connecting: %s (market_id=%d)", ws_url, market_id)
+                async with websockets.connect(ws_url, ssl=_SSL_CTX, close_timeout=5) as ws:
+                    sub_msg = json.dumps({
+                        "method": "subscribe",
+                        "params": {"channel": "orderbook", "market_ids": [market_id]},
+                    })
+                    await ws.send(sub_msg)
+
+                    async with self._ob_locks[key]:
+                        self._orderbooks[key].connected = True
+                    reconnect_delay = 1.0
+                    logger.info("DataLayer: RISEx OB WS subscribed: %s market_id=%d", symbol, market_id)
+
+                    # Heartbeat task
+                    async def _heartbeat():
+                        while True:
+                            await asyncio.sleep(15)
+                            try:
+                                await ws.send(json.dumps({"op": "ping"}))
+                            except Exception:
+                                break
+
+                    hb_task = asyncio.create_task(_heartbeat())
+                    try:
+                        async for raw in ws:
+                            if not self._running:
+                                return
+                            self._handle_risex_ob_message(key, raw)
+                    except websockets.ConnectionClosed:
+                        logger.warning("DataLayer: RISEx OB WS disconnected: %s", symbol)
+                    finally:
+                        hb_task.cancel()
+                        async with self._ob_locks[key]:
+                            self._orderbooks[key].connected = False
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("DataLayer: RISEx OB WS error %s: %s — retry in %.0fs", symbol, exc, reconnect_delay)
+                async with self._ob_locks[key]:
+                    self._orderbooks[key].connected = False
+                    self._orderbooks[key].is_synced = False
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30.0)
+
+    def _handle_risex_ob_message(self, key: tuple, raw: str) -> None:
+        """Parse RISEx WS orderbook message (snapshot or incremental update).
+
+        Snapshot (first message): full bids/asks replacement.
+        Update (type='update'): upsert levels where qty > 0, remove where qty == 0.
+        """
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+
+        # Skip subscription acks and pong messages
+        msg_type = msg.get("type", "")
+        if msg_type == "subscribed" or msg_type == "pong":
+            return
+
+        channel = msg.get("channel", "")
+        if channel != "orderbook":
+            return
+
+        data = msg.get("data", {})
+        bids_raw = data.get("bids", [])
+        asks_raw = data.get("asks", [])
+
+        snap = self._orderbooks[key]
+
+        if msg_type == "update":
+            # Incremental delta: upsert or remove levels
+            if bids_raw:
+                _apply_risex_delta(snap.bids, bids_raw, reverse=True)
+            if asks_raw:
+                _apply_risex_delta(snap.asks, asks_raw, reverse=False)
+        else:
+            # Full snapshot (first message after subscribe, or no type field)
+            if bids_raw:
+                snap.bids = sorted(
+                    [[float(b["price"]), float(b["quantity"])] for b in bids_raw],
+                    key=lambda x: -x[0],
+                )
+            if asks_raw:
+                snap.asks = sorted(
+                    [[float(a["price"]), float(a["quantity"])] for a in asks_raw],
+                    key=lambda x: x[0],
+                )
+
+        snap.timestamp_ms = time.time() * 1000
+        snap.update_count += 1
+        snap.is_synced = True
+        self._ob_changed.set()
+
     # ── Position WS/poll streams ────────────────────────────────────────
 
     async def _run_position_subscription(self, client, exch_name: str, symbol: str) -> None:
@@ -1081,6 +1206,9 @@ class DataLayer:
         elif exch_name == "nado":
             product_id = client._get_product_id(symbol) if hasattr(client, "_get_product_id") else None
             await self._run_pos_ws_nado(client, symbol, product_id)
+        elif exch_name == "risex":
+            logger.info("DataLayer: RISEx has no position WS — using REST polling for %s", symbol)
+            await self._run_pos_rest_fallback(client, exch_name, symbol)
         elif exch_name == "grvt":
             await self._run_pos_ws_grvt(client, symbol)
         else:
@@ -1478,6 +1606,28 @@ def _apply_delta_cumulative(book: list, updates_raw: list, reverse: bool) -> Non
                 price_map.pop(price, None)
             else:
                 price_map[price] = [price, q]
+    book.clear()
+    book.extend(sorted(price_map.values(), key=lambda x: -x[0] if reverse else x[0]))
+
+
+def _apply_risex_delta(book: list, updates: list[dict], reverse: bool) -> None:
+    """Apply RISEx incremental orderbook updates.
+
+    Each update: {"price": "75960.9", "quantity": "0.000263", "order_count": 1}
+    quantity > 0 → upsert level, quantity == 0 → remove level.
+    """
+    price_map = {level[0]: level for level in book}
+    for entry in updates:
+        price_str = entry.get("price")
+        qty_str = entry.get("quantity")
+        if price_str is None or qty_str is None:
+            continue
+        price = float(price_str)
+        qty = float(qty_str)
+        if qty <= 0:
+            price_map.pop(price, None)
+        else:
+            price_map[price] = [price, qty]
     book.clear()
     book.extend(sorted(price_map.values(), key=lambda x: -x[0] if reverse else x[0]))
 

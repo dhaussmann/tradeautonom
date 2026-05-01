@@ -411,32 +411,87 @@ class NadoClient:
         symbol: str,
         side: str,
         amount: Decimal,
+        slippage_pct: float | None = None,
         **kwargs,
     ) -> dict:
-        """Market-order via FOK with aggressive pricing for guaranteed full fill."""
+        """Market-order via FOK with depth-aware aggressive pricing.
+
+        Replaces the previous "best ± 10 ticks" fudge (unit-inappropriate
+        across price scales; triggered code=2031 on thin books) with:
+          1. Walk a 20-level book to find the marginal price needed to
+             consume `amount`. Raise early if depth is insufficient.
+          2. Use a percentage-of-mid band (default 0.5% via caller's
+             `slippage_pct`, falls back to 0.5% literal if omitted) as
+             the *upper bound* on the FOK limit. If the walked price
+             exceeds that band, raise rather than overpay.
+        """
         self._require_trading()
         amount = self._round_qty(amount, symbol)
         product_id = self._get_product_id(symbol)
         tick = self.get_tick_size(symbol)
 
-        # Fetch best price and apply generous offset for fill certainty
-        book = self.fetch_order_book(symbol, limit=1)
+        pct = Decimal(str(slippage_pct)) if slippage_pct is not None else Decimal("0.5")
+        band_factor = pct / Decimal("100")
+
+        # Fetch deeper book and walk it to confirm depth + compute fair limit
+        book = self.fetch_order_book(symbol, limit=20)
+        levels_key = "asks" if side == "buy" else "bids"
+        levels = book.get(levels_key, [])
+        if not levels:
+            raise RuntimeError(f"No {levels_key} in {symbol} orderbook")
+
+        best = Decimal(str(levels[0][0]))
+
+        # Walk levels until cumulative size >= amount; track worst price
+        cum_size = Decimal("0")
+        worst = best
+        consumed_levels = 0
+        for price_str, size_str in levels:
+            price = Decimal(str(price_str))
+            size = Decimal(str(size_str))
+            cum_size += size
+            worst = price
+            consumed_levels += 1
+            if cum_size >= amount:
+                break
+
+        if cum_size < amount:
+            raise RuntimeError(
+                f"NADO: insufficient depth on {symbol} {side} "
+                f"(need {amount}, have {cum_size} across {consumed_levels} levels)"
+            )
+
+        # Compute the percentage-band cap relative to best
         if side == "buy":
-            if not book["asks"]:
-                raise RuntimeError(f"No asks in {symbol} orderbook")
-            best = Decimal(str(book["asks"][0][0]))
-            raw = best + tick * 10
+            band_cap = best * (Decimal("1") + band_factor)
+            # If the walked worst price exceeds our slippage cap, abort:
+            # the FOK would either overpay or fail. Either way: skip.
+            if worst > band_cap:
+                raise RuntimeError(
+                    f"NADO: insufficient depth on {symbol} buy within "
+                    f"{pct}% slippage (best={best}, worst_walked={worst}, "
+                    f"cap={band_cap})"
+                )
+            # Use the looser of walked-worst and cap, then add a tiny
+            # safety pad and round UP to tick.
+            raw = max(worst, best) * (Decimal("1") + band_factor)
             final_limit = (raw / tick).to_integral_value(rounding="ROUND_UP") * tick
         else:
-            if not book["bids"]:
-                raise RuntimeError(f"No bids in {symbol} orderbook")
-            best = Decimal(str(book["bids"][0][0]))
-            raw = best - tick * 10
+            band_cap = best * (Decimal("1") - band_factor)
+            if worst < band_cap:
+                raise RuntimeError(
+                    f"NADO: insufficient depth on {symbol} sell within "
+                    f"{pct}% slippage (best={best}, worst_walked={worst}, "
+                    f"cap={band_cap})"
+                )
+            raw = min(worst, best) * (Decimal("1") - band_factor)
             final_limit = (raw / tick).to_integral_value(rounding="ROUND_DOWN") * tick
 
         logger.info(
-            "NADO market (FOK): %s %s qty=%s best=%s limit=%s",
-            side.upper(), symbol, amount, best, final_limit,
+            "NADO market (FOK) walk: %s %s qty=%s best=%s worst=%s "
+            "limit=%s slippage_pct=%s depth_levels=%d cum_size=%s",
+            side.upper(), symbol, amount, best, worst,
+            final_limit, pct, consumed_levels, cum_size,
         )
 
         order_amount = amount if side == "buy" else -amount

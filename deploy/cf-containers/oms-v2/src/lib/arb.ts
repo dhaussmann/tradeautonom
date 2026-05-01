@@ -26,6 +26,11 @@ export const TAKER_FEE_PCT: Record<string, number> = {
   nado: 0.035,
   grvt: 0.039,
   variational: 0.04, // default for unknown exchanges in V1
+  // RISEx publishes 0.02 % maker / 0.05 % taker on docs.rise.trade. RISEx
+  // markets are currently post_only=true (verified live), so in practice
+  // the bot only pays the maker side; taker is here for completeness if
+  // RISEx ever flips a market off post_only.
+  risex: 0.05,
 };
 
 export const ARB_FEE_BUFFER_BPS = 1.0;

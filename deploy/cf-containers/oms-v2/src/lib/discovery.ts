@@ -24,6 +24,11 @@ export interface DiscoveryResult {
     grvt: string[];
     nado: Array<{ symbol: string; product_id: number }>;
     variational: string[];
+    /**
+     * RISEx markets are addressed by integer market_id, not by string —
+     * mirror the Nado pattern so the OMS can subscribe on a single WS.
+     */
+    risex: Array<{ symbol: string; market_id: number }>;
   };
   /** Per-exchange metadata for arb scanner + Phase E quote endpoints. */
   meta: {
@@ -46,13 +51,15 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
     grvt: {},
     nado: {},
     variational: {},
+    risex: {},
   };
   const nadoProductIds: Record<string, number> = {};
-  const lev: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
-  const mins: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
-  const steps: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
-  const ticks: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
-  const minNotionals: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {} };
+  const risexMarketIds: Record<string, number> = {};
+  const lev: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {}, risex: {} };
+  const mins: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {}, risex: {} };
+  const steps: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {}, risex: {} };
+  const ticks: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {}, risex: {} };
+  const minNotionals: Record<string, Record<string, number>> = { extended: {}, grvt: {}, nado: {}, variational: {}, risex: {} };
 
   const tasks = [
     loadExtended().then(({ markets, metaLev, metaMin, metaStep, metaTick }) => {
@@ -83,6 +90,14 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
       // Variational has no per-symbol tick size published; bots use 1 tick
       // = 0.01 historically. Use 0 to signal "unknown" so /quote falls back.
     }).catch((e) => console.warn("Variational discovery failed:", e)),
+    loadRisex().then(({ markets, marketIds, metaLev, metaMin, metaStep, metaTick }) => {
+      maps.risex = markets;
+      Object.assign(risexMarketIds, marketIds);
+      lev.risex = metaLev;
+      mins.risex = metaMin;
+      steps.risex = metaStep;
+      ticks.risex = metaTick;
+    }).catch((e) => console.warn("RISEx discovery failed:", e)),
   ];
   await Promise.all(tasks);
 
@@ -107,6 +122,7 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
     grvt: new Set(),
     nado: new Set(),
     variational: new Set(),
+    risex: new Set(),
   };
   for (const found of Object.values(pairs)) {
     for (const [exch, sym] of Object.entries(found)) {
@@ -124,6 +140,14 @@ export async function discoverPairs(): Promise<DiscoveryResult> {
         .map((sym) => ({ symbol: sym, product_id: nadoProductIds[sym]! }))
         .sort((a, b) => a.symbol.localeCompare(b.symbol)),
       variational: Array.from(tracked.variational!).sort(),
+      // RISEx market list keyed on the canonical full symbol "BTC/USDC".
+      // RisexOms now stores books under that same key (matching what the
+      // bot's instrument_a/_b carries and what the pair-map advertises) so
+      // we pass the symbol through verbatim and just attach its market_id.
+      risex: Array.from(tracked.risex!)
+        .map((sym) => ({ symbol: sym, market_id: risexMarketIds[sym]! }))
+        .filter((e) => Number.isFinite(e.market_id))
+        .sort((a, b) => a.symbol.localeCompare(b.symbol)),
     },
     meta: {
       maxLeverage: lev,
@@ -256,4 +280,37 @@ async function loadVariational() {
     markets[ticker] = `P-${ticker}-USDC-${fi}`;
   }
   return { markets };
+}
+
+async function loadRisex() {
+  // RISEx perp DEX on RISE Chain. Public /v1/markets returns base_asset_symbol
+  // like "BTC/USDC" — keep that as the canonical symbol and key the market_id
+  // map by it so the discovery loop can build {symbol → market_id} for the
+  // RisexOms ensureTracking call.
+  const resp = await fetch("https://api.rise.trade/v1/markets", {
+    headers: { "User-Agent": "tradeautonom-oms-v2-discovery/0.1" },
+  });
+  const body = (await resp.json()) as any;
+  const markets: Record<string, string> = {};
+  const marketIds: Record<string, number> = {};
+  const metaLev: Record<string, number> = {};
+  const metaMin: Record<string, number> = {};
+  const metaStep: Record<string, number> = {};
+  const metaTick: Record<string, number> = {};
+  for (const m of body?.data?.markets ?? []) {
+    if (m?.available !== true) continue;
+    const sym: string = String(m.base_asset_symbol ?? "").toUpperCase();
+    if (!sym || !sym.endsWith("/USDC")) continue;
+    const base = sym.split("/")[0]!;
+    markets[base] = sym;
+    const mid = Number(m.market_id);
+    if (!Number.isFinite(mid)) continue;
+    marketIds[sym] = mid;
+    const cfg = m.config ?? {};
+    if (cfg.max_leverage) metaLev[base] = Number(cfg.max_leverage);
+    if (cfg.min_order_size) metaMin[base] = Number(cfg.min_order_size);
+    if (cfg.step_size) metaStep[base] = Number(cfg.step_size);
+    if (cfg.step_price) metaTick[base] = Number(cfg.step_price);
+  }
+  return { markets, marketIds, metaLev, metaMin, metaStep, metaTick };
 }

@@ -25,6 +25,19 @@ from app.executor import TradeExecutor
 from app.extended_client import ExtendedClient
 from app.grvt_client import GrvtClient
 from app.nado_client import NadoClient
+# RISEx import is wrapped because eth_account is a relatively new dependency
+# (added with the RISEx integration) and a stripped-down image without it must
+# not crash FastAPI startup — same pattern as DNA bot below.
+_risex_import_error = ""
+try:
+    from app.risex_client import RisexClient
+    _risex_import_ok = True
+except Exception as _exc:
+    _risex_import_ok = False
+    _risex_import_error = str(_exc)
+    RisexClient = None  # type: ignore
+    import logging as _log
+    _log.getLogger("tradeautonom").warning("RISEx client import failed: %s", _exc)
 from app.variational_client import VariationalClient
 from app.job_manager import JobManager, ArbJob
 from app.ws_feeds import OrderbookFeedManager
@@ -39,6 +52,21 @@ except Exception as _exc:
     DNAConfig = None  # type: ignore
     import logging as _log
     _log.getLogger("tradeautonom").error("DNA bot import failed: %s", _exc)
+
+# Gold-Spread bot — same try/except pattern as DNA so a missing dep
+# (e.g. running in a stripped-down container) only logs a warning instead
+# of crashing FastAPI startup.
+_gold_spread_import_error = ""
+try:
+    from app.gold_spread_bot import GoldSpreadBot, GoldSpreadConfig
+    _gold_spread_import_ok = True
+except Exception as _exc:
+    _gold_spread_import_ok = False
+    _gold_spread_import_error = str(_exc)
+    GoldSpreadBot = None  # type: ignore
+    GoldSpreadConfig = None  # type: ignore
+    import logging as _log
+    _log.getLogger("tradeautonom").error("Gold-Spread bot import failed: %s", _exc)
 from app.journal_collector import JournalCollector
 from app.activity_forwarder import ActivityLogForwarder
 from app.schemas import (
@@ -100,6 +128,7 @@ _bot_registry: BotRegistry | None = None
 _journal_collector: JournalCollector | None = None
 _activity_forwarder: ActivityLogForwarder | None = None
 _dna_bot: DNABot | None = None
+_gold_spread_bot: "GoldSpreadBot | None" = None
 _vault_unlocked: bool = False  # True after user enters correct password
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -140,6 +169,10 @@ def _build_dna_bot() -> None:
             min_profit_bps=_settings.dna_min_profit_bps,
             exchanges=_settings.dna_exchanges.split(","),
             slippage_tolerance_pct=_settings.dna_slippage_tolerance_pct,
+            max_signal_age_ms=_settings.dna_max_signal_age_ms,
+            max_quote_age_ms=_settings.dna_max_quote_age_ms,
+            max_signal_erosion_pct=_settings.dna_max_signal_erosion_pct,
+            require_cross_quote=_settings.dna_require_cross_quote,
             size_tolerance_pct=_settings.dna_size_tolerance_pct,
             simulation=_settings.dna_simulation,
             excluded_tokens=[
@@ -148,6 +181,7 @@ def _build_dna_bot() -> None:
                 if t.strip()
             ],
             auto_exclude_open_positions=_settings.dna_auto_exclude_open_positions,
+            cooldown_after_close_s=_settings.dna_cooldown_after_close_s,
         )
         _dna_bot = DNABot(
             config=dna_config,
@@ -163,11 +197,64 @@ def _build_dna_bot() -> None:
         _dna_bot = None
 
 
+def _build_gold_spread_bot() -> None:
+    """Construct the Gold-Spread singleton from current Settings.
+
+    Mirrors `_build_dna_bot` — runs after vault unlock so the bot has
+    access to the Variational client (when Phase 2 trading lands).
+    """
+    global _gold_spread_bot
+    if not _gold_spread_import_ok:
+        logger.warning(
+            "Gold-Spread bot skipped — import failed: %s", _gold_spread_import_error,
+        )
+        _gold_spread_bot = None
+        return
+    if not _settings:
+        _gold_spread_bot = None
+        return
+    if not getattr(_settings, "gold_spread_enabled", True):
+        logger.info("Gold-Spread bot disabled via settings.gold_spread_enabled=False")
+        _gold_spread_bot = None
+        return
+    try:
+        cfg = GoldSpreadConfig(
+            bot_id="gold-spread",
+            oms_url=_settings.gold_spread_oms_url,
+            entry_spread=_settings.gold_spread_entry,
+            exit_spread=_settings.gold_spread_exit,
+            threshold_in_pct=_settings.gold_spread_threshold_in_pct,
+            quantity=_settings.gold_spread_quantity,
+            max_slippage_pct=_settings.gold_spread_max_slippage_pct,
+            signal_confirmations=_settings.gold_spread_signal_confirmations,
+            tick_interval_s=_settings.gold_spread_tick_interval_s,
+            simulation=_settings.gold_spread_simulation,
+            max_position_value_usd=_settings.gold_spread_max_position_value_usd,
+            execution_timeout_s=_settings.gold_spread_execution_timeout_s,
+            unwind_slippage_pct=_settings.gold_spread_unwind_slippage_pct,
+            fill_verify_delay_s=_settings.gold_spread_fill_verify_delay_s,
+            min_actual_spread_ratio=_settings.gold_spread_min_actual_spread_ratio,
+            max_spread_volatility_ratio=_settings.gold_spread_max_spread_volatility_ratio,
+        )
+        _gold_spread_bot = GoldSpreadBot(
+            config=cfg,
+            clients=_exchange_clients,
+            activity_forwarder=_activity_forwarder,
+        )
+        logger.info(
+            "Gold-Spread bot initialized: oms_url=%s entry=%s exit=%s sim=%s",
+            cfg.oms_url, cfg.entry_spread, cfg.exit_spread, cfg.simulation,
+        )
+    except Exception as exc:
+        logger.warning("Gold-Spread bot init failed (non-fatal): %s", exc)
+        _gold_spread_bot = None
+
+
 async def _init_exchange_clients():
     """Initialize exchange clients and engines after vault unlock."""
     global _settings, _client, _extended_client, _executor, _arb_engine
     global _exchange_clients, _feed_manager, _job_manager, _fn_engine, _bot_registry
-    global _vault_unlocked, _auto_trade_task, _dna_bot
+    global _vault_unlocked, _auto_trade_task, _dna_bot, _gold_spread_bot
 
     _client = GrvtClient(_settings)
     _extended_client = ExtendedClient(
@@ -200,6 +287,41 @@ async def _init_exchange_clients():
         )
         _exchange_clients["variational"] = _variational_client
         logger.info("Variational client registered")
+    # RISEx client (optional — needs signer key + account address; also requires
+    # eth_account to be importable, which is guarded above).
+    if _risex_import_ok and _settings.risex_signer_key and _settings.risex_account_address:
+        _risex_client = RisexClient(
+            account_address=_settings.risex_account_address,
+            signer_key=_settings.risex_signer_key,
+            env=_settings.risex_env,
+        )
+        _exchange_clients["risex"] = _risex_client
+        logger.info("RISEx client registered (env=%s)", _settings.risex_env)
+        # Verify signer registration on-chain — best-effort, non-fatal.
+        # An unregistered signer is the #1 cause of HTTP 400 from
+        # /v1/orders/place (see npm risex-client troubleshooting), so logging
+        # the status at startup gives the operator a one-line diagnosis.
+        try:
+            info = _risex_client.verify_signer()
+            if info.get("ok"):
+                logger.info(
+                    "RISEx signer registered on-chain: account=%s signer=%s",
+                    (info.get("account") or "?")[:12] + "...",
+                    (info.get("signer") or "?")[:12] + "...",
+                )
+            else:
+                logger.warning(
+                    "RISEx signer NOT registered on-chain — orders will fail with 400. "
+                    "Register signer at https://app.rise.trade Settings > API Keys. error=%s",
+                    info.get("error"),
+                )
+        except Exception as exc:
+            logger.warning("RISEx verify_signer threw: %s", exc)
+    elif (_settings.risex_signer_key and _settings.risex_account_address) and not _risex_import_ok:
+        logger.warning(
+            "RISEx keys present but client unavailable (import failed: %s)",
+            _risex_import_error,
+        )
     _executor = TradeExecutor(_client, _settings)
     # Legacy single-engine (kept for backward compat with /arb/* endpoints)
     _arb_engine = ArbitrageEngine(_exchange_clients, _executor, _settings)
@@ -269,6 +391,9 @@ async def _init_exchange_clients():
     # ── DNA Bot (Delta-Neutral Arbitrage) ────────────────────────
     _build_dna_bot()
 
+    # ── Gold-Spread Bot (PAXG vs XAUT on Variational) ────────────
+    _build_gold_spread_bot()
+
     # ── Journal Collector (order/fill/funding/points history) ──────
     global _journal_collector
     if _settings.history_ingest_url and _settings.history_ingest_token:
@@ -292,8 +417,15 @@ async def _shutdown_exchange_clients():
     global _client, _extended_client, _executor, _arb_engine
     global _exchange_clients, _feed_manager, _job_manager, _fn_engine, _bot_registry
     global _vault_unlocked, _auto_trade_task, _journal_collector, _dna_bot, _activity_forwarder
+    global _gold_spread_bot
 
     _vault_unlocked = False
+    if _gold_spread_bot is not None:
+        try:
+            await _gold_spread_bot.stop()
+        except Exception:
+            pass
+        _gold_spread_bot = None
     if _dna_bot is not None:
         await _dna_bot.stop()
         _dna_bot = None
@@ -856,22 +988,89 @@ async def account_all():
 
 
 @app.get("/account/positions")
-async def account_positions(symbols: str = ""):
-    """Return open positions from all exchanges. Pass comma-separated symbols or leave empty for all."""
+async def account_positions(symbols: str = "", include_status: int = 0):
+    """Return open positions from all exchanges.
+
+    Pass comma-separated symbols or leave empty for all.
+
+    By default returns a plain JSON array of position dicts (backward compat).
+    Pass `?include_status=1` to receive an envelope of the form:
+        { "positions": [...], "errors": {...}, "auth": {...} }
+      - errors: per-exchange short error string for any exchange that failed
+      - auth:   per-exchange auth health (currently only Variational reports
+                this — see VariationalClient.auth_status)
+    The frontend uses the envelope form to render a clear "token expired/
+    revoked" banner instead of silently showing an empty list.
+    """
     sym_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else []
-    all_positions = []
-    errors = []
+    all_positions: list[dict] = []
+    errors: dict[str, str] = {}
+    auth: dict[str, dict] = {}
+
     for exchange_name, client in _exchange_clients.items():
+        # Snapshot auth status BEFORE the call so we report state-after-call
         try:
             positions = client.fetch_positions(sym_list)
             for p in positions:
                 p["exchange"] = exchange_name
             all_positions.extend(positions)
         except Exception as exc:
-            errors.append(f"{exchange_name}: {exc}")
-    if errors and not all_positions:
-        logger.warning("account/positions: all exchanges failed: %s", "; ".join(errors))
+            errors[exchange_name] = str(exc)
+            logger.warning("[POSITIONS-ERROR] %s: %s", exchange_name, exc)
+
+        # Snapshot auth status if the client exposes one (currently Variational)
+        client_auth = getattr(client, "auth_status", None)
+        if client_auth is not None:
+            try:
+                auth[exchange_name] = client_auth() if callable(client_auth) else dict(client_auth)
+            except Exception:
+                pass
+
+    if include_status:
+        return {
+            "positions": all_positions,
+            "errors": errors,
+            "auth": auth,
+        }
+    # Default: plain array (legacy callers)
     return all_positions
+
+
+@app.get("/account/health")
+async def account_health():
+    """Return per-exchange auth/connectivity health snapshots.
+
+    Used by the frontend to render a status badge per exchange and a banner
+    when an exchange has an auth failure (e.g. expired/revoked Variational
+    JWT). Currently only Variational publishes a meaningful auth_status;
+    other clients return None and are reported as ok=True with no detail.
+    """
+    health: dict[str, dict] = {}
+    for exchange_name, client in _exchange_clients.items():
+        client_auth = getattr(client, "auth_status", None)
+        if client_auth is None:
+            health[exchange_name] = {
+                "ok": True,
+                "last_status_code": None,
+                "last_error": None,
+                "last_check_ts": 0,
+                "consecutive_failures": 0,
+                "tracked": False,
+            }
+            continue
+        try:
+            snap = client_auth() if callable(client_auth) else dict(client_auth)
+        except Exception as exc:
+            snap = {
+                "ok": False,
+                "last_status_code": None,
+                "last_error": f"snapshot failed: {exc}",
+                "last_check_ts": 0,
+                "consecutive_failures": 0,
+            }
+        snap["tracked"] = True
+        health[exchange_name] = snap
+    return health
 
 
 # ------------------------------------------------------------------
@@ -2230,12 +2429,49 @@ async def fn_bot_timer(bot_id: str, req: dict):
 
 @app.post("/fn/bots/{bot_id}/config")
 async def fn_bot_config_update(bot_id: str, updates: dict):
-    """Update config for a specific bot."""
+    """Update config for a specific bot.
+
+    Edits during PAUSED_* state are logged with [PAUSE-EDIT] tags so the user
+    can audit which fields were touched while paused. The values themselves
+    are persisted by update_bot_config; they take effect on Resume via the
+    in-flight config hydration in engine.resume_execution().
+    """
     engine = _require_bot(bot_id)
     try:
+        # Capture state BEFORE applying the update — engine.update_config()
+        # does its own state check; if the state is non-editable it raises
+        # before we get here.
+        sm_state_before = engine._state_machine.state.value if engine._state_machine else "UNKNOWN"
         result = await engine.apply_config_and_restart_feeds(**updates)
-        # Persist updated config
+        # Persist updated config (also triggers R2 flush in V2)
         _require_registry().update_bot_config(bot_id, engine.config)
+
+        # Pause-edit audit log: one line per changed key. Differentiates
+        # between fields that affect the CURRENT paused execution vs fields
+        # that only affect the NEXT entry/exit cycle. This makes it obvious
+        # to the user when an edit during PAUSED_ENTERING that touches an
+        # exit-only field (e.g. exit_max_spread_pct) won't change the
+        # current entry — but will be persisted for the next exit.
+        ENTRY_SPREAD_FIELDS = {"min_spread_pct", "max_spread_pct"}
+        EXIT_SPREAD_FIELDS = {"exit_min_spread_pct", "exit_max_spread_pct"}
+        if sm_state_before in ("PAUSED_ENTERING", "PAUSED_EXITING"):
+            for k, v in updates.items():
+                if sm_state_before == "PAUSED_ENTERING" and k in EXIT_SPREAD_FIELDS:
+                    effect = (
+                        "will take effect on next EXIT (not current entry); "
+                        "persisted to disk"
+                    )
+                elif sm_state_before == "PAUSED_EXITING" and k in ENTRY_SPREAD_FIELDS:
+                    effect = (
+                        "will take effect on next ENTRY (not current exit); "
+                        "persisted to disk"
+                    )
+                else:
+                    effect = "will take effect on Resume; persisted to disk"
+                engine.log_activity(
+                    "ENGINE",
+                    f"[PAUSE-EDIT] {k} = {v} ({effect})",
+                )
         return {"status": "ok", "updated": list(updates.keys()), "feeds_restarted": result.get("feeds_restarted", False)}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2312,6 +2548,24 @@ async def fn_bot_trades(bot_id: str, limit: int = 50):
     return engine.get_trade_log(limit=limit)
 
 
+@app.get("/fn/bots/{bot_id}/fills")
+async def fn_bot_fills(bot_id: str, limit: int = 0):
+    """Flat fill log for a specific bot (all chunks across all trades).
+
+    Each fill represents one TWAP chunk that actually moved size, with
+    pre-mapped long/short legs and the spread % at fill prices. The list
+    is sorted newest-first.
+
+    Pass limit=0 (default) to return the entire history; pass a positive
+    value to truncate. The SSE stream already includes the latest 50
+    fills via engine.get_status() — this endpoint is primarily for the
+    BotDetailView initial mount so the user sees the full history right
+    away, with SSE frames keeping the tail live afterwards.
+    """
+    engine = _require_bot(bot_id)
+    return {"fills": engine.get_fill_log(limit=limit or None)}
+
+
 @app.get("/fn/bots/{bot_id}/log")
 async def fn_bot_log(bot_id: str, since_seq: int = 0, limit: int = 100):
     """Activity log for a specific bot."""
@@ -2321,74 +2575,29 @@ async def fn_bot_log(bot_id: str, since_seq: int = 0, limit: int = 100):
 
 @app.get("/fn/bots/{bot_id}/stream")
 async def fn_bot_stream(request: Request, bot_id: str, interval_ms: int = 2000):
-    """SSE stream for a specific bot."""
+    """SSE stream for a specific bot.
+
+    Uses engine.get_status() as single source of truth (same payload as
+    GET /fn/bots/{bot_id}/status) so the SSE stream cannot drift from the
+    REST snapshot. Previously this function manually rebuilt the status
+    dict and silently dropped fields like exit_min_spread_pct /
+    exit_max_spread_pct, which made config edits appear to have no effect.
+    """
     engine = _require_bot(bot_id)
 
     async def event_generator():
         while not await request.is_disconnected():
             try:
                 now = time.time()
-                remaining_s = None
-                if engine._expires_at:
-                    remaining_s = max(0, engine._expires_at - now)
+                # Single source of truth: engine.get_status() already
+                # includes timer, leverage, prices, pnl, position, execution,
+                # funding, funding_v4, risk, feeds_ready, data, orderbooks,
+                # ohi, depth_analysis, activity_log, and the FULL config
+                # block (entry + exit spread thresholds, all fn_opt_* flags).
+                status = engine.get_status()
                 data = {
+                    **status,
                     "bot_id": bot_id,
-                    "state": engine._state_machine.state.value if engine._state_machine else "?",
-                    "is_running": engine._is_running,
-                    "timer": {
-                        "started_at": engine._started_at,
-                        "expires_at": engine._expires_at,
-                        "remaining_s": remaining_s,
-                        "stop_reason": engine._stop_reason,
-                    },
-                    "leverage": {
-                        "long": engine.config.leverage_long,
-                        "short": engine.config.leverage_short,
-                    },
-                    "prices": engine.get_live_prices(),
-                    "pnl": engine.get_unrealized_pnl(),
-                    "position": engine._state_machine.position_info if engine._state_machine else {},
-                    "execution": engine._state_machine.execution_status if engine._state_machine else {},
-                    "funding": engine._funding_monitor.get_rates() if engine._funding_monitor else {},
-                    "risk": engine._risk_manager.get_status() if engine._risk_manager else {},
-                    "feeds_ready": engine._data_layer.is_ready() if engine._data_layer else False,
-                    "data": engine._data_layer.status() if engine._data_layer else {},
-                    "orderbooks": {
-                        "long": engine._data_layer.get_orderbook_depth(engine.config.long_exchange, engine.config.instrument_a, depth=10) if engine._data_layer else {},
-                        "short": engine._data_layer.get_orderbook_depth(engine.config.short_exchange, engine.config.instrument_b, depth=10) if engine._data_layer else {},
-                    } if engine._data_layer and engine.config.instrument_a and engine.config.instrument_b else {},
-                    "ohi": {
-                        "long": engine._data_layer.get_orderbook_health(engine.config.long_exchange, engine.config.instrument_a),
-                        "short": engine._data_layer.get_orderbook_health(engine.config.short_exchange, engine.config.instrument_b),
-                    } if engine._data_layer and engine.config.instrument_a and engine.config.instrument_b else {},
-                    "depth_analysis": engine._compute_depth_analysis_for_status(),
-                    "activity_log": engine.get_activity_log(limit=50),
-                    "config": {
-                        "long_exchange": engine.config.long_exchange,
-                        "short_exchange": engine.config.short_exchange,
-                        "maker_exchange": engine.config.maker_exchange,
-                        "instrument_a": engine.config.instrument_a,
-                        "instrument_b": engine.config.instrument_b,
-                        "quantity": float(engine.config.quantity),
-                        "twap_num_chunks": engine.config.twap_num_chunks,
-                        "twap_interval_s": engine.config.twap_interval_s,
-                        "simulation": engine.config.simulation,
-                        "max_chunk_spread_usd": engine.config.max_chunk_spread_usd,
-                        "max_spread_pct": engine.config.max_spread_pct,
-                        "duration_h": engine.config.duration_h,
-                        "duration_m": engine.config.duration_m,
-                        "fn_opt_depth_spread": engine.config.fn_opt_depth_spread,
-                        "fn_opt_max_slippage_bps": engine.config.fn_opt_max_slippage_bps,
-                        "fn_opt_ohi_monitoring": engine.config.fn_opt_ohi_monitoring,
-                        "fn_opt_min_ohi": engine.config.fn_opt_min_ohi,
-                        "fn_opt_funding_history": engine.config.fn_opt_funding_history,
-                        "fn_opt_min_funding_consistency": engine.config.fn_opt_min_funding_consistency,
-                        "fn_opt_dynamic_sizing": engine.config.fn_opt_dynamic_sizing,
-                        "fn_opt_shared_monitor_url": engine.config.fn_opt_shared_monitor_url,
-                        "fn_opt_taker_drift_guard": engine.config.fn_opt_taker_drift_guard,
-                        "fn_opt_max_taker_drift_bps": engine.config.fn_opt_max_taker_drift_bps,
-                        "min_spread_pct": engine.config.min_spread_pct,
-                    },
                     "ts": now,
                 }
                 yield f"data: {json.dumps(data)}\n\n"
@@ -2527,6 +2736,12 @@ _MANAGED_KEYS = [
     "grvt_api_key", "grvt_private_key", "grvt_trading_account_id",
     "variational_jwt_token",
     "nado_private_key", "nado_linked_signer_key", "nado_wallet_address", "nado_subaccount_name",
+    # RISEx (rise.trade) — wallet address + pre-registered signer private key.
+    # Mirrored in deploy/cloudflare/src/lib/secrets.ts MANAGED_KEYS so the
+    # Worker forwards them via /internal/apply-keys; without these entries
+    # _apply_secrets_to_settings() drops the keys and the RisexClient stays
+    # unconfigured — no balance reads, no trades.
+    "risex_account_address", "risex_signer_key",
 ]
 
 
@@ -2595,12 +2810,29 @@ def _reinit_exchange_clients() -> None:
         builder_fee=_settings.extended_builder_fee,
     )
     _exchange_clients["extended"] = _extended_client
-    # Reinit Variational client if configured
+    # Reinit Variational client if configured.
+    # Prefer in-place update_jwt() over rebuilding the client so that
+    # ongoing engines/bots already holding a reference don't end up with
+    # a stale instance — they'll see the new token immediately. update_jwt()
+    # also clears the cookie jar (old vr-token from Set-Cookie) and resets
+    # the auth_status tracker. We still rebuild on first init or if the
+    # proxy URL changed.
     if _settings.variational_jwt_token:
-        _exchange_clients["variational"] = VariationalClient(
-            jwt_token=_settings.variational_jwt_token,
-            proxy_worker_url=_settings.variational_proxy_url,
-        )
+        existing = _exchange_clients.get("variational")
+        if existing is not None and getattr(existing, "_proxy_url", None) == _settings.variational_proxy_url.rstrip("/"):
+            try:
+                existing.update_jwt(_settings.variational_jwt_token)
+            except Exception as exc:
+                logger.warning("Variational update_jwt failed (%s) — rebuilding client", exc)
+                _exchange_clients["variational"] = VariationalClient(
+                    jwt_token=_settings.variational_jwt_token,
+                    proxy_worker_url=_settings.variational_proxy_url,
+                )
+        else:
+            _exchange_clients["variational"] = VariationalClient(
+                jwt_token=_settings.variational_jwt_token,
+                proxy_worker_url=_settings.variational_proxy_url,
+            )
     # Reinit NADO client if configured
     if _settings.nado_private_key or _settings.nado_linked_signer_key:
         _exchange_clients["nado"] = NadoClient(
@@ -2609,6 +2841,39 @@ def _reinit_exchange_clients() -> None:
             env=_settings.nado_env,
             linked_signer_key=_settings.nado_linked_signer_key,
             wallet_address=_settings.nado_wallet_address,
+        )
+    # Reinit RISEx client if configured (and the import succeeded — see top of file)
+    if _risex_import_ok and _settings.risex_signer_key and _settings.risex_account_address:
+        _risex_client_reinit = RisexClient(
+            account_address=_settings.risex_account_address,
+            signer_key=_settings.risex_signer_key,
+            env=_settings.risex_env,
+        )
+        _exchange_clients["risex"] = _risex_client_reinit
+        # Re-verify signer status on every reinit — operator may have just
+        # registered a fresh signer key on the web app, so we want a current
+        # log entry rather than relying on the boot-time check.
+        try:
+            info = _risex_client_reinit.verify_signer()
+            if info.get("ok"):
+                logger.info(
+                    "RISEx signer registered on-chain (reinit): account=%s signer=%s",
+                    (info.get("account") or "?")[:12] + "...",
+                    (info.get("signer") or "?")[:12] + "...",
+                )
+            else:
+                logger.warning(
+                    "RISEx signer NOT registered on-chain (reinit) — orders will fail "
+                    "with 400. Register signer at https://app.rise.trade Settings > "
+                    "API Keys. error=%s",
+                    info.get("error"),
+                )
+        except Exception as exc:
+            logger.warning("RISEx verify_signer threw on reinit: %s", exc)
+    elif (_settings.risex_signer_key and _settings.risex_account_address) and not _risex_import_ok:
+        logger.warning(
+            "RISEx reinit skipped — client import unavailable: %s",
+            _risex_import_error,
         )
     # Reinit executor (uses GRVT client)
     _executor = TradeExecutor(_client, _settings)
@@ -2627,6 +2892,17 @@ def _reinit_exchange_clients() -> None:
             "DNA bot rebuild skipped: bot is currently running (oms_url=%s); "
             "stop and restart to apply new settings",
             getattr(_dna_bot.config, "oms_url", "?"),
+        )
+
+    # Same idempotent rebuild for the Gold-Spread singleton — only swap the
+    # global if the bot is not actively running so we don't disrupt an
+    # in-flight position monitor.
+    if _gold_spread_bot is None or not getattr(_gold_spread_bot, "_running", False):
+        _build_gold_spread_bot()
+    else:
+        logger.info(
+            "Gold-Spread bot rebuild skipped: bot is currently running; "
+            "stop and restart to apply new settings",
         )
     logger.info("Exchange clients reinitialized after key update")
 
@@ -3380,6 +3656,84 @@ async def dna_positions():
         "open": len([p for p in bot._positions if p.status == "open"]),
         "max": bot.config.max_positions,
     }
+
+
+# ------------------------------------------------------------------
+# Gold-Spread Bot (PAXG vs XAUT on Variational)
+# ------------------------------------------------------------------
+
+def _require_gold_spread_bot():
+    if not _gold_spread_import_ok:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gold-Spread bot module failed to import: {_gold_spread_import_error}",
+        )
+    if _gold_spread_bot is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Gold-Spread bot not initialized (vault locked or disabled)",
+        )
+    return _gold_spread_bot
+
+
+@app.get("/gold-spread/status")
+async def gold_spread_status():
+    """Full status snapshot: state, current spread, position, config,
+    in-memory live history, and recent activity."""
+    bot = _require_gold_spread_bot()
+    return bot.get_status()
+
+
+@app.post("/gold-spread/start")
+async def gold_spread_start():
+    """Start the monitoring loop. Idempotent — returns already_running
+    if the loop is already active."""
+    bot = _require_gold_spread_bot()
+    if bot._running:
+        return {"status": "already_running", "state": bot._state.value}
+    result = await bot.start()
+    return {"status": "started", **result}
+
+
+@app.post("/gold-spread/stop")
+async def gold_spread_stop():
+    """Stop the monitoring loop. Does NOT close any open position."""
+    bot = _require_gold_spread_bot()
+    if not bot._running:
+        return {"status": "already_stopped", "state": bot._state.value}
+    result = await bot.stop()
+    return {"status": "stopped", **result}
+
+
+@app.post("/gold-spread/reset")
+async def gold_spread_reset():
+    """Force-clear position tracking and signal counters. Does NOT
+    cancel exchange orders — call /gold-spread/stop first if needed."""
+    bot = _require_gold_spread_bot()
+    return bot.reset()
+
+
+@app.post("/gold-spread/config")
+async def gold_spread_config_update(updates: dict):
+    """Hot-update spread thresholds, quantity, etc. while the bot runs.
+
+    Accepted keys: entry_spread, exit_spread, threshold_in_pct, quantity,
+    max_slippage_pct, signal_confirmations, tick_interval_s, simulation.
+    Any unknown keys are returned in `rejected`.
+    """
+    bot = _require_gold_spread_bot()
+    return bot.update_config(updates)
+
+
+@app.get("/gold-spread/stream")
+async def gold_spread_stream(interval_ms: int = 2000):
+    """SSE stream of full status snapshots, useful for the chart UI to
+    overlay live points + current spread on top of historical data."""
+    bot = _require_gold_spread_bot()
+    return StreamingResponse(
+        bot.stream_status(interval_ms=interval_ms),
+        media_type="text/event-stream",
+    )
 
 
 # ------------------------------------------------------------------

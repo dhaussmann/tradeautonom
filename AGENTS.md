@@ -6,20 +6,20 @@ Multi-exchange arbitrage trading bot (FastAPI backend, Vue 3 SPA frontend, Cloud
 
 | Purpose | Document |
 |---------|----------|
-| Architecture overview | `CLAUDE.md`, `docs/architecture.md` |
+| Architecture overview | `CLAUDE.md`, `docs/architecture.md`, `docs/v2-cf-containers-architecture.md` |
 | Engineering deep-dive | `docs/DEVELOPER_GUIDE.md` |
-| Ops runbook / NAS topology | `docs/DEPLOYMENT.md` |
+| Ops runbook (V2 / Cloudflare — canonical) | `docs/DEPLOYMENT.md` |
 | Strategy + P&L | `docs/STRATEGY_GUIDE.md` |
 | Execution / TWAP / state machine | `docs/taker-execution.md`, `docs/safety-balance-verification.md` |
 | WS connection rules | `docs/WEBSOCKET_ARCHITECTURE.md` |
-| OMS + opt-in features | `docs/V5_OMS_AND_FEATURES.md` |
+| OMS + opt-in features | `docs/V5_OMS_AND_FEATURES.md`, `docs/v2-oms-cloudflare-native.md` |
 | Multi-user vault / key lifecycle | `docs/API_KEY_LIFECYCLE.md` |
 | DNA bot | `docs/dna-bot.md` |
 | Nado OMS watchdog | `docs/NADO_WATCHDOG_WEBSOCKET.md` |
 | GRVT endpoints | `.claude/rules/grvt_api.md` |
 | Recent fixes to avoid regressing | `docs/WEBSOCKET_REFACTOR_FIXES.md`, `RELEASENOTES.md` |
-| V2 on Cloudflare (OMS Phase E live; UserContainer F.1–F.3 deployed: routing via `user.backend` flag is live) | `docs/v2-cf-containers-architecture.md`, `docs/v2-oms-cloudflare-native.md`, `deploy/cf-containers/oms-v2/` (OMS), `deploy/cf-containers/user-v2/` (user container), `deploy/cf-containers/proof-of-concept/` (research) |
-| **Do not treat as current reference** | `docs/delta-neutral-algorithm.docx.md` (design spec), `docs/tradeautonom-integrationsplan-v2.docx.md` (plan), `docs/FIX_USER_CONTAINERS.md` (proposal), `docs/V4_WEB_DEVELOPER_GUIDE.md` (external API doc) |
+| V2 deploy targets (canonical) | `deploy/cf-containers/oms-v2/` (OMS), `deploy/cf-containers/user-v2/` (per-user trading container), `deploy/cloudflare/` (Frontend + Auth Worker) |
+| **Do not treat as current reference** | `docs/delta-neutral-algorithm.docx.md` (design spec), `docs/tradeautonom-integrationsplan-v2.docx.md` (plan), `docs/FIX_USER_CONTAINERS.md` (V1/NAS proposal), `docs/V4_WEB_DEVELOPER_GUIDE.md` (external API doc) |
 
 ## 2. Entry points (not obvious from filenames)
 
@@ -49,35 +49,76 @@ python -m pytest tests/test_cf_worker_proxy.py   # needs VARIATIONAL_JWT
 # test_nado_*.py at repo root are ad-hoc scripts, not a test suite
 ```
 
-## 4. NAS & deployment truth
+## 4. Deployment truth (V2 / Cloudflare — canonical)
 
-- **Canonical NAS:** `root@192.168.133.100`, deploy path `/opt/tradeautonom`, SSH key `~/.ssh/id_ed25519`.
-- All `deploy/*/deploy.sh` read `NAS_HOST`, `NAS_USER`, `NAS_DEPLOY_PATH` from repo-root `.env`.
-- **Deprecated:** root `./deploy.sh` hard-codes `192.168.133.253` — **do not use**. Prefer:
-  - `./deploy/v3/manage.sh deploy-code` — hot-reload all v3 + user containers via shared mount `/opt/tradeautonom-v3/app`.
-  - `./deploy/v3/manage.sh update` — rebuild image + restart all user containers.
-- Stale IP `192.168.133.253` also appears in `frontend/vite.config.ts` default, `V5_OMS_AND_FEATURES.md`, `infrastructure-*.md`. Trust CLAUDE.md / DEPLOYMENT.md: **`.100` is canonical**.
-- All deploy paths **abort if any bot is non-IDLE** (probed via `/fn/bots`). Never deploy during a live trade.
-- Typical release: `./deploy/v3/manage.sh update` → SSH loop restart `ta-user-*` → `./deploy/cloudflare/deploy.sh`.
-- **Staging rule:** all code is tested on `tradeautonom-v3` (port 8005) first. Only after it verifies there do changes go out to the `ta-user-*` containers.
-- **Note:** `docs/FIX_USER_CONTAINERS.md` is a proposal. Verify that `ta-user-*` containers actually mount `/opt/tradeautonom-v3/app` before relying on hot-reload.
+The **only supported deploy target** is V2 on Cloudflare. The legacy V3
+NAS stack (`deploy/v3/manage.sh`, `ta-user-*` on `192.168.133.100`) is
+**deprecated** and must not be used for new releases. See
+`docs/DEPLOYMENT.md` Anhang A for historical NAS commands if a legacy
+container has to be touched.
 
-## 5. Container / port / image map
+- **UserContainer V2** — `deploy/cf-containers/user-v2/` (`user-v2.defitool.de`).
+  Deploy: `cd deploy/cf-containers/user-v2 && npm run deploy`.
+  Code is **baked into the image** — there is no shared-mount hot-reload
+  in V2.
+- **OMS V2** — `deploy/cf-containers/oms-v2/` (`oms-v2.defitool.de`).
+  Deploy: `cd deploy/cf-containers/oms-v2 && npm run deploy`.
+- **Frontend + Auth Worker** — `deploy/cloudflare/` (`bot.defitool.de`).
+  Deploy: `./deploy/cloudflare/deploy.sh`.
+- **CRITICAL: Bump `V2_BUILD_TAG`** in
+  `deploy/cf-containers/user-v2/container/Dockerfile` on every Python
+  code change. Without a fresh tag, BuildKit caches the `COPY app/`
+  layer and a successful-looking `wrangler deploy` ships the old code.
+  Convention: `<feature>-vNN`.
+- **When new code goes live:** CF does NOT replace running container
+  instances atomically. New code is loaded on the next **cold start** of
+  a user's container — automatic on idle timeout, or forced via
+  `POST https://user-v2.defitool.de/admin/recycle/<user_id>` with header
+  `X-Internal-Token: <V2_SHARED_TOKEN>`.
+- **State persistence:** R2 bucket `tradeautonom-user-state`. Each user
+  has one tarball (`<user_id>.tar.gz`) containing `data/` (auth.json,
+  secrets.enc, bots/, dna_bot/, …). `app/cloud_persistence.py` restores
+  on cold start and flushes every 30s via `/__state/{restore,flush}` on
+  the user-v2 Worker.
+- **Per-user backend routing:** D1 `user.backend` field decides the
+  proxy target — `v2` (default) → `user-v2.defitool.de`, `nas`
+  (legacy) → NAS container. Bestehende NAS-User werden nach und nach auf
+  V2 migriert.
+- **Do not run** `./deploy.sh` (root, hardcoded `192.168.133.253`),
+  `./deploy/v3/manage.sh ...` for new releases, or any
+  `ssh root@192.168.133.100 docker restart ...` workflow. Those paths
+  exist only for historical NAS containers under `user.backend = "nas"`.
 
-| Container | Port | Image | Notes |
-|-----------|------|-------|-------|
-| `tradeautonom` | 8002 | `tradeautonom:latest` | Prod; code baked in |
-| `tradeautonom-v2` | 8004 | `tradeautonom:v2` | Test/staging |
-| `tradeautonom-v3` | 8005 | `tradeautonom:v3` | Shared RO code mount |
-| `ta-user-*` | 9001–9008 (observed) | `tradeautonom:v3` | Per-user data volume + shared RO code; port assigned by `manage.sh create`; memory-capped at 1 GiB |
-| `tradeautonom-dashboard` | 8003 | — | Read-only view |
-| `ta-orchestrator` | 8090 | — | Requires `X-Orch-Token` header |
-| `oms` / `ta-monitor` | 8099 | — | Shared orderbook monitor |
-| `portainer` | 8000, 9443 | — | Not part of TradeAutonom; avoid port 8000 collisions |
+## 5. V2 component / domain / image map
 
-Host is a **Photon OS VM** (`photon-machine`, 192.168.133.100), not Synology. Older docs (`V5_OMS_AND_FEATURES.md`, `infrastructure-*.md`) still describe Synology; those notes are pre-migration. `host.docker.internal` is still unreliable — always hardcode `192.168.133.100` for cross-container references.
+| Component | Domain | Image / Class | Notes |
+|-----------|--------|---------------|-------|
+| Frontend + Auth Worker | `bot.defitool.de` | `tradeautonom` Worker + `frontend/dist/` assets | Vue 3 SPA, vue-tsc gates the build |
+| User trading containers | `user-v2.defitool.de` | `user-v2-usercontainer` (DO `UserContainer`) | Per-user, `instance_type: standard-1`, `max_instances: 25` |
+| OMS / Arb scanner | `oms-v2.defitool.de` | `oms-v2` Worker + `AggregatorDO` + `ArbScannerDO` + `NadoOmsDO` + `NadoRelayContainer` + `RisexFeed` | Single multi-tenant instance |
+| State persistence | (R2 bucket) | `tradeautonom-user-state` | One tarball per user; restored on cold start |
+| Persistence telemetry | (Analytics Engine) | `tradeautonom-persistence` | last_flush_ts, last_restore_ts, tar_size, status |
 
-**Container init / zombie-reaping:** the `tradeautonom:*` images use `tini` as `ENTRYPOINT` (PID 1). Docker `HEALTHCHECK` forks a Python subprocess every 30s; without a proper init, PID 1 (`main.py`) never reaps those forks and 500+ zombies accumulate per day → eventual OOM-kill on the cgroup. Never remove the `ENTRYPOINT ["/usr/bin/tini", "--"]` from the Dockerfiles or the `--init` flag from `manage.sh`/`deploy.sh` `docker run` invocations. See `docs/extended-builder-codes.md` peer doc for related container config.
+CF Container instance lifecycle: cold-start on first request after
+deploy/recycle/idle-evict; warm thereafter until idle timeout. There is
+no "host" to SSH into — debugging happens via `npx wrangler tail` and
+the Cloudflare dashboard.
+
+**Container init / zombie-reaping:** The user-v2 image uses `tini` as
+`ENTRYPOINT` (PID 1). Docker `HEALTHCHECK` forks a Python subprocess
+every 30 s; without a proper init, PID 1 (`main.py`) never reaps those
+forks and zombies accumulate. Never remove
+`ENTRYPOINT ["/usr/bin/tini", "--"]` from
+`deploy/cf-containers/user-v2/container/Dockerfile`.
+
+### Legacy NAS (deprecated, reference only)
+
+The old V3 stack on Photon OS VM `root@192.168.133.100`
+(`tradeautonom-v3:8005`, `ta-user-*:9001-9008`, `ta-orchestrator:8090`,
+`oms:8099`) still runs for users with `user.backend = "nas"`. **No new
+features go there.** If you must touch a NAS container, see
+`docs/DEPLOYMENT.md` Anhang A. Stale IP `192.168.133.253` in older docs
+is wrong; canonical legacy IP is `.100`.
 
 ## 6. Vault / key model (multi-user D1)
 
@@ -134,7 +175,8 @@ Host is a **Photon OS VM** (`photon-machine`, 192.168.133.100), not Synology. Ol
 | Use `async with websockets.connect(...)` | Use `async for ws in websockets.connect(...)` |
 | Snapshot baseline before chunk 1 | Skip snapshot (causes runaway repair) |
 | Trust exchange position as gap authority | Use `max(pos_gap, chunk_gap)` |
-| Prefer `./deploy/v3/manage.sh deploy-code` | Use root `./deploy.sh` (stale IP) |
-| Verify `ta-user-*` mounts shared code before relying on hot-reload | Assume all user containers hot-reload by default |
+| Deploy via `cd deploy/cf-containers/user-v2 && npm run deploy` (V2/CF) | Use `./deploy/v3/manage.sh ...`, root `./deploy.sh`, or any NAS-SSH workflow |
+| Bump `V2_BUILD_TAG` in user-v2 Dockerfile on every Python change | Trust a successful `wrangler deploy` to ship new code without a tag bump |
+| Force a CF Container cold-start via `/admin/recycle/<user_id>` to pick up new code | Assume running container instances auto-update after deploy |
 | Treat `docs/API_KEY_LIFECYCLE.md` as vault source of truth (multi-user) | Assume `docs/DEVELOPER_GUIDE.md` `secrets.enc` model (legacy) |
 | Treat `docs/delta-neutral-algorithm.docx.md`, `docs/tradeautonom-integrationsplan-v2.docx.md`, `docs/FIX_USER_CONTAINERS.md`, `docs/V4_WEB_DEVELOPER_GUIDE.md` as design/historical | Treat those four as current implementation references |

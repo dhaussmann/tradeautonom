@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, watch, computed } from 'vue'
+import { useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
 import AppHeader from '@/components/layout/AppHeader.vue'
@@ -8,7 +9,14 @@ import MobileBottomNav from '@/components/mobile/MobileBottomNav.vue'
 
 const appStore = useAppStore()
 const authStore = useAuthStore()
+const route = useRoute()
 const ready = ref(false)
+
+// Public routes (login, logout) must always render via <RouterView>,
+// never via VaultScreen — otherwise a user who clicks "Sign out" on the
+// VaultScreen would navigate to /logout but still see VaultScreen because
+// the v-else-if branch below would win over the RouterView branch.
+const isPublicRoute = computed(() => route.meta?.public === true)
 
 onMounted(async () => {
   await authStore.checkSession()
@@ -41,6 +49,14 @@ watch(() => authStore.isAuthenticated, async (isAuth) => {
       <div class="app-loading">
         <span class="spinner" />
       </div>
+    </template>
+    <!-- Public routes (login, logout) — always render via RouterView,
+         even when the user is authenticated and the vault is locked.
+         This is what makes /logout a true escape hatch from VaultScreen. -->
+    <template v-else-if="isPublicRoute">
+      <main class="app-main">
+        <RouterView />
+      </main>
     </template>
     <!-- Vault locked/setup required -->
     <template v-else-if="authStore.isAuthenticated && appStore.needsVaultAction">

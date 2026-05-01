@@ -29,6 +29,7 @@ from app.spread_analyzer import analyze_cross_venue_spread
 from app.risk_manager import RiskManager
 from app.state_machine import (
     ChunkResult,
+    ChunkState,
     ExecutionResult,
     JobState,
     MakerTakerConfig,
@@ -63,8 +64,10 @@ class EngineConfig:
     # Risk
     delta_max_usd: float = 50.0
     circuit_breaker_loss_usd: float = 500.0
-    min_spread_pct: float = -0.5
-    max_spread_pct: float = 0.05
+    min_spread_pct: float = -0.5            # Entry: applied during manual_entry()
+    max_spread_pct: float = 0.05            # Entry: applied during manual_entry()
+    exit_min_spread_pct: float = -0.5       # Exit:  applied during manual_exit() / graceful_stop()
+    exit_max_spread_pct: float = 0.05       # Exit:  applied during manual_exit() / graceful_stop()
     max_chunk_spread_usd: float = 1.0
 
     # Funding monitor
@@ -128,6 +131,8 @@ class EngineConfig:
             circuit_breaker_loss_usd=settings.fn_circuit_breaker_loss_usd,
             min_spread_pct=settings.fn_min_spread_pct,
             max_spread_pct=settings.fn_max_spread_pct,
+            exit_min_spread_pct=settings.fn_exit_min_spread_pct,
+            exit_max_spread_pct=settings.fn_exit_max_spread_pct,
             max_chunk_spread_usd=settings.fn_max_chunk_spread_usd,
             funding_poll_interval_s=settings.fn_funding_poll_interval_s,
             duration_h=settings.fn_duration_h,
@@ -703,18 +708,127 @@ class FundingArbEngine:
             self._countdown_task = None
 
         self._save_timer()
-        self.log_activity("ENGINE", f"PAUSED: execution + timer (remaining={self._paused_timer_remaining:.0f}s)" if self._paused_timer_remaining else "PAUSED: execution (no timer)")
+
+        # Phase-aware pause logging — tells the user exactly where the bot
+        # was when pause was requested and how long until it actually stops.
+        phase = self._state_machine._current_chunk_state
+        phase_name = phase.value if phase else "?"
+        chunk_idx = self._state_machine._current_chunk_index
+        if phase == ChunkState.SPREAD_WAIT:
+            expectation = "stops immediately at next 2s check tick (≤2s)"
+        elif phase in (
+            ChunkState.MAKER_PLACE, ChunkState.MAKER_WAIT,
+            ChunkState.TAKER_HEDGE, ChunkState.REPAIR, ChunkState.VERIFY,
+        ):
+            expectation = (
+                "current chunk will finish first "
+                "(incl. all reprice rounds + hedge + verify)"
+            )
+        else:
+            expectation = "stops at next chunk boundary"
+
+        timer_str = (
+            f"{self._paused_timer_remaining:.0f}s remaining (saved)"
+            if self._paused_timer_remaining else "no timer"
+        )
+        self.log_activity(
+            "ENGINE",
+            f"[PAUSE-REQUEST] Pause requested at chunk={chunk_idx} "
+            f"phase={phase_name} state={sm_state.value} → {expectation}. "
+            f"Timer paused: {timer_str}",
+        )
+        hot_keys_list = ", ".join(sorted(self._HOT_UPDATE_KEYS))
+        self.log_activity(
+            "ENGINE",
+            f"[PAUSE-CONFIG] You can now edit: {hot_keys_list}. "
+            f"Changes apply on Resume.",
+        )
         return {"status": "ok", "paused": True}
 
+    # Static part of the hydrate map (state-independent fields).
+    # Spread fields are added dynamically in resume_execution() based on
+    # whether we're paused during entry or exit.
+    _RESUME_HYDRATE_MAP_BASE = {
+        "max_chunk_spread_usd":   "max_chunk_spread_usd",
+        "maker_timeout_ms":       "maker_timeout_ms",
+        "maker_reprice_ticks":    "maker_reprice_ticks",
+        "maker_max_chase_rounds": "maker_max_chase_rounds",
+        "maker_offset_ticks":     "maker_offset_ticks",
+        "simulation":             "simulation",
+        # fn_opt_*-prefixed in EngineConfig:
+        "use_depth_spread":       "fn_opt_depth_spread",
+        "max_slippage_bps":       "fn_opt_max_slippage_bps",
+        "ohi_monitoring":         "fn_opt_ohi_monitoring",
+        "min_ohi":                "fn_opt_min_ohi",
+        "taker_drift_guard":      "fn_opt_taker_drift_guard",
+        "max_taker_drift_bps":    "fn_opt_max_taker_drift_bps",
+    }
+
     def resume_execution(self) -> dict:
-        """Resume a paused TWAP execution and restart the countdown timer."""
+        """Resume a paused TWAP execution and restart the countdown timer.
+
+        Hydrates the in-flight MakerTakerConfig with any hot-update field
+        edits made via update_config() during the pause window. This fixes
+        the snapshot-staleness bug where edits to engine.config never
+        reached the running chunk loop.
+
+        Spread bounds are state-aware: during PAUSED_EXITING the in-flight
+        MakerTakerConfig.min/max_spread_pct fields are sourced from
+        engine.config.exit_min/max_spread_pct (separate exit thresholds).
+        """
         if not self._state_machine:
             raise RuntimeError("Engine not started")
 
         if not self._state_machine.is_paused:
             raise RuntimeError(f"Cannot resume: state is {self._state_machine.state.value}")
 
-        # Resume state machine
+        # ── State-aware spread mapping ──
+        sm_state = self._state_machine.state
+        if sm_state == JobState.PAUSED_EXITING:
+            spread_min_src = "exit_min_spread_pct"
+            spread_max_src = "exit_max_spread_pct"
+            phase_label = "EXIT"
+        else:  # PAUSED_ENTERING
+            spread_min_src = "min_spread_pct"
+            spread_max_src = "max_spread_pct"
+            phase_label = "ENTRY"
+
+        # Build the per-resume hydrate map: static base + state-dependent spreads.
+        key_map = dict(self._RESUME_HYDRATE_MAP_BASE)
+        key_map["min_spread_pct"] = spread_min_src
+        key_map["max_spread_pct"] = spread_max_src
+
+        # ── Hydrate live config into in-flight MakerTakerConfig ──
+        cfg = self._state_machine._current_config
+        diffs: list[str] = []
+        if cfg is not None:
+            for cfg_key, engine_key in key_map.items():
+                if hasattr(cfg, cfg_key) and hasattr(self.config, engine_key):
+                    old = getattr(cfg, cfg_key)
+                    new = getattr(self.config, engine_key)
+                    if old != new:
+                        setattr(cfg, cfg_key, new)
+                        # When source name differs from target name (spread fields
+                        # during exit), show source name for clarity in the log.
+                        if engine_key != cfg_key:
+                            diffs.append(f"{cfg_key} (from {engine_key}): {old} → {new}")
+                        else:
+                            diffs.append(f"{cfg_key}: {old} → {new}")
+
+        if diffs:
+            self.log_activity(
+                "ENGINE",
+                f"[RESUME-CONFIG] Hydrating live config into in-flight {phase_label} "
+                f"execution: {'; '.join(diffs)}",
+            )
+        else:
+            self.log_activity(
+                "ENGINE",
+                f"[RESUME-CONFIG] No config changes during pause ({phase_label})",
+            )
+
+        # Resume state machine (releases the asyncio Event so any
+        # _wait_if_paused() / _pause_aware_sleep() waiters proceed).
         self._state_machine.resume()
 
         # Resume countdown timer with saved remaining time
@@ -725,9 +839,9 @@ class FundingArbEngine:
                 self._duration_countdown(remaining),
                 name=f"fn-countdown-{self.config.job_id}",
             )
-            self.log_activity("ENGINE", f"RESUMED: execution + timer ({remaining:.0f}s remaining)")
+            self.log_activity("ENGINE", f"[RESUME] Execution resumed + timer ({remaining:.0f}s remaining)")
         else:
-            self.log_activity("ENGINE", "RESUMED: execution (no timer)")
+            self.log_activity("ENGINE", "[RESUME] Execution resumed (no timer)")
         self._paused_timer_remaining = None
 
         self._save_timer()
@@ -1064,7 +1178,7 @@ class FundingArbEngine:
             self.log_activity("ENTRY", f"Entry COMPLETE: maker={result.total_maker_qty:.6f} taker={result.total_taker_qty:.6f} ({result.end_ts - result.start_ts:.1f}s)")
         else:
             self.log_activity("ENTRY", f"Entry FAILED: {result.error}", level="error")
-        self._log_trade("ENTRY", result)
+        self._log_trade("ENTRY", result, config=config)
         return result
 
     async def manual_exit(self, quantity: Decimal | None = None) -> ExecutionResult:
@@ -1116,8 +1230,12 @@ class FundingArbEngine:
             simulation=self.config.simulation,
             reduce_only=True,
             max_chunk_spread_usd=self.config.max_chunk_spread_usd,
-            min_spread_pct=self.config.min_spread_pct,
-            max_spread_pct=self.config.max_spread_pct,
+            # ── Exit uses its own spread thresholds, separate from entry ──
+            # Exit-spread direction is typically the mirror of entry-spread,
+            # so reusing entry thresholds would either always-pass or always-block.
+            # User configures these via UI in IDLE/HOLDING/PAUSED_EXITING states.
+            min_spread_pct=self.config.exit_min_spread_pct,
+            max_spread_pct=self.config.exit_max_spread_pct,
             use_depth_spread=self.config.fn_opt_depth_spread,
             max_slippage_bps=self.config.fn_opt_max_slippage_bps,
             taker_drift_guard=self.config.fn_opt_taker_drift_guard,
@@ -1129,6 +1247,13 @@ class FundingArbEngine:
         )
 
         self.log_activity("EXIT", f"Maker={maker_exch} {maker_side} {maker_symbol}, Taker={taker_exch} {taker_side} {taker_symbol}, qty={qty} (reduce_only)")
+        self.log_activity(
+            "EXIT",
+            f"Spread window for exit: [{config.min_spread_pct:+.4f}%, "
+            f"{config.max_spread_pct:+.4f}%] "
+            f"(entry window was [{self.config.min_spread_pct:+.4f}%, "
+            f"{self.config.max_spread_pct:+.4f}%])",
+        )
         logger.info(
             "Manual EXIT: maker=%s(%s %s) taker=%s(%s %s) qty=%s",
             maker_exch, maker_side, maker_symbol,
@@ -1140,7 +1265,7 @@ class FundingArbEngine:
             self.log_activity("EXIT", f"Exit COMPLETE: maker={result.total_maker_qty:.6f} taker={result.total_taker_qty:.6f} ({result.end_ts - result.start_ts:.1f}s)")
         else:
             self.log_activity("EXIT", f"Exit FAILED: {result.error}", level="error")
-        self._log_trade("EXIT", result)
+        self._log_trade("EXIT", result, config=config)
         return result
 
     # ── Status / Info ─────────────────────────────────────────────────
@@ -1309,6 +1434,8 @@ class FundingArbEngine:
                 "max_chunk_spread_usd": self.config.max_chunk_spread_usd,
                 "min_spread_pct": self.config.min_spread_pct,
                 "max_spread_pct": self.config.max_spread_pct,
+                "exit_min_spread_pct": self.config.exit_min_spread_pct,
+                "exit_max_spread_pct": self.config.exit_max_spread_pct,
                 "fn_opt_depth_spread": self.config.fn_opt_depth_spread,
                 "fn_opt_max_slippage_bps": self.config.fn_opt_max_slippage_bps,
                 "fn_opt_ohi_monitoring": self.config.fn_opt_ohi_monitoring,
@@ -1321,6 +1448,11 @@ class FundingArbEngine:
                 "fn_opt_shared_monitor_url": self.config.fn_opt_shared_monitor_url,
             },
             "trade_count": len(self._trade_log),
+            # Last 50 fills (newest first) for the BotDetailView's
+            # "Filled Orders" panel. Initial mount can also call the REST
+            # endpoint /fn/bots/{id}/fills (no limit) for the full history;
+            # subsequent SSE frames keep the live-tail in sync.
+            "fills": self.get_fill_log(limit=50),
             "activity_log": self.get_activity_log(limit=50),
         }
 
@@ -1373,7 +1505,9 @@ class FundingArbEngine:
     # ── Config updates ────────────────────────────────────────────────
 
     _HOT_UPDATE_KEYS = {
-        "min_spread_pct", "max_spread_pct", "max_chunk_spread_usd",
+        "min_spread_pct", "max_spread_pct",
+        "exit_min_spread_pct", "exit_max_spread_pct",
+        "max_chunk_spread_usd",
         "quantity", "twap_num_chunks", "twap_interval_s",
         "maker_timeout_ms", "maker_reprice_ticks", "maker_max_chase_rounds",
         "maker_offset_ticks", "simulation", "duration_h", "duration_m",
@@ -1390,10 +1524,24 @@ class FundingArbEngine:
 
         Most fields can be changed in IDLE, HOLDING, or PAUSED states.
         Exchange/instrument fields require IDLE (they trigger feed restarts).
+
+        ENTERING / EXITING are NOT editable — the in-flight MakerTakerConfig
+        is a snapshot taken at the start of execution, so live edits during
+        a running TWAP would not reach the chunk loop. To prevent silent
+        data loss, edits are rejected; user must Pause first.
         """
         sm_state = self._state_machine.state if self._state_machine else JobState.IDLE
         editable_states = {JobState.IDLE, JobState.HOLDING, JobState.PAUSED_ENTERING, JobState.PAUSED_EXITING}
         if sm_state not in editable_states:
+            if sm_state in (JobState.ENTERING, JobState.EXITING):
+                hot_keys = ", ".join(sorted(self._HOT_UPDATE_KEYS))
+                raise RuntimeError(
+                    f"[CONFIG-EDIT-REJECTED] Cannot update config while bot is "
+                    f"actively executing ({sm_state.value}). Pause the bot first "
+                    f"to edit hot-update fields ({hot_keys}). Editing during "
+                    f"active TWAP execution would create a state-snapshot "
+                    f"mismatch — the running chunk loop would not see your changes."
+                )
             raise RuntimeError(f"Cannot update config in state {sm_state.value}")
         if sm_state != JobState.IDLE:
             non_hot = {k for k in kwargs if k not in self._HOT_UPDATE_KEYS}
@@ -1537,29 +1685,132 @@ class FundingArbEngine:
                     exc,
                 )
 
-    def _log_trade(self, action: str, result: ExecutionResult) -> None:
-        """Append a trade entry to the log."""
+    def _log_trade(self, action: str, result: ExecutionResult, config: Any | None = None) -> None:
+        """Append a trade entry to the log.
+
+        ``config`` is the MakerTakerConfig that was active at execution
+        time. We use ``config.long_exchange`` and ``config.maker_exchange``
+        to pre-compute the long/short mapping per chunk. This is robust
+        across ENTRY (maker buys) and EXIT (maker sells) because the long
+        leg stays the long leg regardless of trade direction — only the
+        Buy/Sell side flips.
+
+        Storing the mapping at log time also protects against the user
+        editing engine.config.long_exchange later (the trade log preserves
+        the truth as-of-execution).
+
+        Spread is reported in USD per unit (long_price − short_price).
+        Negative = long leg was cheaper than short at fill = favourable
+        carry on entry; positive = cost on entry.
+        """
+        long_exch = getattr(config, "long_exchange", "") if config is not None else ""
+        maker_side = getattr(config, "maker_side", "") if config is not None else ""
+
+        chunks_out = []
+        for c in result.chunks:
+            # Map maker/taker → long/short by exchange identity. This is
+            # invariant under ENTRY/EXIT direction, unlike a maker_side
+            # check which would invert long/short on EXIT.
+            if long_exch and c.maker_exchange == long_exch:
+                long_exchange  = c.maker_exchange
+                long_qty       = c.maker_filled_qty
+                long_price     = c.maker_price
+                short_exchange = c.taker_exchange
+                short_qty      = c.taker_filled_qty
+                short_price    = c.taker_price
+            elif long_exch and c.taker_exchange == long_exch:
+                long_exchange  = c.taker_exchange
+                long_qty       = c.taker_filled_qty
+                long_price     = c.taker_price
+                short_exchange = c.maker_exchange
+                short_qty      = c.maker_filled_qty
+                short_price    = c.maker_price
+            else:
+                # Cannot determine roles — fall back to empty strings/0
+                # so the UI shows "—". Should not happen in practice
+                # because manual_entry/manual_exit always pass a config
+                # with long_exchange set.
+                long_exchange = ""
+                long_qty = 0.0
+                long_price = 0.0
+                short_exchange = ""
+                short_qty = 0.0
+                short_price = 0.0
+
+            spread_usd: float | None
+            if isinstance(long_price, (int, float)) and isinstance(short_price, (int, float)) \
+                    and long_price > 0 and short_price > 0:
+                spread_usd = float(long_price) - float(short_price)
+            else:
+                spread_usd = None
+
+            chunks_out.append({
+                "index": c.chunk_index,
+                "maker_exchange": c.maker_exchange,
+                "taker_exchange": c.taker_exchange,
+                "maker_qty": c.maker_filled_qty,
+                "taker_qty": c.taker_filled_qty,
+                "maker_price": c.maker_price,
+                "taker_price": c.taker_price,
+                "long_exchange": long_exchange,
+                "long_qty": long_qty,
+                "long_price": long_price,
+                "short_exchange": short_exchange,
+                "short_qty": short_qty,
+                "short_price": short_price,
+                "spread_usd": spread_usd,
+                "start_ts": c.start_ts,
+                "end_ts": c.end_ts,
+                "error": c.error,
+            })
+
         entry = {
             "action": action,
             "timestamp": time.time(),
             "success": result.success,
             "error": result.error,
+            "maker_side": maker_side,
             "total_maker_qty": result.total_maker_qty,
             "total_taker_qty": result.total_taker_qty,
             "num_chunks": len(result.chunks),
             "duration_s": result.end_ts - result.start_ts,
-            "chunks": [
-                {
-                    "index": c.chunk_index,
-                    "maker_qty": c.maker_filled_qty,
-                    "taker_qty": c.taker_filled_qty,
-                    "maker_price": c.maker_price,
-                    "taker_price": c.taker_price,
-                    "error": c.error,
-                }
-                for c in result.chunks
-            ],
+            "chunks": chunks_out,
         }
         self._trade_log.append(entry)
         logger.info("Trade logged: %s success=%s maker=%.6f taker=%.6f",
                      action, result.success, result.total_maker_qty, result.total_taker_qty)
+
+    def get_fill_log(self, limit: int | None = None) -> list[dict]:
+        """Flatten all chunks across all trades into a single chronological
+        fills list, newest first.
+
+        A "fill" here is one TWAP chunk that actually moved size on at
+        least one leg — empty/aborted chunks are skipped so the UI does
+        not show them. Each fill carries the long/short pre-mapping that
+        ``_log_trade`` computed at execution time, plus the spread in
+        USD per unit (long_price − short_price) at fill prices.
+        """
+        fills: list[dict] = []
+        for trade in self._trade_log:
+            action = trade.get("action", "")
+            for chunk in trade.get("chunks", []):
+                if (chunk.get("maker_qty", 0) or 0) <= 0 and (chunk.get("taker_qty", 0) or 0) <= 0:
+                    continue
+                ts = chunk.get("end_ts") or trade.get("timestamp", 0)
+                fills.append({
+                    "action": action,
+                    "chunk_index": chunk.get("index", 0),
+                    "long_exchange": chunk.get("long_exchange", ""),
+                    "long_qty": chunk.get("long_qty", 0),
+                    "long_price": chunk.get("long_price", 0),
+                    "short_exchange": chunk.get("short_exchange", ""),
+                    "short_qty": chunk.get("short_qty", 0),
+                    "short_price": chunk.get("short_price", 0),
+                    "spread_usd": chunk.get("spread_usd"),
+                    "ts": ts,
+                    "error": chunk.get("error"),
+                })
+        fills.sort(key=lambda f: f["ts"], reverse=True)
+        if limit:
+            return fills[:limit]
+        return fills

@@ -38,6 +38,13 @@ import { discoverPairs, DiscoveryResult } from "./lib/discovery";
 import { TAKER_FEE_PCT } from "./lib/arb";
 import { computeBookStats } from "./lib/book-stats";
 import { computeQuote, computeCrossQuote } from "./lib/quote";
+import { trackGoldSpread, getLatestGoldSpread } from "./lib/gold-spread";
+import {
+  evaluateTradeability,
+  tradeabilityKey,
+  type TradeabilityMap,
+  type TradeabilityResult,
+} from "./lib/tradeability";
 import type {
   Env,
   BookSnapshot,
@@ -57,7 +64,7 @@ const MAX_QUOTE_SUBS_PER_WS = 50;
 /** Coalesce quote pushes to at most once per this many ms. */
 const QUOTE_PUSH_MIN_INTERVAL_MS = 100;
 
-const SUPPORTED_EXCHANGES = ["extended", "grvt", "nado", "variational"] as const;
+const SUPPORTED_EXCHANGES = ["extended", "grvt", "nado", "variational", "risex"] as const;
 type SupportedExchange = (typeof SUPPORTED_EXCHANGES)[number];
 
 /**
@@ -97,9 +104,40 @@ function buildScannerMeta(
 }
 
 export class AggregatorDO extends DurableObject<Env> {
+  private corsHeaders(origin = "*"): Record<string, string> {
+    return {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+  }
+
+  private handleOptions(req: Request): Response {
+    const origin = req.headers.get("Origin") || "*";
+    return new Response(null, {
+      status: 204,
+      headers: this.corsHeaders(origin),
+    });
+  }
+
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+    // Resolve once up-front so CORS-relevant routes can pass it without
+    // having to reach further down the function.
+    const origin = req.headers.get("Origin") || "*";
+
+    // CORS preflight for browser-consumed routes.
+    if (
+      req.method === "OPTIONS" &&
+      (path.startsWith("/meta") ||
+        path.startsWith("/quote") ||
+        path.startsWith("/book") ||
+        path.startsWith("/tradeability") ||
+        path === "/tracked/legs")
+    ) {
+      return this.handleOptions(req);
+    }
 
     if (path === "/ws") return this.handleWsUpgrade(req);
 
@@ -111,8 +149,31 @@ export class AggregatorDO extends DurableObject<Env> {
       });
     }
 
-    if (path === "/tracked") return this.json(await this.trackedSnapshot());
+    if (path === "/tracked") {
+      // V1-compatible shape: { "<TOKEN>": { "<exchange>": "<symbol>" } }
+      // Python clients (app/symbol_resolver.py) depend on this exact shape;
+      // do not change without coordinating. Annotated tradeability lives at
+      // /tracked/legs instead.
+      return this.json(await this.trackedSnapshot(), 200, origin);
+    }
+    if (path === "/tracked/legs") {
+      // Annotated variant: every per-exchange leg gains `tradeable` +
+      // `reason` so the frontend can hide non-tradeable exchanges in the
+      // bot-create flow. Defaults to tradeable=true when no check has run
+      // yet (worker cold start).
+      const annotated = await this.trackedSnapshotAnnotated();
+      return this.json(annotated, 200, origin);
+    }
     if (path === "/status") return this.json(await this.statusSnapshot());
+
+    // Latest computed PAXG/XAUT spread point. Cheap (in-memory cache only).
+    if (path === "/gold-spread/latest") {
+      const point = getLatestGoldSpread();
+      if (!point) {
+        return this.json({ error: "no gold spread data yet" }, 404);
+      }
+      return this.json(point);
+    }
 
     if (path === "/discovery") {
       const stored = (await this.ctx.storage.get<DiscoveryResult>("discovery")) ?? null;
@@ -124,6 +185,7 @@ export class AggregatorDO extends DurableObject<Env> {
           grvt: stored.symbolsByExchange.grvt.length,
           nado: stored.symbolsByExchange.nado.length,
           variational: stored.symbolsByExchange.variational.length,
+          risex: stored.symbolsByExchange.risex.length,
         },
         meta_summary: {
           extended_markets_with_lev: Object.keys(stored.meta.maxLeverage.extended ?? {}).length,
@@ -138,17 +200,40 @@ export class AggregatorDO extends DurableObject<Env> {
       return this.json(res);
     }
 
-    // Phase E: /meta
+    // Tradeability endpoints (Nado/ARB-style guard against listed-but-dead
+    // symbols). The map is rebuilt by runTradeabilityCheck() on every cron
+    // tick; the frontend reads it to hide non-tradeable exchanges in the
+    // bot-create flow.
+    if (path === "/tradeability") {
+      const map = await this.getTradeabilityMap();
+      return this.json(map, 200, origin);
+    }
+    if (path === "/tradeability/run") {
+      const stats = await this.runTradeabilityCheck();
+      return this.json(stats, 200, origin);
+    }
+    const tradeMatch = path.match(/^\/tradeability\/([a-z]+)\/([A-Za-z0-9._-]+)$/);
+    if (tradeMatch) {
+      const map = await this.getTradeabilityMap();
+      const key = tradeabilityKey(tradeMatch[1]!, tradeMatch[2]!);
+      const entry = map[key];
+      if (!entry) {
+        return this.json({ error: `no tradeability data for ${key}` }, 404, origin);
+      }
+      return this.json({ key, ...entry }, 200, origin);
+    }
+
+    // Phase E: /meta (CORS-enabled for browser-based frontend)
     if (path === "/meta") {
-      return this.handleMetaAll();
+      return this.handleMetaAll(origin);
     }
     const metaExchMatch = path.match(/^\/meta\/([a-z]+)$/);
     if (metaExchMatch) {
-      return this.handleMetaPerExchange(metaExchMatch[1]!);
+      return this.handleMetaPerExchange(metaExchMatch[1]!, origin);
     }
     const metaSymMatch = path.match(/^\/meta\/([a-z]+)\/([A-Za-z0-9._-]+)$/);
     if (metaSymMatch) {
-      return this.handleMetaPerSymbol(metaSymMatch[1]!, metaSymMatch[2]!);
+      return this.handleMetaPerSymbol(metaSymMatch[1]!, metaSymMatch[2]!, origin);
     }
 
     // Phase E: /quote
@@ -160,7 +245,16 @@ export class AggregatorDO extends DurableObject<Env> {
       return this.handleQuoteRest(quoteMatch[1]!, quoteMatch[2]!, url);
     }
 
-    const bookMatch = path.match(/^\/book\/([a-z]+)\/([A-Za-z0-9._-]+)$/);
+    // Symbol patterns vary across exchanges:
+    //   extended      "BTC-USD"
+    //   grvt          "BTC_USDT_Perp"
+    //   nado          "BTC-PERP"
+    //   variational   "P-BTC-USDC-3600"
+    //   risex         "BTC/USDC"  ← contains a slash
+    // The previous regex restricted the symbol to [A-Za-z0-9._-]+ which
+    // rejected RISEx symbols outright. We now accept any non-empty path
+    // segment (`.+`) so the slash passes through unchanged.
+    const bookMatch = path.match(/^\/book\/([a-z]+)\/(.+)$/);
     if (bookMatch) {
       const exchange = bookMatch[1].toLowerCase();
       const symbol = bookMatch[2]!;
@@ -178,6 +272,10 @@ export class AggregatorDO extends DurableObject<Env> {
 
   async onBookUpdate(snap: BookSnapshot): Promise<void> {
     const key = `${snap.exchange}:${snap.symbol}`;
+    // Gold-spread tracking: throttled write to Analytics Engine whenever a
+    // Variational PAXG/XAUT update arrives and the counter-leg book is fresh.
+    // No-op for any other (exchange, symbol) tuple.
+    trackGoldSpread(this.env.GOLD_SPREAD, snap);
     // Phase E: precompute cheap stats once and attach to every fan-out.
     const stats = computeBookStats(snap);
     const bookPayload = JSON.stringify({
@@ -232,6 +330,12 @@ export class AggregatorDO extends DurableObject<Env> {
       );
       tasks.push(v.ensureTracking(result.symbolsByExchange.variational));
     }
+    if (result.symbolsByExchange.risex.length > 0) {
+      const r = this.env.RISEX_OMS.get(
+        this.env.RISEX_OMS.idFromName("singleton"),
+      );
+      tasks.push(r.ensureTracking(result.symbolsByExchange.risex));
+    }
 
     const scanner = this.env.ARB_SCANNER.get(
       this.env.ARB_SCANNER.idFromName("singleton"),
@@ -249,8 +353,172 @@ export class AggregatorDO extends DurableObject<Env> {
         grvt: result.symbolsByExchange.grvt.length,
         nado: result.symbolsByExchange.nado.length,
         variational: result.symbolsByExchange.variational.length,
+        risex: result.symbolsByExchange.risex.length,
       },
     };
+  }
+
+  // ── Tradeability (cron entry point) ─────────────────────────────
+
+  /**
+   * Walk every (exchange, symbol) currently in discovery and check whether
+   * its order book is two-sided, fresh, and connected. Persist the result
+   * so /tracked can annotate `tradeable: false` on dead legs.
+   *
+   * Called by the scheduled cron handler in src/index.ts every 15 min,
+   * which exceeds the once-per-hour cadence the user requested. Doing it
+   * on the discovery cron also means the result picks up newly-tracked
+   * symbols within one tick instead of waiting for a separate alarm.
+   */
+  async runTradeabilityCheck(): Promise<{
+    ok: true;
+    checked: number;
+    tradeable: number;
+    untradeable: number;
+    untradeable_keys: string[];
+  }> {
+    const stored = await this.ctx.storage.get<DiscoveryResult>("discovery");
+    if (!stored) {
+      return { ok: true, checked: 0, tradeable: 0, untradeable: 0, untradeable_keys: [] };
+    }
+
+    // Build the full list of (exchange, symbol) to evaluate. We use
+    // symbolsByExchange so a symbol is only checked against exchanges that
+    // actually advertise it.
+    const targets: Array<[string, string]> = [];
+    for (const sym of stored.symbolsByExchange.extended) targets.push(["extended", sym]);
+    for (const sym of stored.symbolsByExchange.grvt) targets.push(["grvt", sym]);
+    for (const entry of stored.symbolsByExchange.nado) targets.push(["nado", entry.symbol]);
+    for (const sym of stored.symbolsByExchange.variational) targets.push(["variational", sym]);
+    // RISEx symbols are already in canonical "BTC/USDC" form once discovery
+    // has run — entry.symbol therefore matches both the pair-map and the
+    // RisexOms storage key directly, no extra suffixing required.
+    for (const entry of stored.symbolsByExchange.risex) {
+      targets.push(["risex", entry.symbol]);
+    }
+
+    // Fan out book lookups in parallel; each one is an in-process DO RPC
+    // (cheap). Cap concurrency by chunking — Cloudflare workers do not have
+    // a hard limit but `Promise.all` over hundreds of RPCs can spike CPU.
+    const CHUNK = 32;
+    const results: Array<[string, TradeabilityResult]> = [];
+    for (let i = 0; i < targets.length; i += CHUNK) {
+      const slice = targets.slice(i, i + CHUNK);
+      const books = await Promise.all(
+        slice.map(([exch, sym]) =>
+          this.fetchBookFromExchange(exch, sym).catch(() => null),
+        ),
+      );
+      for (let j = 0; j < slice.length; j++) {
+        const [exch, sym] = slice[j]!;
+        const result = evaluateTradeability(books[j] ?? null);
+        results.push([tradeabilityKey(exch, sym), result]);
+      }
+    }
+
+    const map: TradeabilityMap = {};
+    let tradeable = 0;
+    let untradeable = 0;
+    const untradeableKeys: string[] = [];
+    for (const [key, r] of results) {
+      map[key] = r;
+      if (r.tradeable) tradeable += 1;
+      else {
+        untradeable += 1;
+        untradeableKeys.push(key);
+      }
+    }
+
+    await this.ctx.storage.put("tradeability", map);
+
+    // Propagate to ArbScannerDO so the DNA-bot opportunity feed filters
+    // out non-tradeable legs (crossed_book / spread_too_wide / stale —
+    // cases that lib/arb.ts cannot detect on its own). Best-effort: a
+    // failed RPC just leaves the scanner with the previous map until the
+    // next cron tick.
+    try {
+      const scanner = this.env.ARB_SCANNER.get(
+        this.env.ARB_SCANNER.idFromName("singleton"),
+      );
+      await (scanner as any).updateTradeability(map);
+    } catch (e) {
+      console.warn(
+        "tradeability propagate to scanner failed:",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+
+    return {
+      ok: true,
+      checked: results.length,
+      tradeable,
+      untradeable,
+      untradeable_keys: untradeableKeys,
+    };
+  }
+
+  async getTradeabilityMap(): Promise<TradeabilityMap> {
+    return (await this.ctx.storage.get<TradeabilityMap>("tradeability")) ?? {};
+  }
+
+  /**
+   * Bootstrap RPC: ArbScannerDO calls this on cold start so it can apply
+   * the leg-liveness filter immediately instead of waiting for the next
+   * cron tick (max. 15 min away). Mirrors the pattern of
+   * getDiscoveryForScanner above.
+   */
+  async getTradeabilityForScanner(): Promise<TradeabilityMap> {
+    return this.getTradeabilityMap();
+  }
+
+  /**
+   * Annotated /tracked output. Each per-exchange leg gains a `tradeable`
+   * boolean (default true if we haven't checked yet) and a `reason` string
+   * when not tradeable. The shape stays backwards-compatible for callers
+   * that only read `pairs[token][exchange]` as a symbol string by exposing
+   * both `pairs` and `legs`:
+   *   pairs:  { ARB: { extended: "ARB-USD", nado: "ARB-PERP", ... } }
+   *   legs:   { ARB: { extended: { symbol, tradeable, reason }, ... } }
+   * Existing V1 bot clients only consume `pairs`; the frontend reads `legs`.
+   */
+  private async trackedSnapshotAnnotated(): Promise<{
+    pairs: DiscoveredPairs;
+    legs: Record<
+      string,
+      Record<
+        string,
+        { symbol: string; tradeable: boolean; reason: string | null; checked_at: number | null }
+      >
+    >;
+  }> {
+    const pairs = await this.trackedSnapshot();
+    const tmap = await this.getTradeabilityMap();
+    const legs: Record<
+      string,
+      Record<
+        string,
+        { symbol: string; tradeable: boolean; reason: string | null; checked_at: number | null }
+      >
+    > = {};
+    for (const [token, exchMap] of Object.entries(pairs)) {
+      const out: Record<
+        string,
+        { symbol: string; tradeable: boolean; reason: string | null; checked_at: number | null }
+      > = {};
+      for (const [exch, sym] of Object.entries(exchMap)) {
+        const t = tmap[tradeabilityKey(exch, sym)];
+        out[exch] = {
+          symbol: sym,
+          // Default `true` when we have no data yet — avoids false negatives
+          // during a worker cold start.
+          tradeable: t ? t.tradeable : true,
+          reason: t?.reason ?? null,
+          checked_at: t?.checked_at ?? null,
+        };
+      }
+      legs[token] = out;
+    }
+    return { pairs, legs };
   }
 
   /**
@@ -270,34 +538,34 @@ export class AggregatorDO extends DurableObject<Env> {
 
   // ── Phase E: /meta REST ──────────────────────────────────────────
 
-  private async handleMetaAll(): Promise<Response> {
+  private async handleMetaAll(origin: string): Promise<Response> {
     const stored = await this.ctx.storage.get<DiscoveryResult>("discovery");
-    if (!stored) return this.json({ error: "discovery not bootstrapped yet" }, 503);
+    if (!stored) return this.json({ error: "discovery not bootstrapped yet" }, 503, origin);
 
     const out: SymbolMeta[] = [];
     for (const exch of SUPPORTED_EXCHANGES) {
       out.push(...this.collectMetaForExchange(stored, exch));
     }
-    return this.json(out);
+    return this.json(out, 200, origin);
   }
 
-  private async handleMetaPerExchange(exch: string): Promise<Response> {
+  private async handleMetaPerExchange(exch: string, origin: string): Promise<Response> {
     const stored = await this.ctx.storage.get<DiscoveryResult>("discovery");
-    if (!stored) return this.json({ error: "discovery not bootstrapped yet" }, 503);
+    if (!stored) return this.json({ error: "discovery not bootstrapped yet" }, 503, origin);
     if (!SUPPORTED_EXCHANGES.includes(exch as SupportedExchange)) {
-      return this.json({ error: `unsupported exchange: ${exch}` }, 400);
+      return this.json({ error: `unsupported exchange: ${exch}` }, 400, origin);
     }
-    return this.json(this.collectMetaForExchange(stored, exch as SupportedExchange));
+    return this.json(this.collectMetaForExchange(stored, exch as SupportedExchange), 200, origin);
   }
 
-  private async handleMetaPerSymbol(exch: string, symbol: string): Promise<Response> {
+  private async handleMetaPerSymbol(exch: string, symbol: string, origin: string): Promise<Response> {
     const stored = await this.ctx.storage.get<DiscoveryResult>("discovery");
-    if (!stored) return this.json({ error: "discovery not bootstrapped yet" }, 503);
+    if (!stored) return this.json({ error: "discovery not bootstrapped yet" }, 503, origin);
     const meta = this.resolveSymbolMeta(stored, exch, symbol);
     if (!meta) {
-      return this.json({ error: `no meta for ${exch}:${symbol}` }, 404);
+      return this.json({ error: `no meta for ${exch}:${symbol}` }, 404, origin);
     }
-    return this.json(meta);
+    return this.json(meta, 200, origin);
   }
 
   private collectMetaForExchange(
@@ -357,7 +625,7 @@ export class AggregatorDO extends DurableObject<Env> {
       maker_fee_pct: null,
       funding_interval_s: exch === "variational"
         ? this.inferVariationalFundingInterval(symbol)
-        : exch === "grvt" || exch === "extended" || exch === "nado"
+        : exch === "grvt" || exch === "extended" || exch === "nado" || exch === "risex"
           ? 3600
           : null,
     };
@@ -888,6 +1156,14 @@ export class AggregatorDO extends DurableObject<Env> {
         this.env.VARIATIONAL_OMS.idFromName("singleton"),
       );
       res = (await s.getBook(symbol)) as BookSnapshot | null;
+    } else if (exchange === "risex") {
+      // RisexOms keys books by the canonical RISEx symbol "BTC/USDC" — same
+      // string used by the pair map, the bot config and the upstream API,
+      // so we pass the symbol straight through.
+      const s = this.env.RISEX_OMS.get(
+        this.env.RISEX_OMS.idFromName("singleton"),
+      );
+      res = (await s.getBook(symbol)) as BookSnapshot | null;
     }
     return res;
   }
@@ -908,6 +1184,7 @@ export class AggregatorDO extends DurableObject<Env> {
       ["grvt", stored.symbolsByExchange.grvt],
       ["variational", stored.symbolsByExchange.variational],
       ["nado", stored.symbolsByExchange.nado.map((x) => x.symbol)],
+      ["risex", stored.symbolsByExchange.risex.map((x) => x.symbol)],
     ];
 
     const MAX = 400;
@@ -962,11 +1239,12 @@ export class AggregatorDO extends DurableObject<Env> {
     try { ws.send(JSON.stringify(data)); } catch { /* ignore */ }
   }
 
-  private json(data: unknown, status = 200): Response {
-    return new Response(JSON.stringify(data, null, 2), {
-      status,
-      headers: { "content-type": "application/json" },
-    });
+  private json(data: unknown, status = 200, corsOrigin: string | null = null): Response {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (corsOrigin) {
+      Object.assign(headers, this.corsHeaders(corsOrigin));
+    }
+    return new Response(JSON.stringify(data, null, 2), { status, headers });
   }
 }
 

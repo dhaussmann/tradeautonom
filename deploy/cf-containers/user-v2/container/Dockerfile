@@ -44,7 +44,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # producing stale images that look "deployed" but contain old code.
 # Bump the version suffix on every code change you want forced into the
 # next build; keeps the tag short while still acting as a cache-buster.
-ENV V2_BUILD_TAG=repair-ioc-diagnostics-v40
+ENV V2_BUILD_TAG=dna-cooldown-after-close-v54
 
 # App code. V2 is HEADLESS — no static/ directory, no /ui route. The
 # user-facing Vue SPA lives on bot.defitool.de (see deploy/cloudflare/).

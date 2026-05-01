@@ -47,6 +47,17 @@ const helpContent: Record<string, { title: string; steps: { text: string; link?:
       { text: 'Your wallet key never leaves MetaMask \u2014 only a signature is sent' },
     ],
   },
+  RISEx: {
+    title: 'HOW TO GET YOUR SIGNER KEY:',
+    steps: [
+      { text: 'Create an account at rise.trade', link: 'https://app.rise.trade' },
+      { text: 'Deposit USDC to your RISEx account' },
+      { text: 'Go to Settings \u2192 API / Signers' },
+      { text: 'Register a new signer key (or generate one)' },
+      { text: 'Copy the ', bold: 'Signer Private Key', text2: ' and your wallet address' },
+      { text: 'The signer key signs trade permits \u2014 it cannot withdraw funds' },
+    ],
+  },
 }
 
 function toggleHelp(group: string) {
@@ -62,9 +73,11 @@ const keyFields = [
   { key: 'extended_private_key', label: 'Private Key', group: 'Extended' },
   { key: 'extended_vault', label: 'Vault ID', group: 'Extended' },
   { key: 'variational_jwt_token', label: 'JWT Token', group: 'Variational' },
+  { key: 'risex_account_address', label: 'Wallet Address', group: 'RISEx' },
+  { key: 'risex_signer_key', label: 'Signer Private Key', group: 'RISEx' },
 ]
 
-const groups = ['GRVT', 'Extended', 'Variational', 'NADO']
+const groups = ['GRVT', 'Extended', 'Variational', 'NADO', 'RISEx']
 
 // Current masked values from D1
 const masked = ref<Record<string, string>>({})

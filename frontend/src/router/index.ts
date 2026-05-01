@@ -9,6 +9,15 @@ const routes = [
     meta: { public: true },
   },
   {
+    // Always-reachable logout escape hatch. `meta.public` makes the auth
+    // guard a no-op so the user can sign out from any state — including
+    // unauthenticated, vault-locked, or stuck on a broken sub-screen.
+    path: '/logout',
+    name: 'logout',
+    component: () => import('@/views/LogoutView.vue'),
+    meta: { public: true },
+  },
+  {
     path: '/',
     name: 'dashboard',
     component: () => import('@/views/DashboardView.vue'),
@@ -58,6 +67,11 @@ const routes = [
     path: '/dna',
     name: 'dna',
     component: () => import('@/views/DnaView.vue'),
+  },
+  {
+    path: '/gold-spread',
+    name: 'gold-spread',
+    component: () => import('@/views/GoldSpreadView.vue'),
   },
   {
     path: '/settings',

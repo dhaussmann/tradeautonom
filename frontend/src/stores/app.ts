@@ -103,10 +103,32 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  /**
+   * Reset all session-scoped state. Called by /logout so the next user's
+   * session starts clean — no leftover vault flags, no stale connected
+   * status, no error messages from a previous failed unlock.
+   *
+   * `connected` and `backendEnv` are also reset because they reflect the
+   * /health endpoint of the previous user's container; the next session
+   * will repopulate them via App.vue's onMounted hook.
+   */
+  function resetSession() {
+    connected.value = false
+    backendEnv.value = ''
+    error.value = null
+    vaultLocked.value = false
+    vaultSetupRequired.value = false
+    vaultUnlocked.value = false
+    vaultChecked.value = false
+    vaultError.value = null
+    d1HasKeys.value = false
+    autoInjected.value = false
+  }
+
   return {
     connected, backendEnv, error, checkHealth,
     vaultLocked, vaultSetupRequired, vaultUnlocked, vaultChecked, vaultError,
     d1HasKeys, autoInjected, needsVaultAction, needsKeySetup,
-    checkVault, unlockVault, setupVault, saveKeys,
+    checkVault, unlockVault, setupVault, saveKeys, resetSession,
   }
 })

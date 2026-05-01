@@ -4,8 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { useBotStream } from '@/composables/useBotStream'
 import { useBotsStore } from '@/stores/bots'
 import { useAccountStore } from '@/stores/account'
-import { updateBotConfig, adjustBotTimer } from '@/lib/api'
+import { updateBotConfig, adjustBotTimer, fetchBotFills } from '@/lib/api'
 import { fetchMarketsBySymbol, type MarketEntry } from '@/lib/defi-api'
+import type { FillEntry } from '@/types/bot'
 import Typography from '@/components/ui/Typography.vue'
 import Button from '@/components/ui/Button.vue'
 import Chip from '@/components/ui/Chip.vue'
@@ -65,14 +66,92 @@ const editQtyValue = ref(0)
 const showLevPopover = ref(false)
 const editLevValue = ref(0)
 
-// Spread popovers
+// Spread popovers — Entry
 const showSpreadPopover = ref(false)
 const editSpreadValue = ref(0.5)
 const showMinSpreadPopover = ref(false)
 const editMinSpreadValue = ref(-0.5)
+// Spread popovers — Exit (separate thresholds, applied during manual_exit)
+const showExitMaxSpreadPopover = ref(false)
+const editExitMaxSpreadValue = ref(0.05)
+const showExitMinSpreadPopover = ref(false)
+const editExitMinSpreadValue = ref(-0.5)
 
 // Advanced settings panel
 const showAdvancedPanel = ref(false)
+
+// ── Filled Orders ─────────────────────────────────
+// Strategy: load the FULL history once via REST on mount, then merge
+// new fills from the SSE-streamed `status.fills` (last-50 tail) using
+// a (action, chunk_index, ts) composite key. This keeps the bandwidth
+// small while letting the user scroll through the entire trade history.
+const allFills = ref<FillEntry[]>([])
+const fillsLoaded = ref(false)
+const fillsLoadError = ref<string | null>(null)
+
+function fillKey(f: FillEntry): string {
+  return `${f.action}:${f.chunk_index}:${f.ts}`
+}
+
+function mergeFills(incoming: FillEntry[]) {
+  if (!incoming || incoming.length === 0) return
+  const seen = new Set(allFills.value.map(fillKey))
+  let added = 0
+  for (const f of incoming) {
+    const k = fillKey(f)
+    if (!seen.has(k)) {
+      allFills.value.push(f)
+      seen.add(k)
+      added++
+    }
+  }
+  if (added > 0) {
+    allFills.value.sort((a, b) => b.ts - a.ts)
+  }
+}
+
+/**
+ * Format a USD spread value with dynamic precision so it reads well
+ * across the full range of asset prices the bot trades:
+ *   - BTC fills can produce spreads of several dollars → 2 decimals
+ *   - mid-range assets (ARB, UNI) sit around 0.01–0.5 → 4 decimals
+ *   - very tight spreads on low-priced assets → 6 decimals
+ * Sign is always rendered (+ for positive, − for negative) so the
+ * carry direction is unambiguous.
+ */
+function formatSpreadUsd(v: number | null): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—'
+  const abs = Math.abs(v)
+  let decimals: number
+  if (abs >= 1) decimals = 2
+  else if (abs >= 0.01) decimals = 4
+  else decimals = 6
+  const sign = v >= 0 ? '+' : '−'
+  return `${sign}$${abs.toFixed(decimals)}`
+}
+
+async function loadFillsHistory() {
+  if (!botId.value) return
+  fillsLoadError.value = null
+  try {
+    const resp = await fetchBotFills(botId.value, 0)
+    allFills.value = (resp.fills ?? []).slice().sort((a, b) => b.ts - a.ts)
+    fillsLoaded.value = true
+  } catch (e) {
+    fillsLoadError.value = e instanceof Error ? e.message : String(e)
+    fillsLoaded.value = true
+  }
+}
+
+// Watch SSE-streamed fills tail and merge any new ones into the full list.
+watch(
+  () => status.value?.fills,
+  (incoming) => {
+    if (!fillsLoaded.value) return
+    if (incoming && incoming.length > 0) mergeFills(incoming as FillEntry[])
+  },
+  { deep: false },
+)
 
 // Local refs for numeric inputs (prevents SSE overwrite while editing)
 const localSlippageBps = ref(10)
@@ -100,9 +179,40 @@ const canStart = computed(() => status.value?.state === 'IDLE')
 const canStop = computed(() => status.value?.is_running || status.value?.state === 'HOLDING')
 const canPause = computed(() => status.value?.state === 'ENTERING' || status.value?.state === 'EXITING')
 const canResume = computed(() => status.value?.state === 'PAUSED_ENTERING' || status.value?.state === 'PAUSED_EXITING')
-const canEditSpread = computed(() => {
+// Hot-update fields (min/max spread, timeouts, chase rounds, etc.) can be
+// edited only in IDLE/HOLDING/PAUSED. ENTERING/EXITING are blocked because
+// the in-flight MakerTakerConfig is a snapshot — edits would not reach the
+// running chunk loop. Backend rejects with [CONFIG-EDIT-REJECTED] in that case.
+const canEditHotConfig = computed(() => {
   const s = status.value?.state
   return s === 'IDLE' || s === 'HOLDING' || s === 'PAUSED_ENTERING' || s === 'PAUSED_EXITING'
+})
+// Backwards-compatible alias used by Min/Max-Spread pills.
+const canEditSpread = canEditHotConfig
+
+// Current ChunkState (SPREAD_WAIT, MAKER_PLACE, MAKER_WAIT, TAKER_HEDGE,
+// REPAIR, VERIFY, CHUNK_DONE, or null when idle). Used for the pause banner
+// and other phase-aware UI hints.
+const chunkPhase = computed(() => status.value?.execution?.chunk_state ?? null)
+
+// ── Per-exchange auth-health banners ─────────────────
+// The /account/health endpoint reports per-exchange auth state. Currently
+// only Variational publishes a meaningful tracker (auth_status.ok=false on
+// 401/403). When a bot uses Variational on either leg AND that exchange
+// reports an auth failure, we surface a clear banner so the user knows to
+// refresh the vr-token in Settings instead of staring at an empty position.
+const usesVariational = computed(() => {
+  return longEx.value === 'variational' || shortEx.value === 'variational'
+})
+const variationalHealth = computed(() => {
+  return accountStore.health?.variational ?? null
+})
+const variationalAuthBroken = computed(() => {
+  const h = variationalHealth.value
+  return !!(h && h.tracked && h.ok === false && (h.last_status_code === 401 || h.last_status_code === 403))
+})
+const variationalAuthHint = computed(() => {
+  return variationalHealth.value?.last_error ?? 'Variational authentication failed'
 })
 
 const stateLabel = computed(() => {
@@ -150,9 +260,37 @@ const quantityPillLabel = computed(() => {
 
 const rawLeverage = computed(() => status.value?.leverage?.long ?? 0)
 const rawMinSpread = computed(() => status.value?.config.min_spread_pct ?? -0.5)
-const rawMaxSpread = computed(() => status.value?.config.max_spread_pct ?? 0.5)
-const minSpreadPillLabel = computed(() => `↓ ${rawMinSpread.value}%`)
-const spreadPillLabel = computed(() => `↑ ${rawMaxSpread.value}%`)
+// Backend defaults are 0.05 (engine.py:68, config.py:99). The previous
+// 0.5 fallback created a brief mismatch on initial SSE load before the
+// real config arrived — harmless but confusing in the pill label.
+const rawMaxSpread = computed(() => status.value?.config.max_spread_pct ?? 0.05)
+const rawExitMinSpread = computed(() => status.value?.config.exit_min_spread_pct ?? -0.5)
+const rawExitMaxSpread = computed(() => status.value?.config.exit_max_spread_pct ?? 0.05)
+// Pills use ≥ / ≤ to make explicit that these are the range bounds of a
+// closed interval [min, max] in which the bot is allowed to trade. The
+// state-machine gate (state_machine.py:1609,1628) blocks placement when
+// current spread < min or > max — both sides are hard limits, not "best"
+// or "worst" hints.
+const minSpreadPillLabel = computed(() => `Entry ≥ ${rawMinSpread.value}%`)
+const spreadPillLabel = computed(() => `Entry ≤ ${rawMaxSpread.value}%`)
+const exitMinSpreadPillLabel = computed(() => `Exit ≥ ${rawExitMinSpread.value}%`)
+const exitMaxSpreadPillLabel = computed(() => `Exit ≤ ${rawExitMaxSpread.value}%`)
+
+// Phase-aware tooltip hints — alle Pillen sind in PAUSED_*-States editierbar
+// (laut Entscheidung B), aber ein Edit am "falschen" Set wirkt erst auf den
+// nächsten Cycle. Tooltip macht das transparent.
+const entrySpreadHint = computed(() => {
+  if (status.value?.state === 'PAUSED_EXITING')
+    return 'Greift erst beim nächsten Entry (nicht im aktuellen Exit)'
+  return ''
+})
+const exitSpreadHint = computed(() => {
+  if (status.value?.state === 'PAUSED_ENTERING')
+    return 'Greift erst beim nächsten Exit (nicht im aktuellen Entry)'
+  return ''
+})
+
+
 
 const leverageLabel = computed(() => {
   if (!status.value) return '—'
@@ -226,6 +364,13 @@ const TOOLTIPS: Record<string, string> = {
   fn_opt_funding_history: 'Prüft historische Funding-Rate-Konsistenz via fundingrate.de API. Ein niedriger Konsistenz-Score bedeutet das die Spread-Opportunität instabil war — der Bot blockt den Entry bis der Score über dem Threshold liegt.',
   fn_opt_dynamic_sizing: 'Berechnet die Positionsgröße automatisch aus verfügbarem Kapital, Liquidität beider Orderbücher und dem Max-Slippage-Budget. Verhindert zu große Orders die das Buch bewegen würden.',
   fn_opt_taker_drift_guard: 'Überwacht den Taker-Preis während der Maker-Order wartet. Wenn der Taker-Preis um mehr als N bps driftet wird die Maker-Order gecancelt und der Chunk neu gestartet — schützt vor nachteiligen Fills.',
+  // Spread-window explainers — shown via the ⓘ button next to the popover
+  // header so the popover itself stays compact (no multi-line subtitles
+  // that would push the input off-screen on narrow layouts).
+  spread_entry_min: 'Spread must not drop below this value. Acts as a safety floor against stale-book outliers (e.g. one venue freezes while the other moves). Default: −0.5 %.',
+  spread_entry_max: 'Spread must not exceed this value. Caps the cost of opening the position — a positive spread means you pay to enter. Default: +0.05 %.',
+  spread_exit_min: 'Spread must not drop below this value during exit. Safety floor against stale-book outliers while closing. Default: −0.5 %.',
+  spread_exit_max: 'Spread must not exceed this value during exit. Caps the cost of closing the position. Default: +0.05 %.',
 }
 
 // Depth Spread Analysis from SSE
@@ -363,9 +508,13 @@ function formatPnl(val: number | string | undefined): string {
 // ── Popover edit actions ─────────────────────────────
 function openQtyEditor() {
   editQtyValue.value = rawQuantity.value || 1
-  showQtyPopover.value = !showQtyPopover.value
+  const wasOpen = showQtyPopover.value
   showLevPopover.value = false
   showSpreadPopover.value = false
+  showMinSpreadPopover.value = false
+  showExitMaxSpreadPopover.value = false
+  showExitMinSpreadPopover.value = false
+  showQtyPopover.value = !wasOpen
 }
 
 async function saveQty() {
@@ -377,9 +526,13 @@ async function saveQty() {
 
 function openLevEditor() {
   editLevValue.value = rawLeverage.value || 1
-  showLevPopover.value = !showLevPopover.value
+  const wasOpen = showLevPopover.value
   showQtyPopover.value = false
   showSpreadPopover.value = false
+  showMinSpreadPopover.value = false
+  showExitMaxSpreadPopover.value = false
+  showExitMinSpreadPopover.value = false
+  showLevPopover.value = !wasOpen
 }
 
 async function saveLev() {
@@ -389,12 +542,21 @@ async function saveLev() {
   }
 }
 
-function openMinSpreadEditor() {
-  editMinSpreadValue.value = rawMinSpread.value
-  showMinSpreadPopover.value = !showMinSpreadPopover.value
+// Helper to close all spread popovers (used when opening any one of them)
+function _closeAllSpreadPopovers() {
   showSpreadPopover.value = false
+  showMinSpreadPopover.value = false
+  showExitMaxSpreadPopover.value = false
+  showExitMinSpreadPopover.value = false
   showQtyPopover.value = false
   showLevPopover.value = false
+}
+
+function openMinSpreadEditor() {
+  editMinSpreadValue.value = rawMinSpread.value
+  const wasOpen = showMinSpreadPopover.value
+  _closeAllSpreadPopovers()
+  showMinSpreadPopover.value = !wasOpen
 }
 
 async function saveMinSpread() {
@@ -407,10 +569,9 @@ async function saveMinSpread() {
 
 function openSpreadEditor() {
   editSpreadValue.value = rawMaxSpread.value
-  showSpreadPopover.value = !showSpreadPopover.value
-  showMinSpreadPopover.value = false
-  showQtyPopover.value = false
-  showLevPopover.value = false
+  const wasOpen = showSpreadPopover.value
+  _closeAllSpreadPopovers()
+  showSpreadPopover.value = !wasOpen
 }
 
 async function saveSpread() {
@@ -421,6 +582,37 @@ async function saveSpread() {
   // than long leg", e.g. -0.02 demands ≥ 2 bp favour before placing a maker.
   if (!isNaN(val)) {
     try { await updateBotConfig(botId.value!, { max_spread_pct: val }) } catch (e) { console.error('saveSpread failed:', e) }
+  }
+}
+
+// ── Exit-Spread editors (separate from entry) ─────────────
+function openExitMinSpreadEditor() {
+  editExitMinSpreadValue.value = rawExitMinSpread.value
+  const wasOpen = showExitMinSpreadPopover.value
+  _closeAllSpreadPopovers()
+  showExitMinSpreadPopover.value = !wasOpen
+}
+
+async function saveExitMinSpread() {
+  showExitMinSpreadPopover.value = false
+  const val = Number(editExitMinSpreadValue.value)
+  if (!isNaN(val)) {
+    try { await updateBotConfig(botId.value!, { exit_min_spread_pct: val }) } catch (e) { console.error('saveExitMinSpread failed:', e) }
+  }
+}
+
+function openExitMaxSpreadEditor() {
+  editExitMaxSpreadValue.value = rawExitMaxSpread.value
+  const wasOpen = showExitMaxSpreadPopover.value
+  _closeAllSpreadPopovers()
+  showExitMaxSpreadPopover.value = !wasOpen
+}
+
+async function saveExitMaxSpread() {
+  showExitMaxSpreadPopover.value = false
+  const val = Number(editExitMaxSpreadValue.value)
+  if (!isNaN(val)) {
+    try { await updateBotConfig(botId.value!, { exit_max_spread_pct: val }) } catch (e) { console.error('saveExitMaxSpread failed:', e) }
   }
 }
 
@@ -481,9 +673,14 @@ function openTimerEditor() {
   const h = status.value.timer.duration_h || 0
   const m = status.value.timer.duration_m || 0
   timerMinutes.value = h * 60 + m || 720
-  showTimerPopover.value = !showTimerPopover.value
+  const wasOpen = showTimerPopover.value
   showQtyPopover.value = false
   showLevPopover.value = false
+  showSpreadPopover.value = false
+  showMinSpreadPopover.value = false
+  showExitMaxSpreadPopover.value = false
+  showExitMinSpreadPopover.value = false
+  showTimerPopover.value = !wasOpen
 }
 
 async function saveTimer() {
@@ -503,13 +700,19 @@ function setTimerPreset(val: number) {
   timerMinutes.value = val
 }
 
+let healthPoll: ReturnType<typeof setInterval> | null = null
+
 onMounted(async () => {
   if (!botId.value) { router.push('/'); return }
   document.addEventListener('click', closeTooltip)
   await accountStore.loadAccounts()
   await accountStore.loadPositions()
+  // Load per-exchange auth health so the Variational "token expired/revoked"
+  // banner can render. Polled every 15s along with positions.
+  accountStore.loadHealth()
   accountPoll = setInterval(() => accountStore.loadAccounts(), 15000)
   positionPoll = setInterval(() => accountStore.loadPositions(), 15000)
+  healthPoll = setInterval(() => accountStore.loadHealth(), 15000)
   // Load live funding immediately and poll every 30s
   loadLiveFunding()
   fundingPoll = setInterval(loadLiveFunding, 30000)
@@ -517,6 +720,9 @@ onMounted(async () => {
   watch(tokenName, () => loadLiveFunding())
   // Tick clock every second for funding countdown
   clockTick = setInterval(() => { nowSeconds.value = Math.floor(Date.now() / 1000) }, 1000)
+  // Load full fill history once; SSE-streamed status.fills keeps the
+  // tail in sync after this initial load.
+  loadFillsHistory()
 })
 
 onUnmounted(() => {
@@ -524,6 +730,7 @@ onUnmounted(() => {
   if (accountPoll) clearInterval(accountPoll)
   if (positionPoll) clearInterval(positionPoll)
   if (fundingPoll) clearInterval(fundingPoll)
+  if (healthPoll) clearInterval(healthPoll)
   if (clockTick) clearInterval(clockTick)
 })
 </script>
@@ -589,11 +796,22 @@ onUnmounted(() => {
               <Button variant="solid" color="success" size="sm" @click="saveLev">Apply</Button>
             </div>
           </div>
-          <!-- Min Spread pill + popover -->
-          <div :class="[$style.pill, canEditSpread && $style.pillEditable]" @click="canEditSpread && openMinSpreadEditor()">
+          <!-- Entry Min Spread pill + popover -->
+          <div :class="[$style.pill, canEditSpread && $style.pillEditable]"
+               :title="entrySpreadHint"
+               @click="canEditSpread && openMinSpreadEditor()">
             {{ minSpreadPillLabel }}
             <div v-if="showMinSpreadPopover && canEditSpread" :class="$style.popover" @click.stop>
-              <Typography size="text-xs" weight="semibold" color="secondary">Min Spread % (safety floor)</Typography>
+              <div :class="$style.popoverHeader">
+                <Typography size="text-xs" weight="semibold" color="secondary">Entry Min Spread % (≥, safety floor)</Typography>
+                <div :class="$style.tooltipWrap">
+                  <button :class="$style.tooltipBtn" @click="toggleTooltip('spread_entry_min', $event)">?</button>
+                  <div v-if="activeTooltip === 'spread_entry_min'" :class="$style.tooltipBox">{{ TOOLTIPS.spread_entry_min }}</div>
+                </div>
+              </div>
+              <Typography v-if="entrySpreadHint" size="text-xs" color="warning">
+                {{ entrySpreadHint }}
+              </Typography>
               <input
                 v-model.number="editMinSpreadValue"
                 :class="$style.popoverInput"
@@ -608,11 +826,22 @@ onUnmounted(() => {
               <Button variant="solid" color="success" size="sm" @click="saveMinSpread">Apply</Button>
             </div>
           </div>
-          <!-- Max Spread pill + popover -->
-          <div :class="[$style.pill, canEditSpread && $style.pillEditable]" @click="canEditSpread && openSpreadEditor()">
+          <!-- Entry Max Spread pill + popover -->
+          <div :class="[$style.pill, canEditSpread && $style.pillEditable]"
+               :title="entrySpreadHint"
+               @click="canEditSpread && openSpreadEditor()">
             {{ spreadPillLabel }}
             <div v-if="showSpreadPopover && canEditSpread" :class="$style.popover" @click.stop>
-              <Typography size="text-xs" weight="semibold" color="secondary">Max Spread (%)</Typography>
+              <div :class="$style.popoverHeader">
+                <Typography size="text-xs" weight="semibold" color="secondary">Entry Max Spread % (≤, cost cap)</Typography>
+                <div :class="$style.tooltipWrap">
+                  <button :class="$style.tooltipBtn" @click="toggleTooltip('spread_entry_max', $event)">?</button>
+                  <div v-if="activeTooltip === 'spread_entry_max'" :class="$style.tooltipBox">{{ TOOLTIPS.spread_entry_max }}</div>
+                </div>
+              </div>
+              <Typography v-if="entrySpreadHint" size="text-xs" color="warning">
+                {{ entrySpreadHint }}
+              </Typography>
               <input
                 v-model.number="editSpreadValue"
                 :class="$style.popoverInput"
@@ -625,6 +854,66 @@ onUnmounted(() => {
                 </Typography>
               </div>
               <Button variant="solid" color="success" size="sm" @click="saveSpread">Apply</Button>
+            </div>
+          </div>
+          <!-- Exit Min Spread pill + popover -->
+          <div :class="[$style.pill, canEditSpread && $style.pillEditable]"
+               :title="exitSpreadHint"
+               @click="canEditSpread && openExitMinSpreadEditor()">
+            {{ exitMinSpreadPillLabel }}
+            <div v-if="showExitMinSpreadPopover && canEditSpread" :class="$style.popover" @click.stop>
+              <div :class="$style.popoverHeader">
+                <Typography size="text-xs" weight="semibold" color="secondary">Exit Min Spread % (≥, safety floor)</Typography>
+                <div :class="$style.tooltipWrap">
+                  <button :class="$style.tooltipBtn" @click="toggleTooltip('spread_exit_min', $event)">?</button>
+                  <div v-if="activeTooltip === 'spread_exit_min'" :class="$style.tooltipBox">{{ TOOLTIPS.spread_exit_min }}</div>
+                </div>
+              </div>
+              <Typography v-if="exitSpreadHint" size="text-xs" color="warning">
+                {{ exitSpreadHint }}
+              </Typography>
+              <input
+                v-model.number="editExitMinSpreadValue"
+                :class="$style.popoverInput"
+                type="number"
+                step="0.1"
+              />
+              <div v-if="priceSpreadPct !== null" :class="$style.popoverUsd">
+                <Typography size="text-xs" :style="{ color: priceSpreadPct >= editExitMinSpreadValue ? '#22c55e' : '#ef4444' }">
+                  Current: {{ priceSpreadPct.toFixed(4) }}%
+                </Typography>
+              </div>
+              <Button variant="solid" color="success" size="sm" @click="saveExitMinSpread">Apply</Button>
+            </div>
+          </div>
+          <!-- Exit Max Spread pill + popover -->
+          <div :class="[$style.pill, canEditSpread && $style.pillEditable]"
+               :title="exitSpreadHint"
+               @click="canEditSpread && openExitMaxSpreadEditor()">
+            {{ exitMaxSpreadPillLabel }}
+            <div v-if="showExitMaxSpreadPopover && canEditSpread" :class="$style.popover" @click.stop>
+              <div :class="$style.popoverHeader">
+                <Typography size="text-xs" weight="semibold" color="secondary">Exit Max Spread % (≤, cost cap)</Typography>
+                <div :class="$style.tooltipWrap">
+                  <button :class="$style.tooltipBtn" @click="toggleTooltip('spread_exit_max', $event)">?</button>
+                  <div v-if="activeTooltip === 'spread_exit_max'" :class="$style.tooltipBox">{{ TOOLTIPS.spread_exit_max }}</div>
+                </div>
+              </div>
+              <Typography v-if="exitSpreadHint" size="text-xs" color="warning">
+                {{ exitSpreadHint }}
+              </Typography>
+              <input
+                v-model.number="editExitMaxSpreadValue"
+                :class="$style.popoverInput"
+                type="number"
+                step="0.01"
+              />
+              <div v-if="priceSpreadPct !== null" :class="$style.popoverUsd">
+                <Typography size="text-xs" :style="{ color: priceSpreadPct <= editExitMaxSpreadValue ? '#22c55e' : '#ef4444' }">
+                  Current: {{ priceSpreadPct.toFixed(4) }}%
+                </Typography>
+              </div>
+              <Button variant="solid" color="success" size="sm" @click="saveExitMaxSpread">Apply</Button>
             </div>
           </div>
           <div :class="[$style.pill, $style.pillTimer]" @click="openTimerEditor">
@@ -667,6 +956,46 @@ onUnmounted(() => {
           <Button v-if="canStop" variant="outline" color="warning" size="md" :loading="actionLoading === 'stop'" @click="handleStop">Stop</Button>
           <Button v-if="isActive || isPaused" variant="outline" color="error" size="md" :loading="actionLoading === 'kill'" @click="handleKill">Kill</Button>
         </div>
+      </div>
+
+      <!-- ── Pause Hinweisbanner ── -->
+      <div v-if="isPaused" :class="$style.pauseBanner">
+        <Typography size="text-sm" weight="semibold">
+          ⏸ Bot pausiert<span v-if="chunkPhase"> (Phase: {{ chunkPhase }})</span>
+        </Typography>
+        <Typography size="text-xs" color="secondary">
+          Edits an Min/Max-Spread, Timeouts und Chase-Parametern werden bei
+          <strong>Resume</strong> übernommen und in der laufenden Execution sofort
+          wirksam. Andere Felder (Exchange, Symbol, Quantity, Leverage) erfordern
+          Stop + Restart.
+        </Typography>
+      </div>
+
+      <!-- ── Variational-Auth-Banner (zeigt nur wenn Bot Variational nutzt UND Auth failed) ── -->
+      <div v-if="usesVariational && variationalAuthBroken" :class="$style.authErrorBanner">
+        <Typography size="text-sm" weight="semibold">
+          🔴 Variational: Auth-Fehler ({{ variationalHealth?.last_status_code ?? '?' }})
+        </Typography>
+        <Typography size="text-xs" color="secondary">
+          {{ variationalAuthHint }}
+        </Typography>
+        <Typography size="text-xs" color="tertiary">
+          → Geh in
+          <RouterLink to="/settings"><strong>Settings</strong></RouterLink>
+          und aktualisiere den <strong>vr-token</strong>. Nach dem Speichern Browser-Tab
+          zu omni.variational.io schließen, damit Variational dein Token nicht
+          erneut serverseitig rotiert.
+        </Typography>
+      </div>
+
+      <!-- ── Hinweis: Edit gesperrt während aktiver Execution ── -->
+      <div v-else-if="status?.state === 'ENTERING' || status?.state === 'EXITING'" :class="$style.execLockBanner">
+        <Typography size="text-xs" color="secondary">
+          ▶ Bot läuft ({{ stateLabel }}). Edits an Spread-Bounds, Timeouts etc.
+          sind gesperrt — bitte erst <strong>Pause</strong> drücken. Live-Änderungen
+          während laufender TWAP-Execution würden den aktuellen Chunk-Loop nicht
+          erreichen (Snapshot-Mismatch).
+        </Typography>
       </div>
 
       <!-- ── Advanced Settings Panel ── -->
@@ -1147,6 +1476,93 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- ── Filled Orders ── -->
+      <div :class="$style.fillsSection">
+        <div :class="$style.fillsHeader">
+          <Typography size="text-md" weight="semibold" color="secondary" as="h3">Filled Orders</Typography>
+          <Typography size="text-xs" color="tertiary">
+            {{ allFills.length }} fill{{ allFills.length === 1 ? '' : 's' }} total
+          </Typography>
+        </div>
+        <div :class="$style.fillsContainer">
+          <div v-if="!fillsLoaded" :class="$style.fillsEmpty">
+            <Typography size="text-sm" color="tertiary">Loading…</Typography>
+          </div>
+          <div v-else-if="fillsLoadError" :class="$style.fillsEmpty">
+            <Typography size="text-sm" color="error">{{ fillsLoadError }}</Typography>
+          </div>
+          <div v-else-if="!allFills.length" :class="$style.fillsEmpty">
+            <Typography size="text-sm" color="tertiary">No filled orders yet</Typography>
+          </div>
+          <div
+            v-for="fill in allFills"
+            :key="`${fill.action}:${fill.chunk_index}:${fill.ts}`"
+            :class="[$style.fillEntry, fill.error && $style['fillEntry--error']]"
+          >
+            <!-- Top row: timestamp + action chip + chunk index -->
+            <div :class="$style.fillMeta">
+              <Typography size="text-xs" color="tertiary" :class="$style.fillTime">
+                {{ new Date(fill.ts * 1000).toLocaleString() }}
+              </Typography>
+              <Chip
+                :variant="fill.action === 'ENTRY' ? 'info' : fill.action === 'EXIT' ? 'neutral' : 'neutral'"
+                size="sm"
+              >
+                {{ fill.action }}
+              </Chip>
+              <Typography size="text-xs" color="tertiary">Chunk #{{ fill.chunk_index }}</Typography>
+              <Typography v-if="fill.error" size="text-xs" color="error" :class="$style.fillErr">
+                {{ fill.error }}
+              </Typography>
+            </div>
+            <!-- 3-column row: long | spread | short -->
+            <div :class="$style.fillRow">
+              <!-- Long leg (left) -->
+              <div :class="$style.fillLeg">
+                <div :class="$style.fillLegHead">
+                  <img v-if="DEX_LOGOS[fill.long_exchange]" :src="DEX_LOGOS[fill.long_exchange]" :class="$style.fillDexLogo" />
+                  <Typography size="text-xs" weight="semibold" color="secondary">
+                    LONG · {{ fill.long_exchange || '—' }}
+                  </Typography>
+                </div>
+                <Typography size="text-sm">
+                  {{ fill.long_qty ? Number(fill.long_qty).toFixed(6) : '—' }}
+                  <span v-if="fill.long_price" :class="$style.fillAt">@</span>
+                  <span v-if="fill.long_price">${{ Number(fill.long_price).toFixed(4) }}</span>
+                </Typography>
+              </div>
+              <!-- Spread (centre) — USD per unit, dynamic precision so
+                   high-priced assets (BTC) show $X.XX while low-priced
+                   ones (ARB, sub-cent spreads) keep readable digits. -->
+              <div :class="$style.fillSpread">
+                <Typography size="text-xs" color="tertiary">Spread</Typography>
+                <Typography
+                  size="text-sm"
+                  weight="semibold"
+                  :style="{ color: fill.spread_usd === null ? 'inherit' : (fill.spread_usd < 0 ? '#22c55e' : fill.spread_usd > 0 ? '#ef4444' : 'inherit') }"
+                >
+                  {{ formatSpreadUsd(fill.spread_usd) }}
+                </Typography>
+              </div>
+              <!-- Short leg (right) -->
+              <div :class="[$style.fillLeg, $style.fillLegRight]">
+                <div :class="$style.fillLegHead">
+                  <img v-if="DEX_LOGOS[fill.short_exchange]" :src="DEX_LOGOS[fill.short_exchange]" :class="$style.fillDexLogo" />
+                  <Typography size="text-xs" weight="semibold" color="secondary">
+                    SHORT · {{ fill.short_exchange || '—' }}
+                  </Typography>
+                </div>
+                <Typography size="text-sm">
+                  {{ fill.short_qty ? Number(fill.short_qty).toFixed(6) : '—' }}
+                  <span v-if="fill.short_price" :class="$style.fillAt">@</span>
+                  <span v-if="fill.short_price">${{ Number(fill.short_price).toFixed(4) }}</span>
+                </Typography>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- ── Activity Log ── -->
       <div :class="$style.logSection">
         <Typography size="text-md" weight="semibold" color="secondary" as="h3">Activity Log</Typography>
@@ -1257,6 +1673,18 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 10px;
   cursor: default;
+}
+
+/* Header row inside the popover — title text on the left, ⓘ tooltip
+   button on the right. The tooltip box itself is `position: absolute`
+   with z-index 200 so it can overflow the popover bounds without
+   pushing the input field down or breaking the popover layout. */
+.popoverHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  position: relative;
 }
 
 .popoverInput {
@@ -1592,6 +2020,127 @@ onUnmounted(() => {
   gap: 6px;
 }
 
+/* ── Filled Orders ── */
+.fillsSection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.fillsHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.fillsContainer {
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-2);
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.fillsEmpty {
+  padding: var(--space-8);
+  text-align: center;
+}
+
+.fillEntry {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-stroke-divider);
+}
+.fillEntry:last-child { border-bottom: none; }
+
+.fillEntry--error { background: var(--color-error-bg); }
+
+.fillMeta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.fillTime {
+  font-variant-numeric: tabular-nums;
+}
+
+.fillErr {
+  margin-left: auto;
+}
+
+.fillRow {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.fillLeg {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.fillLegRight {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.fillLegHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fillDexLogo {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+}
+
+.fillAt {
+  color: var(--color-text-tertiary);
+  margin: 0 4px;
+}
+
+.fillSpread {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 0 var(--space-3);
+  border-left: 1px solid var(--color-stroke-divider);
+  border-right: 1px solid var(--color-stroke-divider);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+  .fillRow {
+    grid-template-columns: 1fr;
+    gap: var(--space-2);
+  }
+  .fillLegRight {
+    align-items: flex-start;
+    text-align: left;
+  }
+  .fillSpread {
+    border-left: none;
+    border-right: none;
+    border-top: 1px solid var(--color-stroke-divider);
+    border-bottom: 1px solid var(--color-stroke-divider);
+    padding: var(--space-1) 0;
+    flex-direction: row;
+    justify-content: center;
+    gap: var(--space-2);
+  }
+}
+
 /* ── Activity Log ── */
 .logSection {
   display: flex;
@@ -1635,6 +2184,40 @@ onUnmounted(() => {
   width: 60px;
   justify-content: center;
   text-align: center;
+}
+
+/* ── Pause / Exec-Lock Banner ── */
+.pauseBanner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-3);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 10%, transparent);
+}
+.execLockBanner {
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-stroke-divider);
+  background: var(--color-white-2);
+}
+
+.authErrorBanner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-3);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+}
+.authErrorBanner a {
+  color: var(--color-text-primary);
+  text-decoration: underline;
 }
 
 /* ── Advanced Settings Panel ── */

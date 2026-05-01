@@ -45,6 +45,14 @@ def _is_http_403(exc: Exception) -> bool:
     return False
 
 
+def _http_status(exc: Exception) -> int | None:
+    """Extract HTTP status code from a requests/curl_cffi exception, if any."""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        return getattr(resp, "status_code", None)
+    return None
+
+
 # The trading API always uses funding_interval_s=3600 regardless of what the
 # stats API reports (which may show 14400, 28800, etc.).
 _TRADING_FUNDING_INTERVAL = 3600
@@ -110,11 +118,106 @@ class VariationalClient:
         self._transfers_cache_ts: dict[str, float] = {}
         self._TRANSFERS_CACHE_TTL = 120  # seconds
 
+        # Auth-status tracker — last observed authentication state, exposed via
+        # `auth_status` property so the /account/positions endpoint and the
+        # frontend can surface a clear "token expired/revoked" hint to the
+        # user instead of silently showing an empty positions list.
+        self._auth_status: dict = {
+            "ok": True,                    # True until we see a 401/403
+            "last_status_code": None,      # int|None of last HTTP code
+            "last_error": None,            # str|None human-readable hint
+            "last_check_ts": 0.0,          # epoch seconds of last update
+            "consecutive_failures": 0,     # incremented on 401/403, reset on 2xx
+        }
+
         logger.info("VariationalClient initialized: wallet=%s...%s proxy=%s", self._wallet_address[:6], self._wallet_address[-4:], bool(self._proxy_url))
 
     @property
     def name(self) -> str:
         return "variational"
+
+    @property
+    def auth_status(self) -> dict:
+        """Last-observed Variational auth state.
+
+        Returns a dict with:
+          - ok: bool — False if last call returned 401/403
+          - last_status_code: int|None — the HTTP code observed
+          - last_error: str|None — short human hint (e.g. "JWT revoked")
+          - last_check_ts: float — epoch seconds of last update
+          - consecutive_failures: int — number of consecutive 401/403 calls
+
+        Consumed by /account/positions to surface a clear UI banner so the
+        user can refresh the vr-token in Settings without guessing why
+        positions are missing.
+        """
+        return dict(self._auth_status)  # shallow copy — caller should not mutate
+
+    def _record_auth_ok(self) -> None:
+        """Mark auth as healthy after a 2xx response."""
+        self._auth_status.update({
+            "ok": True,
+            "last_status_code": 200,
+            "last_error": None,
+            "last_check_ts": time.time(),
+            "consecutive_failures": 0,
+        })
+
+    def _record_auth_failure(self, status_code: int | None, hint: str) -> None:
+        """Mark auth as failing after a 401/403 (or other auth-relevant) response."""
+        self._auth_status["ok"] = False
+        self._auth_status["last_status_code"] = status_code
+        self._auth_status["last_error"] = hint
+        self._auth_status["last_check_ts"] = time.time()
+        self._auth_status["consecutive_failures"] += 1
+
+    def _record_auth_failure_from_exc(self, exc: Exception, url: str) -> None:
+        """Inspect a request exception and update auth_status + log accordingly.
+
+        Only acts on auth-relevant statuses (401/403). Other errors (5xx,
+        timeouts) are not auth failures and leave the status unchanged.
+        """
+        code = _http_status(exc)
+        if code not in (401, 403):
+            return
+        path = url.replace(self._base_url, "").replace(self._proxy_url, "") or url
+        token_tail = self._jwt_token[-4:] if self._jwt_token and len(self._jwt_token) >= 4 else "?"
+        wallet_tail = (
+            f"{self._wallet_address[:6]}...{self._wallet_address[-4:]}"
+            if self._wallet_address and len(self._wallet_address) >= 10
+            else self._wallet_address
+        )
+
+        # Decode JWT exp to differentiate "expired" vs "revoked"
+        is_expired = False
+        try:
+            parts = self._jwt_token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                data = json.loads(base64.b64decode(payload_b64))
+                exp = data.get("exp", 0)
+                if exp and int(time.time()) > exp:
+                    is_expired = True
+        except Exception:
+            pass
+
+        if code == 401:
+            if is_expired:
+                hint = "Token expired (Variational returned 401 'No token'). Refresh in Settings."
+            else:
+                hint = "Token rejected as 'No token' by Variational despite being sent. Cookie may be malformed or token type mismatched. Refresh in Settings."
+        else:  # 403
+            if is_expired:
+                hint = "Token expired. Refresh vr-token in Settings."
+            else:
+                hint = "Token revoked server-side (likely re-login on omni.variational.io rotated the JWT). Refresh vr-token in Settings."
+
+        self._record_auth_failure(code, hint)
+        logger.error(
+            "[VARIATIONAL-AUTH] %d on %s — %s (token=***%s, wallet=%s, fails=%d)",
+            code, path, hint, token_tail, wallet_tail,
+            self._auth_status["consecutive_failures"],
+        )
 
     # ── Internal helpers ───────────────────────────────────────────────
 
@@ -143,11 +246,77 @@ class VariationalClient:
         return ""
 
     def update_jwt(self, new_token: str) -> None:
-        """Update JWT token (e.g. after manual refresh from browser)."""
+        """Update JWT token (e.g. after manual refresh from browser).
+
+        Also:
+          - Resets the auth_status tracker so the next request re-evaluates
+            health (otherwise stale 401/403 would persist after a fix).
+          - Clears the proxy session's cookie jar so old vr-token cookies
+            from prior responses don't compete with the new per-request cookie.
+          - Logs token expiry status so an already-expired token is noticed
+            immediately rather than after the first failed request.
+        """
         self._jwt_token = new_token
         new_addr = self._extract_address_from_jwt(new_token)
         if new_addr:
             self._wallet_address = new_addr
+
+        # Reset auth tracking — let the next call re-establish health
+        self._auth_status = {
+            "ok": True,
+            "last_status_code": None,
+            "last_error": None,
+            "last_check_ts": time.time(),
+            "consecutive_failures": 0,
+        }
+
+        # Clear cookie jars so any old vr-token (from Set-Cookie responses
+        # to earlier requests) cannot override the per-request cookie sent
+        # via cookies=self._cookies()
+        if self._proxy_session is not None:
+            try:
+                self._proxy_session.cookies.clear()
+            except Exception:
+                pass
+        try:
+            # curl_cffi sessions don't support cookies.clear() reliably; just
+            # rebuild the session with the same impersonation profile
+            current_fp = getattr(self._cffi_session, "_impersonate", "chrome120")
+            self._cffi_session = _cffi_requests.Session(impersonate=current_fp)
+        except Exception:
+            pass
+
+        # Log expiry of the new token so a stale paste is caught immediately
+        try:
+            parts = new_token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                data = json.loads(base64.b64decode(payload_b64))
+                exp = data.get("exp", 0)
+                if exp:
+                    now = int(time.time())
+                    secs_left = exp - now
+                    if secs_left <= 0:
+                        logger.error(
+                            "[VARIATIONAL-AUTH] update_jwt received an ALREADY EXPIRED "
+                            "token (exp was %ds ago). Refresh from omni.variational.io.",
+                            -secs_left,
+                        )
+                    elif secs_left < 3600:
+                        logger.warning(
+                            "[VARIATIONAL-AUTH] update_jwt: new token expires in %ds (<1h)",
+                            secs_left,
+                        )
+                    else:
+                        logger.info(
+                            "Variational JWT token updated (valid for %.1fh, wallet=%s...%s)",
+                            secs_left / 3600,
+                            self._wallet_address[:6] if self._wallet_address else "?",
+                            self._wallet_address[-4:] if self._wallet_address else "?",
+                        )
+                    return
+        except Exception:
+            pass
         logger.info("Variational JWT token updated")
 
     def _rotate_fingerprint(self) -> None:
@@ -214,8 +383,11 @@ class VariationalClient:
 
         max_retries=0 (default): no retry, fail fast (dashboard/portfolio reads).
         max_retries=N: retry N times on 403 (position checks in order flow).
+
+        Updates self._auth_status on 2xx (auth ok) and 401/403 (auth failure)
+        so consumers can surface a clear "token expired/revoked" message.
         """
-        # Public stats API — always direct, no auth
+        # Public stats API — always direct, no auth (does not affect auth_status)
         if url.startswith(self._stats_url):
             resp = self._cffi_session.get(url, params=params, timeout=15)
             resp.raise_for_status()
@@ -231,11 +403,16 @@ class VariationalClient:
                     params=params, timeout=15,
                 )
                 resp.raise_for_status()
+                self._record_auth_ok()
                 return resp.json()
 
-            if max_retries == 0:
-                return _do_proxy_get()
-            return self._retry_on_403(_do_proxy_get, max_retries=max_retries)
+            try:
+                if max_retries == 0:
+                    return _do_proxy_get()
+                return self._retry_on_403(_do_proxy_get, max_retries=max_retries)
+            except Exception as exc:
+                self._record_auth_failure_from_exc(exc, url)
+                raise
 
         # No proxy configured — curl_cffi direct (dev/testing only)
         def _do_get():
@@ -244,11 +421,16 @@ class VariationalClient:
                 params=params, timeout=15,
             )
             resp.raise_for_status()
+            self._record_auth_ok()
             return resp.json()
 
-        if max_retries == 0:
-            return _do_get()
-        return self._retry_on_403(_do_get, max_retries=max_retries)
+        try:
+            if max_retries == 0:
+                return _do_get()
+            return self._retry_on_403(_do_get, max_retries=max_retries)
+        except Exception as exc:
+            self._record_auth_failure_from_exc(exc, url)
+            raise
 
     def _sync_post(self, endpoint: str, payload: dict, max_retries: int | None = 3) -> Any:
         """Synchronous POST — CF Worker proxy only (when configured).
@@ -270,9 +452,14 @@ class VariationalClient:
                     json=payload, timeout=15,
                 )
                 resp.raise_for_status()
+                self._record_auth_ok()
                 return resp.json()
 
-            return self._retry_on_403(_do_proxy_post, max_retries=max_retries)
+            try:
+                return self._retry_on_403(_do_proxy_post, max_retries=max_retries)
+            except Exception as exc:
+                self._record_auth_failure_from_exc(exc, post_url)
+                raise
 
         # No proxy configured — curl_cffi direct (dev/testing only)
         def _do_post():
@@ -281,9 +468,14 @@ class VariationalClient:
                 json=payload, timeout=15,
             )
             resp.raise_for_status()
+            self._record_auth_ok()
             return resp.json()
 
-        return self._retry_on_403(_do_post, max_retries=max_retries)
+        try:
+            return self._retry_on_403(_do_post, max_retries=max_retries)
+        except Exception as exc:
+            self._record_auth_failure_from_exc(exc, post_url)
+            raise
 
     async def _async_get(self, url: str, params: dict | None = None, max_retries: int = 0) -> Any:
         return await asyncio.to_thread(self._sync_get, url, params, max_retries)
@@ -396,12 +588,27 @@ class VariationalClient:
     async def async_create_ioc_order(
         self, symbol: str, side: str, amount: Decimal, price: Decimal,
         reduce_only: bool = False,
+        max_slippage: float | None = None,
     ) -> dict:
         """Execute a market order via 2-step RFQ: get quote → place order.
 
-        The 'price' parameter is used to calculate max_slippage relative to quote.
+        Parameters
+        ----------
+        symbol, side, amount, price : standard order parameters. ``price`` is
+            currently informational; the OLP fills at its quote subject to
+            ``max_slippage``.
+        reduce_only : bool
+            Pass ``True`` for exit orders so an unintended re-open is impossible
+            even if the persisted position state was stale.
+        max_slippage : float | None
+            Slippage cap as a fraction (e.g. 0.007 = 0.7%). When ``None``, falls
+            back to the module-level ``_DEFAULT_SLIPPAGE``. Used by the Gold-
+            Spread bot to wire its ``max_slippage_pct`` config (normal trades)
+            and ``unwind_slippage_pct`` (emergency unwinds) through to the
+            Variational API rather than relying on the hard-coded default.
         """
         instrument = _build_instrument(symbol)
+        slippage = float(max_slippage) if max_slippage is not None else _DEFAULT_SLIPPAGE
 
         # Step 1: Get indicative quote
         quote_payload = {
@@ -429,7 +636,7 @@ class VariationalClient:
             "side": side.lower(),
             "qty": str(amount),
             "quote_id": quote_id,
-            "max_slippage": _DEFAULT_SLIPPAGE,
+            "max_slippage": slippage,
             "is_reduce_only": reduce_only,
         }
         # Snapshot position BEFORE order to verify fill via delta
